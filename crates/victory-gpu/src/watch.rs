@@ -578,6 +578,21 @@ struct Guards {
     /// runtime last mapped or unmapped them. They are view memory whether
     /// their guard stands now or a write has opened it.
     viewed: BTreeSet<usize>,
+    /// Runs of blocks Windows lately said are wholly uncommitted, by first
+    /// block: the end block, whether the memory is a mapped view, and when
+    /// it was said ([`hole_end`]). They do not overlap.
+    holes: BTreeMap<usize, Hole>,
+}
+
+/// What [`Guards::holes`] keeps of one answer of Windows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Hole {
+    end: usize,
+    mapped: bool,
+    /// The frame (`crate::frame::current`) and the millisecond
+    /// (`crate::host::now_ms`) of the answer.
+    frame: u64,
+    ms: u64,
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -627,6 +642,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     absent: BTreeSet::new(),
     aliased: BTreeSet::new(),
     viewed: BTreeSet::new(),
+    holes: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -684,9 +700,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let mut open = block < last && !is_clean;
         if open && g.absent.contains(&block) {
             // Ordinary commits need no runtime mapping notification. Reuse
-            // this asking's query for the following blocks in the same region.
+            // this asking's query for the following blocks in the same region
+            // (and a recent asking's: [`hole_end`]).
             if block >= uncommitted_until {
-                uncommitted_until = uncommitted_end(block);
+                uncommitted_until = hole_end(&mut g, block);
             }
             open = block >= uncommitted_until;
             if open {
@@ -722,6 +739,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
 /// refresh, around its unmapped pages (run 54: 300 such ranges, 570 MB
 /// copied a frame for them, 255 copies a frame reading around holes).
 /// `VICTORY_GUARD_HOLES=0` looks at the first address only, as before.
+///
+/// Holes Windows lately said are wholly uncommitted are passed over
+/// without asking again ([`known_hole`]), and the holes it says are kept.
 fn is_view(start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
@@ -730,6 +750,20 @@ fn is_view(start: usize, end: usize) -> bool {
     let holes = *HOLES.get_or_init(|| std::env::var_os("VICTORY_GUARD_HOLES").is_none_or(|v| v != "0"));
     let mut at = start;
     loop {
+        let known = if holes { known_hole(&guards(), at / BLOCK) } else { None };
+        if let Some((hole_end, mapped)) = known {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::HolesKnown, 1);
+            if mapped {
+                return true;
+            }
+            let next = hole_end.saturating_mul(BLOCK);
+            if next <= at || next >= end {
+                return true;
+            }
+            at = next;
+            continue;
+        }
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
@@ -747,6 +781,12 @@ fn is_view(start: usize, end: usize) -> bool {
         }
         // A hole (a placeholder, or free): on to what follows it.
         let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::HolesAsked, 1);
+        let (first, last) = ((info.BaseAddress as usize).div_ceil(BLOCK), next / BLOCK);
+        if first < last {
+            note_hole(&mut guards(), first, last, false);
+        }
         if next <= at || next >= end {
             return true;
         }
@@ -860,7 +900,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         } else {
             #[cfg(feature = "diagnostics")]
             let error = std::io::Error::last_os_error();
-            if block < uncommitted_end(block) {
+            if block < hole_end(g, block) {
                 g.absent.insert(block);
             } else {
                 // Diagnostics: a committed block that will not be made
@@ -878,19 +918,146 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     }
 }
 
-/// The end (exclusive) of the whole uncommitted blocks starting at `block`.
-fn uncommitted_end(block: usize) -> usize {
+/// The end (exclusive) of the whole uncommitted blocks starting at `block`,
+/// and whether they are a mapped view (of a section whose pages are not
+/// committed); `(block, false)` if `block` is committed.
+fn uncommitted_end(block: usize) -> (usize, bool) {
     use windows_sys::Win32::System::Memory::{
-        MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        MEM_FREE, MEM_MAPPED, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
-        (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
+        (
+            ((info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK).max(block),
+            info.Type == MEM_MAPPED,
+        )
     } else {
-        block
+        (block, false)
+    }
+}
+
+/// How long Windows' word that blocks are wholly uncommitted is taken
+/// without asking again, in milliseconds (`VICTORY_ABSENT_KEEP`; 100 by
+/// default, `0` asks at every check as before). Never past the frame it
+/// was said in.
+///
+/// A copy of view memory whose range holds blocks that are not mapped
+/// (placeholders between the title's views, free memory beside them) asked
+/// Windows about every such run of blocks at every check: they are never
+/// clean, so no check of the range was answered from the guards alone. In
+/// run P that was 10.7 ms a frame of the submitting thread in
+/// `VirtualQuery` under `guard`, some 2,000 checks a frame. What maps such
+/// blocks is the runtime's (`xmem`: [`title_memory_remapped`], and
+/// [`title_memory_committed`] for its commits into the title's
+/// reservations), and its word forgets them at once. A commit nobody tells
+/// (the title's own `VirtualAlloc` into a reservation of its own, memory
+/// beside a view that another allocation takes) is seen at the first check
+/// after the answer is this old, or in the next frame: until then the
+/// copies there keep the zeros they took.
+fn hole_keep() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("VICTORY_ABSENT_KEEP")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(100)
+    })
+}
+
+/// The most runs of blocks [`Guards::holes`] keeps (the title's views lie
+/// in some thousands of placeholders); past it, all are forgotten.
+const HOLES_MOST: usize = 1 << 16;
+
+/// Whether `hole` may still be taken at frame `now_frame` and millisecond
+/// `now_ms`, kept `keep` ms.
+fn fresh(hole: &Hole, now_frame: u64, now_ms: u64, keep: u64) -> bool {
+    keep > 0 && hole.frame == now_frame && now_ms.saturating_sub(hole.ms) < keep
+}
+
+/// The run of blocks from `block` on that [`Guards::holes`] holds, if what
+/// it says is fresh: (end block, whether a mapped view).
+fn known_hole(g: &Guards, block: usize) -> Option<(usize, bool)> {
+    let keep = hole_keep();
+    if keep == 0 {
+        return None;
+    }
+    let (_, hole) = g.holes.range(..=block).next_back()?;
+    (hole.end > block && fresh(hole, crate::frame::current(), crate::host::now_ms(), keep))
+        .then_some((hole.end, hole.mapped))
+}
+
+/// [`uncommitted_end`]'s end, from [`Guards::holes`] while it is fresh
+/// ([`hole_keep`]), else asked of Windows and kept there.
+fn hole_end(g: &mut Guards, block: usize) -> usize {
+    if let Some((end, _)) = known_hole(g, block) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::HolesKnown, 1);
+        return end;
+    }
+    let (end, mapped) = uncommitted_end(block);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::HolesAsked, 1);
+    note_hole(g, block, end, mapped);
+    end
+}
+
+/// Windows said blocks `[block, end)` are wholly uncommitted (nothing if
+/// `end` is `block`: that block is committed). What the holes held of them
+/// is older and goes.
+fn note_hole(g: &mut Guards, block: usize, end: usize, mapped: bool) {
+    let keep = hole_keep();
+    if keep == 0 {
+        return;
+    }
+    forget_holes(g, block, end.max(block + 1));
+    if end > block {
+        if g.holes.len() >= HOLES_MOST {
+            g.holes.clear();
+        }
+        let hole = Hole { end, mapped, frame: crate::frame::current(), ms: crate::host::now_ms() };
+        g.holes.insert(block, hole);
+    }
+}
+
+/// Blocks `[from, to)` may have been committed: [`Guards::holes`] keeps
+/// only what it said of the blocks beside them.
+fn forget_holes(g: &mut Guards, from: usize, to: usize) {
+    if g.holes.is_empty() || from >= to {
+        return;
+    }
+    let before = g.holes.range(..from).next_back().filter(|(_, h)| h.end > from).map(|(&s, _)| s);
+    let met: Vec<usize> = before.into_iter().chain(g.holes.range(from..to).map(|(&s, _)| s)).collect();
+    for start in met {
+        let Some(hole) = g.holes.remove(&start) else {
+            continue;
+        };
+        if start < from {
+            g.holes.insert(start, Hole { end: from, ..hole });
+        }
+        if hole.end > to {
+            g.holes.insert(to, hole);
+        }
+    }
+}
+
+/// The runtime committed title memory `[at, at + len)` in a reservation
+/// (`xmem`'s `XMemVirtualAlloc` with an address): blocks there that were
+/// noted absent are looked at again at their next check, and what
+/// [`hole_end`] kept of them goes.
+pub fn title_memory_committed(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let mut g = guards();
+    let g = &mut *g;
+    let (from, to) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    forget_holes(g, from, to);
+    let absent: Vec<usize> = g.absent.range(from..to).copied().collect();
+    for block in absent {
+        g.absent.remove(&block);
     }
 }
 
@@ -1042,6 +1209,9 @@ pub(crate) fn views_mapped(section: usize, offset: u64, len: usize) {
             #[cfg(feature = "diagnostics")]
             ALIASES[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        // The pages may have been committed through the new view (a section
+        // that is only reserved): they are no hole at the others either.
+        forget_holes(&mut g, at / BLOCK, at.saturating_add(n).div_ceil(BLOCK));
     }
 }
 
@@ -1247,6 +1417,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in absent {
         g.absent.remove(&block);
     }
+    forget_holes(&mut g, range.start, range.end);
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
@@ -1475,7 +1646,7 @@ mod tests {
             SEC_RESERVE, UnmapViewOfFile,
         };
 
-        const SIZE: usize = 3 * BLOCK;
+        const SIZE: usize = 4 * BLOCK;
         struct View(MEMORY_MAPPED_VIEW_ADDRESS);
         impl Drop for View {
             fn drop(&mut self) {
@@ -1509,20 +1680,73 @@ mod tests {
         };
         let early = start + BLOCK + 3 * KERNEL_PAGE;
         let late = start + 2 * BLOCK + 3 * KERNEL_PAGE;
+        let untold = start + 3 * BLOCK + 3 * KERNEL_PAGE;
         commit(start, BLOCK);
         commit(early, KERNEL_PAGE);
         let refresh = || guard(start, start + SIZE).unwrap();
-        assert_eq!(refresh(), [start / PAGE, early / PAGE, late / PAGE]);
-        // The last block is still entirely reserved.
-        assert!(!refresh().contains(&(late / PAGE)));
+        assert_eq!(refresh(), [start / PAGE, early / PAGE, late / PAGE, untold / PAGE]);
+        // The last blocks are still entirely reserved.
+        let again = refresh();
+        assert!(!again.contains(&(late / PAGE)) && !again.contains(&(untold / PAGE)));
 
-        commit(late, KERNEL_PAGE); // Ordinary commit, without a runtime mapping notification.
+        // Ordinary commit, without a runtime mapping notification; told as
+        // `xmem` tells its commits into reservations.
+        commit(late, KERNEL_PAGE);
+        title_memory_committed(late, KERNEL_PAGE);
         for at in [early, late] {
             assert!(writable(at));
             // SAFETY: each address is inside its committed read-write page.
             unsafe { (at as *mut u8).write_volatile(1) };
         }
         assert_eq!(refresh(), [early / PAGE, late / PAGE]);
+
+        // A commit nobody tells is seen once Windows' last word on the
+        // block is older than `hole_keep`.
+        commit(untold, KERNEL_PAGE);
+        // SAFETY: inside the page just committed.
+        unsafe { (untold as *mut u8).write_volatile(1) };
+        std::thread::sleep(std::time::Duration::from_millis(hole_keep() + 20));
+        assert!(refresh().contains(&(untold / PAGE)));
+    }
+
+    /// What is kept of Windows' answers about uncommitted blocks: trimmed
+    /// around the blocks that may have been committed, replaced by a newer
+    /// answer, and taken only while it is fresh.
+    #[test]
+    fn holes_are_kept_trimmed_and_expire() {
+        let mut g = Guards {
+            protected: BTreeSet::new(),
+            clean: BTreeSet::new(),
+            absent: BTreeSet::new(),
+            aliased: BTreeSet::new(),
+            viewed: BTreeSet::new(),
+            holes: BTreeMap::new(),
+        };
+        let spans = |g: &Guards| g.holes.iter().map(|(&s, h)| (s, h.end)).collect::<Vec<_>>();
+        note_hole(&mut g, 10, 20, false);
+        note_hole(&mut g, 30, 40, false);
+        assert_eq!(known_hole(&g, 15), Some((20, false)));
+        assert_eq!(known_hole(&g, 20), None, "past its end");
+        assert_eq!(known_hole(&g, 5), None);
+        // A mapping in the middle of the first and over the start of the second.
+        forget_holes(&mut g, 12, 14);
+        forget_holes(&mut g, 25, 32);
+        assert_eq!(spans(&g), [(10, 12), (14, 20), (32, 40)]);
+        assert_eq!(known_hole(&g, 13), None);
+        assert_eq!(known_hole(&g, 11), Some((12, false)));
+        // A newer answer replaces what overlaps it; a committed block (an
+        // answer that ends where it begins) only takes the old word away.
+        note_hole(&mut g, 16, 36, true);
+        assert_eq!(spans(&g), [(10, 12), (14, 16), (16, 36), (36, 40)]);
+        assert_eq!(known_hole(&g, 33), Some((36, true)));
+        note_hole(&mut g, 11, 11, false);
+        assert_eq!(spans(&g), [(10, 11), (14, 16), (16, 36), (36, 40)]);
+        // Freshness: the same frame and less than `keep` ms.
+        let hole = Hole { end: 1, mapped: false, frame: 7, ms: 1000 };
+        assert!(fresh(&hole, 7, 1099, 100));
+        assert!(!fresh(&hole, 7, 1100, 100));
+        assert!(!fresh(&hole, 8, 1001, 100), "a frame later");
+        assert!(!fresh(&hole, 7, 1000, 0), "kept for no time at all");
     }
 
     /// A range of view memory whose first block is not mapped is a view

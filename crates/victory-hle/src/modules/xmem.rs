@@ -161,6 +161,10 @@ pub extern "system" fn XMemVirtualAlloc(
             at = format_args!("{at:p}"),
             "XMemVirtualAlloc"
         );
+    } else if kind & MEM_COMMIT != 0 && !at.is_null() {
+        // Pages of a reservation the GPU side may have found uncommitted
+        // (and not looked at again for a while: `victory_gpu`'s guards).
+        victory_gpu::title_memory_committed(at as usize, size);
     }
     at
 }

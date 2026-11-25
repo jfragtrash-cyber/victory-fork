@@ -133,6 +133,11 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// Runs of uncommitted blocks of guarded ranges asked of Windows
+    /// (`watch::hole_end`, `watch::is_view`), and passed over on a recent
+    /// answer instead.
+    HolesAsked,
+    HolesKnown,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1286,6 +1291,11 @@ pub(crate) fn log(frames: f64) {
         c[C::WatchFailed as usize],
         c[C::WatchKnownView as usize],
         crate::watch::AHEAD_VIEWS.swap(0, Relaxed) as f64 / frames,
+    );
+    tracing::info!(
+        "  runs of unmapped blocks in guarded ranges per frame: {:.0} asked of Windows, {:.0} passed over on a          recent answer (VICTORY_ABSENT_KEEP=0 asks every time)",
+        c[C::HolesAsked as usize],
+        c[C::HolesKnown as usize],
     );
     crate::draw::window_line(frames);
     tracing::info!(

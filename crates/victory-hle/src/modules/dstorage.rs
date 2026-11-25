@@ -802,6 +802,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             intermediate_size = request.intermediate_size,
             tag = request.tag,
             name = text(request.name),
+            destination = format_args!("{:#x}", request.destination as usize),
             hr = format_args!("{:#010x}", hr as u32),
             "dstorage: request failed: {why}"
         );
@@ -813,6 +814,21 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     if request.source.is_null() || request.destination.is_null() {
         return Err(fail(E_INVALIDARG, "no source or destination"));
     }
+    // The title memory the request reads or writes in place, held together
+    // for the whole request: no remapping of it meanwhile
+    // (`victory_gpu::title_memory_reading`). While the runtime maps one
+    // page of a view anew the view's other pages are a reservation for a
+    // moment (`xmem` `unmap`), and the kernel's write into such a page fails
+    // with ERROR_INVALID_USER_BUFFER (0x800706f8), which the title takes as
+    // fatal (a breakpoint in its streaming, 2026-11-25).
+    let mut in_place = Vec::with_capacity(2);
+    if options & MEMORY_SOURCE != 0 {
+        in_place.push((request.source as usize, request.source_size as usize));
+    }
+    if options & PAGE_DESTINATION == 0 {
+        in_place.push((request.destination as usize, request.destination_size as usize));
+    }
+    let _held = victory_gpu::title_memory_reading_all(&in_place);
     let bc = ((options & BCPACK) >> 1) as u8;
     let size = request.destination_size as usize;
     if options & (ZLIB | BCPACK) == 0 {
@@ -920,6 +936,7 @@ static READING: AtomicU64 = AtomicU64::new(0);
 /// Fills `out` (the source size) from the request's file or memory.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
+        // (title memory read in place, held by `execute`)
         // SAFETY: the title's source holds `out.len()` bytes until completion.
         out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
         return Ok(());
@@ -958,6 +975,7 @@ fn into_destination(
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first.
         victory_gpu::kernel_will_write(request.destination as usize, len);
+        // (no remapping of it meanwhile: held by `execute`)
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
         let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };

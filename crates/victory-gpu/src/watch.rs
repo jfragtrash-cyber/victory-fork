@@ -763,27 +763,38 @@ pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading((usize, usize));
+pub struct Reading(Vec<(usize, usize)>);
 
 impl Drop for Reading {
     fn drop(&mut self) {
-        let_go(&mut held().reading, self.0);
+        let mut h = held();
+        for &range in &self.0 {
+            let_go(&mut h.reading, range);
+        }
+        drop(h);
         LET_GO.notify_all();
     }
 }
 
 /// For reading title memory `[at, at + len)` in place: until what it
 /// returns is dropped, the runtime changes no mapping there, so memory
-/// found mapped stays mapped. Not to be taken twice by one thread for
-/// memory that overlaps, nor held across anything that maps title memory.
+/// found mapped stays mapped. Not to be taken twice by one thread (a
+/// change waiting for the first would hold back the second: take both at
+/// once, [`title_memory_reading_all`]), nor held across anything that maps
+/// title memory.
 pub fn title_memory_reading(at: usize, len: usize) -> Reading {
-    let range = range(at, len);
+    title_memory_reading_all(&[(at, len)])
+}
+
+/// [`title_memory_reading`] for several ranges `(at, len)`, had together.
+pub fn title_memory_reading_all(ranges: &[(usize, usize)]) -> Reading {
+    let ranges: Vec<(usize, usize)> = ranges.iter().map(|&(at, len)| range(at, len)).collect();
     let mut h = held();
-    while meets(&h.remapping, range) || meets(&h.waiting, range) {
+    while ranges.iter().any(|&r| meets(&h.remapping, r) || meets(&h.waiting, r)) {
         h = LET_GO.wait(h).unwrap_or_else(|e| e.into_inner());
     }
-    h.reading.push(range);
-    Reading(range)
+    h.reading.extend_from_slice(&ranges);
+    Reading(ranges)
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
@@ -796,7 +807,7 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
         return None;
     }
     h.reading.push(range);
-    Some(Reading(range))
+    Some(Reading(vec![range]))
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
@@ -1319,6 +1330,23 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    /// Several ranges had together are held together: a change of either
+    /// waits, and all go at once.
+    #[test]
+    fn ranges_had_together_are_held_together() {
+        const AT: usize = 0x7200_0000_0000;
+        let both = super::title_memory_reading_all(&[(AT, 0x100), (AT + 0x10_0000, 0x100)]);
+        let (done, wait) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _changing = title_memory_remapping(AT + 0x10_0000, 0x1_0000);
+            done.send(()).unwrap();
+        });
+        assert!(wait.recv_timeout(Duration::from_millis(100)).is_err(), "the second range changed under the read");
+        drop(both);
+        wait.recv_timeout(Duration::from_secs(5)).expect("the change went on once the reads let go");
+        assert!(super::held().reading.iter().all(|&(a, _)| !(AT..AT + 0x20_0000).contains(&a)));
     }
 
     /// Memory elsewhere is not waited for, either way; and a change that

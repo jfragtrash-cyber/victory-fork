@@ -500,8 +500,13 @@ mod card_tests {
 
 /// Whether the copy-back of what shaders wrote runs on a thread of its own,
 /// beside the submitting thread and outside the submission lock
-/// (`VICTORY_RELAY=1` or `2`; off by default; not with kept snapshots,
-/// [`keeps`]). `crate::host::relay` says what it does; here it changes
+/// (`VICTORY_RELAY`: unset, `2` or `1` on, `0` off; not with kept
+/// snapshots, [`keeps`]). On by default since world runs C2 and D
+/// (MOONSHOT.md): from the same save, frames went from 540 to 378 ms in the
+/// opening of the prologue and from 412 to 270 ms in play, the same shots
+/// showing the same picture, with no crash and no failed read in either.
+/// Unit tests keep the synchronous model they were written for unless
+/// `VICTORY_RELAY` says otherwise. `crate::host::relay` says what it does; here it changes
 /// what a copy keeps:
 ///
 /// - the ranges shaders may be writing are counted per submission
@@ -516,7 +521,7 @@ mod card_tests {
 ///   had not received from bytes the card wrote.
 pub(crate) fn relay() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").is_ok_and(|v| v == "1" || v == "2") && !keeps())
+    *ON.get_or_init(|| std::env::var("VICTORY_RELAY").map_or(!cfg!(test), |v| v.trim() != "0") && !keeps())
 }
 
 /// The submission being prepared (its number among those started): what
@@ -3337,6 +3342,12 @@ mod busy_tests {
     /// (upstream VIctory #1322).
     #[test]
     fn title_writes_under_a_busy_range_are_copied() {
+        // The synchronous model: with the relay a range declared written
+        // stays closed to refreshes until its copy-back (`Flights`), and
+        // the title's bytes there are merged instead (`merge_under_writes`).
+        if relay() {
+            return;
+        }
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
         let len = 2 * PAGE;

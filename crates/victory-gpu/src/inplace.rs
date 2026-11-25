@@ -1789,6 +1789,65 @@ mod tests {
         }
     }
 
+    /// Resizable BAR as Direct3D shows it (`D3D12_HEAP_TYPE_GPU_UPLOAD`):
+    /// the card's own memory, mapped for the CPU. Whether this PC has it,
+    /// and what it costs: the CPU writing and reading 256 MB of it, and
+    /// the card's scattered reads from it (against its other memory in
+    /// `card_gathers_from_memory_in_place`).
+    #[test]
+    #[ignore = "opens the card"]
+    fn card_gpu_upload_heap_probe() {
+        let Some(device) = card() else { return };
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+        // SAFETY: a plain query that fills our structure.
+        let asked = unsafe { device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, (&raw mut options).cast(), size_of_val(&options) as u32) };
+        eprintln!("rebar probe: options 16 asked: {asked:?}; GPU upload heaps supported: {}", options.GPUUploadHeapSupported.as_bool());
+        if asked.is_err() || !options.GPUUploadHeapSupported.as_bool() {
+            return;
+        }
+        let bytes = 256usize << 20;
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_GPU_UPLOAD, ..Default::default() };
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation and mapping of a buffer of ours.
+        unsafe {
+            if let Err(e) = device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &buffer_desc(bytes as u64, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut made,
+            ) {
+                eprintln!("rebar probe: no such buffer: {e}");
+                return;
+            }
+            let buffer = made.unwrap();
+            let mut data = std::ptr::null_mut();
+            buffer.Map(0, None, Some(&mut data)).unwrap();
+            let source = vec![0x5au8; bytes];
+            let started = std::time::Instant::now();
+            std::ptr::copy_nonoverlapping(source.as_ptr(), data.cast::<u8>(), bytes);
+            let write = started.elapsed().as_secs_f64();
+            let mut back = vec![0u8; 16 << 20];
+            let started = std::time::Instant::now();
+            std::ptr::copy_nonoverlapping(data.cast::<u8>(), back.as_mut_ptr(), back.len());
+            let read = started.elapsed().as_secs_f64();
+            eprintln!(
+                "rebar probe: the CPU writes {:.1} GB/s into the card's memory, reads {:.2} GB/s back; bytes read back right: {}",
+                bytes as f64 / write / 1e9,
+                back.len() as f64 / read / 1e9,
+                back.iter().all(|&b| b == 0x5a)
+            );
+            let mut rig = Rig::new(&device).unwrap();
+            let gpu = buffer.GetGPUVirtualAddress();
+            eprintln!(
+                "rebar probe: the card's scattered reads from it: over 256 MB {:?} ms, over 1 MB {:?} ms",
+                rig.gather_ms(gpu, bytes as u64),
+                rig.gather_ms(gpu, 1 << 20)
+            );
+        }
+    }
+
     #[test]
     #[ignore = "opens the card"]
     fn card_heap_as_the_pool_probe() {

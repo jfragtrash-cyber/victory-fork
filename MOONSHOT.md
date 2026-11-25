@@ -308,6 +308,58 @@ already reach.
   compared. The black-frame check is left out with late presents, so its
   0 proves nothing. No crash. The relay stays off by default until frames
   captured with and without it have been compared.
+- 2026-11-25. Runs are now made from a copy of the saves
+  (`saves-backup-20261125-after-capB`, outside the tree), restored before
+  each run. The title autosaves, so without the copy each run started where
+  the one before had saved. Run C (no relay) ended about 2.5 minutes into
+  the prologue on a breakpoint in the title's streaming. It came right
+  after a DirectStorage read straight into title memory had failed with
+  ERROR_INVALID_USER_BUFFER (0x800706f8). Such reads never took the read
+  lock: while `xmem` maps one page of a view anew, the view's other pages
+  are a reservation for a moment, and a kernel write into them fails. Each
+  request now holds, in one taking, the title memory it reads or writes in
+  place (`watch::title_memory_reading_all`). One taking, not two, because
+  a change waiting on the first would hold back the second. Run C2, same
+  save, with the fix: more than 6 minutes in the prologue, no failed read,
+  no crash.
+- 2026-11-25. Runs C2 (no relay) and D (relay), same save, frames captured
+  every 8th frame in the world:
+
+  | Run | Prologue opening frame (CPU) | Play frame (CPU) |
+  |-----|-----------------------------|------------------|
+  | C2, no relay | 540 ms (182) | 412 ms (147) |
+  | D, relay | **378 ms (190)** | **270 ms (145)** |
+
+  The same shots show the same picture (frames +2 to +200 after the world
+  starts). Neither run has a black frame, a crash or a failed read. Later,
+  C2's character walked to the canteen on its own while D's stayed at the
+  window. C2 then shows big flat triangles (green, black, brown) across the
+  screen in nearly every frame. Those are older than this work (the owner
+  saw them before) and appear without the relay. They are a bug of their
+  own, still open. **The relay is now on by default** (`VICTORY_RELAY` at
+  2; `0` turns it off). Unit tests keep the synchronous model they were
+  written for; the two tests specific to that model skip under the relay.
+- 2026-11-25. Run E, the new defaults and no switch, same save: the relay
+  is on by itself. The prologue opening runs at 436 ms a frame (CPU 181)
+  and play at **264 ms (about 3.8 fps)**, CPU 137. No black frame, crash
+  or failed read. Play by default over the day: 521 ms with the old
+  defaults (run 3), 401 with card memory and the range lock (run 7), 264
+  now.
+- 2026-11-25. Resizable BAR (`card_gpu_upload_heap_probe`): Direct3D's
+  form of it, `D3D12_HEAP_TYPE_GPU_UPLOAD`, is not offered on this PC.
+  `nvidia-smi` shows a BAR1 window of 256 MiB, so Resizable BAR is off in
+  the firmware; with it on, the window covers all 24 GiB. Where it would
+  help: copies in the card's memory brought up to date by the CPU writing
+  into them directly, with no CPU side in the PC's memory, no copy on the
+  card and no hash passes to find what changed. That fits copies shaders
+  only read, such as the windows. It cannot be title memory itself: the
+  CPU reads such memory uncached over the bus, and the driver picks the
+  address. To retest after turning it on: the same probe.
+- 2026-11-25. Unattended runs can now walk the character
+  (`VICTORY_KEYS=<seconds>:<key>[:<hold>]`; W A S D and I J K L are the
+  sticks, Z and C the triggers, with a real pad connected too). Run G
+  walked the cell block for 1,300 frames with no flat triangles. They show
+  in the yard and the canteen (run C2), which the walk did not reach.
 - 2026-11-25. Where the same table points instead: for scattered reads, the
   card's own memory is 28 times faster than today's host copies, and today
   every buffer below 16 MiB, and everything past 512 MB of card copies,

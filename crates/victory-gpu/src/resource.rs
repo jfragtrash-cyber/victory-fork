@@ -2479,6 +2479,11 @@ mod tests {
     #[test]
     fn buffer_data_reaches_the_host_texture() {
         use windows::Win32::Graphics::Direct3D12::*;
+        // The synchronous model: submissions sent ahead (the relay) hold
+        // what they use in their flights, not in the upload list.
+        if crate::host::late() {
+            return;
+        }
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };

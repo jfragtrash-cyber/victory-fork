@@ -794,7 +794,7 @@ pub(crate) const MANY_VIEWS: usize = 64;
 
 /// Whether all the views of a guarded page are guarded together
 /// (`VICTORY_VIEW_GUARD`).
-fn view_guard() -> bool {
+pub(crate) fn view_guard() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_GUARD").is_none_or(|v| v != "0"))
 }

@@ -1978,6 +1978,12 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Title memory the recording's shaders may write, in recording order:
+    /// the ranges declared written (`[from, to)`), and how many commands so
+    /// far run shaders that may store where no bound view says
+    /// ([`HostList::stored_since`]).
+    stored: Vec<(usize, usize)>,
+    raw_stores: u32,
 }
 
 impl Deferred {
@@ -6707,9 +6713,39 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+        deferred.stored.push((address, address.saturating_add(len)));
+    }
+
+    /// A command about to be recorded runs shaders that may store to title
+    /// memory no bound view names (`crate::pipeline::Translated::raw_stores`).
+    pub(crate) fn raw_store(&self) {
+        self.deferred().raw_stores += 1;
+    }
+
+    /// Where the recording stands in what its shaders may write, for
+    /// [`HostList::stored_since`].
+    pub(crate) fn stored_mark(&self) -> (usize, u32) {
+        let deferred = self.deferred();
+        (deferred.stored.len(), deferred.raw_stores)
+    }
+
+    /// Whether a command recorded since `mark` ([`HostList::stored_mark`];
+    /// `(0, 0)`: since the recording began) may have written title memory
+    /// `[at, at + len)`: a range declared written that meets it, or shaders
+    /// that store where no view says.
+    pub(crate) fn stored_since(&self, mark: (usize, u32), at: usize, len: usize) -> bool {
+        let deferred = self.deferred();
+        let end = at.saturating_add(len);
+        deferred.raw_stores != mark.1
+            || deferred.stored.get(mark.0..).is_some_and(|s| s.iter().any(|&(from, to)| from < end && at < to))
+    }
+
+    /// The range declared written by a command recorded since the recording
+    /// began that holds title address `at`, if any (the last one).
+    pub(crate) fn stored_around(&self, at: usize) -> Option<(usize, usize)> {
+        self.deferred().stored.iter().rev().find(|&&(from, to)| from <= at && at < to).copied()
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -7858,6 +7894,17 @@ impl Meter {
                     "title buffer copies recorded per frame: {copies:.0}, of them {joined:.0} continue the one before \
                      (VICTORY_JOIN_COPIES=1 makes those one copy with it: now {})",
                     if join_copies() { "on" } else { "off" }
+                );
+            }
+        }
+        // Title-filled textures read past their guards, by why.
+        {
+            let [written, turn, aliased, unguarded, partial] =
+                [0, 1, 2, 3, 4].map(|i| crate::texture::TEX_WHY[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
+            if written + turn + aliased + unguarded > 0.0 {
+                tracing::info!(
+                    "textures read past their guards per frame: {written:.1} MB written, {turn:.1} MB their eighth-frame turn, \
+                     {aliased:.1} MB pages shown elsewhere too, {unguarded:.1} MB neither watched nor guarded; {partial:.1} MB of it partly mapped"
                 );
             }
         }

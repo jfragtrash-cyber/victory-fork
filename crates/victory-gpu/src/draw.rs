@@ -134,10 +134,47 @@ struct Window {
     base: u64,
     records: u32,
     scratch: ID3D12Resource,
+    /// The title address of the first record, and where the list stood in
+    /// what its shaders may write when the window was clamped
+    /// (`HostList::stored_mark`; [`precise`]).
+    address: u64,
+    mark: (usize, u32),
 }
 
 /// The most records clamped in one pass ([`windows`]).
 const WINDOW_MOST: u64 = 64;
+
+/// The most records clamped in one pass with [`precise`]: a culling pass's
+/// whole output (1,024 records of 32 bytes in the timing run's frame).
+const WINDOW_MOST_PRECISE: u64 = 4096;
+
+/// Whether windows and gathered records ([`windows`], [`gathers`]) end only
+/// where something may have written their records
+/// (`VICTORY_INDIRECT_PRECISE`; on by default, `0`: off).
+///
+/// Without it a window ended at every compute dispatch and every direct
+/// draw, and a list stopped gathering at the first dispatch or storing
+/// draw: anything might write arguments. The title's frame is one culling
+/// dispatch writing a run of records, then hundreds of mesh draws reading
+/// one record each, then the next dispatch (timing run K: 6,632 records a
+/// frame clamped one at a time, about 100 ms of the card's frame, each a
+/// trip from drawing to compute and back). What a recorded command's
+/// shaders may write is known: the ranges declared written as its views
+/// are bound (`Shadow::gpu_writes`), unless its code stores through
+/// addresses it computes (`crate::pipeline::Translated::raw_stores`).
+///
+/// With the switch each host list keeps that log (`HostList::stored_since`):
+/// a window serves a draw unless a range declared written since its clamp
+/// meets its records, or a command with such stores was recorded since; a
+/// record is gathered for the list's prelude unless anything recorded
+/// before it in the list may have written it. A record that lies in a range
+/// written earlier in the list (a culling pass's output) opens a window
+/// over the rest of that range, at the step the title walks, up to
+/// [`WINDOW_MOST_PRECISE`] records, instead of 16, 32, 64.
+fn precise() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_PRECISE").is_none_or(|v| v != "0"))
+}
 
 /// Whether indirect draws that read record after record of one argument
 /// buffer are clamped a window at a time (`VICTORY_INDIRECT_WINDOW=1`; off
@@ -2217,11 +2254,35 @@ impl State {
         crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores))
     }
 
+    /// Whether the shaders of the pipeline bound now can store where no
+    /// bound view says (or the pipeline is not known).
+    fn may_store_raw(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| p.stages.iter().any(|stage| stage.translated().raw_stores))
+    }
+
+    /// Before a direct command with the pipeline bound now: what it may
+    /// write of the arguments windows and gathered records hold. With
+    /// [`precise`] only stores where no view says are noted (the ranges its
+    /// views declare are logged as they are bound); without it the window
+    /// ends, and gathering too for a dispatch or a draw whose shaders can
+    /// store.
+    fn stores_noted(&mut self, list: &HostList, dispatch: bool) {
+        if precise() && windows() {
+            if self.may_store_raw() {
+                list.raw_store();
+            }
+            return;
+        }
+        self.window = None;
+        if dispatch || self.may_store() {
+            list.gather_close();
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         // It may write the arguments a window holds clamped.
-        self.window = None;
-        list.gather_close();
+        self.stores_noted(list, true);
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2531,10 +2592,7 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
-        self.window = None;
-        if self.may_store() {
-            list.gather_close();
-        }
+        self.stores_noted(list, false);
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         let ran = mesh_test() != 1
@@ -3007,10 +3065,7 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
-        self.window = None;
-        if self.may_store() {
-            list.gather_close();
-        }
+        self.stores_noted(list, false);
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let ready = self.prepare(list, false);
@@ -3115,10 +3170,7 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
-        self.window = None;
-        if self.may_store() {
-            list.gather_close();
-        }
+        self.stores_noted(list, false);
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         // Indexed rectangles are drawn by the rectangle geometry stage
@@ -3251,27 +3303,33 @@ impl State {
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
+        // With [`precise`] dispatches and storing shaders too: what they
+        // write is logged once their views are bound, after their own record
+        // is clamped, so the next command's record is clamped again if they
+        // wrote it.
         let windowed = windows()
-            && kind != DISPATCH
             && max == 1
             && count.is_none()
-            && !p.stages.iter().any(|stage| stage.translated().stores);
+            && (precise() || kind != DISPATCH && !p.stages.iter().any(|stage| stage.translated().stores));
         // Another host list (a new one after a cut, or this one after its
         // reset) has another scratch buffer, or this one's with old bytes.
         let first_on_list = list.first_use(WINDOW_USE);
         if !windowed || first_on_list {
             self.window = None;
         }
-        if !windowed {
+        let exact = precise() && windows();
+        if !windowed && !exact {
             // A dispatch, or shaders that store to buffers: arguments may
             // be written from here on.
             list.gather_close();
         }
+        // Stores of its own where no view says: noted once it is recorded.
+        let raw = exact && p.stages.iter().any(|stage| stage.translated().raw_stores);
         // Diagnostics: why this command gets a pass of ours, if it does.
         #[cfg(feature = "diagnostics")]
         let why_not = if !windows() {
             usize::MAX
-        } else if kind == DISPATCH {
+        } else if kind == DISPATCH && !windowed {
             1
         } else if max != 1 {
             2
@@ -3295,10 +3353,16 @@ impl State {
             .as_ref()
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
+            // Nothing recorded since its clamp may have written its records.
+            .filter(|w| !exact || !list.stored_since(w.mark, w.address as usize, (u64::from(w.records) * u64::from(w.step)) as usize))
             .map(|w| (w.scratch.clone(), offset - w.base, w.step));
         // A record that misses its window: a slot the list's prelude fills,
         // if the list still gathers ([`gathers`]).
-        let gathered = if hit.is_none() && windowed && gathers() {
+        let gathered = if hit.is_none()
+            && windowed
+            && gathers()
+            && !(exact && list.stored_since((0, 0), arguments as usize, len as usize))
+        {
             let slot = crate::indirect::gather(list, (&args.buffer, args.id()), offset, (kind, stride));
             #[cfg(feature = "diagnostics")]
             WINDOW_WHY[if slot.is_some() { 12 } else { 13 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3365,7 +3429,17 @@ impl State {
                             && step <= 256
                             && step % 4 == 0
                             && (w.records == 1 || step == u64::from(w.step));
-                        if walks {
+                        if walks && exact {
+                            // The rest of the range written earlier in the
+                            // list that holds the record (a culling pass's
+                            // output), or four times the last window.
+                            let fit = (args.left(arguments) / step).min(WINDOW_MOST_PRECISE) as u32;
+                            let produced = list
+                                .stored_around(arguments as usize)
+                                .map(|(_, to)| (to as u64).saturating_sub(arguments).div_ceil(step) as u32);
+                            let grown = if w.records == 1 { 16 } else { w.records.saturating_mul(4) };
+                            (step as u32, produced.map_or(grown, |n| n.max(grown)).min(fit).max(1))
+                        } else if walks {
                             let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
                             (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
                         } else {
@@ -3445,6 +3519,8 @@ impl State {
                     base: offset,
                     records,
                     scratch: bounded.clone(),
+                    address: arguments,
+                    mark: list.stored_mark(),
                 });
                 (bounded, 0)
             }
@@ -3488,6 +3564,9 @@ impl State {
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it
         // back (`crate::indirect`).
+        if raw {
+            list.raw_store();
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {

@@ -953,6 +953,13 @@ fn aliased(start: usize, size: usize) -> bool {
     aliased
 }
 
+/// Bytes of title-filled textures read past the guards since the last frame
+/// line, by why: the guards saw a write; the texture's turn of the
+/// eighth-frame hash; its pages shown at another address too; memory with
+/// neither write watch nor guard; and of all of them, partly mapped ones
+/// (read again every thirtieth frame).
+pub(crate) static TEX_WHY: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
 impl Staging {
     /// Levels on demand: what says, beside the mapping, which levels of
     /// the texture are the title's now. First the lowest level a live view
@@ -1073,6 +1080,8 @@ impl Staging {
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // Diagnostics: why the texture is read below ([`TEX_WHY`]).
+        let mut why = 3;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
@@ -1080,15 +1089,18 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            // Pages shown at another address too may be written by a way
-            // that faults nowhere (the guards' twins see the title's own
-            // writes, not ours through views of our own): such a texture is
-            // hashed at every check, as before the guard. The opening
-            // video's frames were otherwise seen one frame in eight (run 25).
+            // Pages shown at another address too, where the guards do not
+            // follow them (`crate::inplace::aliased`: a page of very many
+            // views, or views not guarded together), may be written by a
+            // way that faults nowhere: such a texture is hashed at every
+            // check, as before the guard. The opening video's frames were
+            // otherwise seen one frame in eight (run 25).
             if unwritten && !turn && !aliased(start, size) {
                 return 0;
             }
+            why = if !unwritten { 0 } else if turn { 1 } else { 2 };
         }
+        TEX_WHY[why].fetch_add(size as u64, std::sync::atomic::Ordering::Relaxed);
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
         // only with this taken alone, so what `committed` finds mapped
@@ -1119,6 +1131,7 @@ impl Staging {
                 return 0;
             }
             last.partial = Some(frame);
+            TEX_WHY[4].fetch_add(size as u64, std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {

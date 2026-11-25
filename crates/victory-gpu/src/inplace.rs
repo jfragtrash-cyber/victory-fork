@@ -575,14 +575,44 @@ pub(crate) fn views_gone(at: usize, len: usize) {
 }
 
 /// Whether physical pages that `[at, at + len)` shows are shown at another
-/// address too ([`aliases`]), remembered until the views change.
+/// address too ([`aliases`]) where the guards do not follow them: with the
+/// views of a page guarded together (`crate::watch::view_guard`), a write
+/// through any of them is seen, unless the page has more than
+/// `crate::watch::MANY_VIEWS` views. Remembered until the views change.
+///
+/// Textures in such memory were hashed at every check: 124 MB a frame of
+/// the 128 hashed in run N's gameplay, all of it pages shown at several
+/// addresses that the guards already covered.
 pub(crate) fn aliased(at: usize, len: usize) -> bool {
     let mut v = views();
     let v = &mut *v;
-    *v.aliased
-        .get_or_insert_with(Default::default)
-        .entry((at, len))
-        .or_insert_with(|| !aliases_in_parts(&v.views, &v.shown, &v.big, v.longest, at, len).is_empty())
+    if let Some(&known) = v.aliased.as_ref().and_then(|m| m.get(&(at, len))) {
+        return known;
+    }
+    let shown = !aliases_in_parts(&v.views, &v.shown, &v.big, v.longest, at, len).is_empty();
+    let unguarded = shown && (!crate::watch::view_guard() || many_views(v, at, len));
+    v.aliased.get_or_insert_with(Default::default).insert((at, len), unguarded);
+    unguarded
+}
+
+/// Whether a 64 KiB page that `[at, at + len)` shows is shown in more than
+/// `crate::watch::MANY_VIEWS` views (whose guards are not set together).
+fn many_views(v: &Views, at: usize, len: usize) -> bool {
+    let end = at.saturating_add(len);
+    let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at);
+    first.into_iter().chain(v.views.range(at.saturating_add(1)..end)).any(|(&base, &(bytes, section, offset))| {
+        let (from, to) = (base.max(at), (base + bytes).min(end));
+        let mut page = offset + (from - base) as u64;
+        page -= page % K64 as u64;
+        let last = offset + (to - base) as u64;
+        while page < last {
+            if v.pages.get(&(section, page)).is_some_and(|views| views.len() > crate::watch::MANY_VIEWS) {
+                return true;
+            }
+            page += K64 as u64;
+        }
+        false
+    })
 }
 
 /// The other addresses that show physical pages `[at, at + len)` shows:

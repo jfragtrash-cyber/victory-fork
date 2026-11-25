@@ -144,6 +144,10 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it can store to memory no bound view names ([`raw_stores`]):
+    /// its writes are then not among the ranges declared written, and
+    /// whatever was clamped from title memory before it may be stale.
+    pub(crate) raw_stores: bool,
 }
 
 #[cfg(windows)]
@@ -202,6 +206,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     };
     let host = crate::shader_cache::host_shader(container)?;
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let raw_stores = programs.is_empty() || programs.iter().any(raw_stores);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -212,7 +217,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated { host, used, stores, raw_stores })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -434,6 +439,29 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             | Encoding::Global => name.is_none_or(|n| {
                 (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
             }),
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
+}
+
+/// Whether a console program can store to memory that no view bound to
+/// it names: a flat, global or scalar-memory store or atomic (an address
+/// the program computes), or code that is not all known. Its buffer and
+/// typed-buffer stores go through descriptors, whose ranges are declared
+/// written when they are bound (`Shadow::gpu_writes`); these do not.
+#[cfg(windows)]
+fn raw_stores(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Smem | Encoding::Flat | Encoding::Global => {
+                name.is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
+            }
             Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
             _ => false,
         }

@@ -425,7 +425,7 @@ pub(crate) struct State {
     host_heaps: [usize; 2],
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    fresh_tables: FastMap<(u64, u32, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -433,9 +433,9 @@ pub(crate) struct State {
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
     /// copy the address would find by then (`shadow.rs` `tails`).
-    root_srv_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_srv_slots: FastMap<(usize, u64), RootSlot>,
     /// Root UAVs bound as one-view tables in this list, likewise.
-    root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
+    root_uav_slots: FastMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
 }
@@ -552,6 +552,56 @@ pub(crate) fn take_dropped() -> u64 {
 }
 /// A root SRV's dynamic slot in a list, and the host copy it shows.
 type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
+
+/// A hash for keys of ours (title addresses, heap objects, slot counts and
+/// prints of records), not for anything a stranger chooses. The standard
+/// one (SipHash) over a list's tables and root views was 1.7 ms a frame of
+/// the recording threads in run P's gameplay.
+#[derive(Default, Clone, Copy)]
+struct Fast(u64);
+
+impl std::hash::Hasher for Fast {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+    fn write_u32(&mut self, v: u32) {
+        self.write_u64(u64::from(v));
+    }
+    fn write_u64(&mut self, v: u64) {
+        self.0 = (self.0.rotate_left(5) ^ v).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    fn write_usize(&mut self, v: usize) {
+        self.write_u64(v as u64);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type FastMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<Fast>>;
+
+/// A 64-bit print of the first three words of `n` descriptor records of
+/// 32 bytes from `table` (tag, view index, generation: all a record
+/// names): equal tables print alike, and tables that differ in one word
+/// never do (each step is a bijection of the print); two that differ more
+/// print alike about once in 2^64. The multiply-and-fold of
+/// `descriptor::host::record_print`.
+fn table_print(table: u64, n: u32) -> u64 {
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut h = K ^ u64::from(n);
+    for k in 0..n {
+        let at = table + u64::from(k) * 32;
+        // SAFETY: a descriptor slot in title memory.
+        let [tag, i, generation] = unsafe { (at as *const [u32; 3]).read_unaligned() };
+        for w in [u64::from(tag) | u64::from(i) << 32, u64::from(generation)] {
+            h = (h ^ w).wrapping_mul(K);
+            h ^= h >> 29;
+        }
+    }
+    h ^ (h >> 32)
+}
 
 /// Buffer views of the heap whose slot showed another host buffer than
 /// the copy the pass brought up to date for them, since the start
@@ -1220,7 +1270,16 @@ impl State {
                 None
             };
             if let Some((param, dwords)) = stage.user_data {
-                let mut values = vec![0u32; dwords as usize];
+                // (A root signature holds 64 dwords at most: no allocation
+                // per stage and draw.)
+                let (mut most, mut more) = ([0u32; 64], Vec::new());
+                let values: &mut [u32] = match most.get_mut(..dwords as usize) {
+                    Some(values) => values,
+                    None => {
+                        more.resize(dwords as usize, 0);
+                        &mut more
+                    }
+                };
                 for u in &t.host.user_data {
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
@@ -2899,16 +2958,7 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                }
-                (table, n, h.finish())
-            };
+            let key = (table, n, table_print(table, n));
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
@@ -3699,8 +3749,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 SHADER_RESOURCE
             };
             crate::list::ensure_state(list, *resource as This, state);
+            // (Asked only when the line can be written: the look and the
+            // description were 1 ms a frame of the recording threads.)
             #[cfg(feature = "diagnostics")]
-            if let Some(t) = crate::resource::host_resource(*resource as This) {
+            if tracing::enabled!(tracing::Level::DEBUG)
+                && let Some(t) = crate::resource::host_resource(*resource as This)
+            {
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
                 if d.Flags.0 & 7 == 0 {
@@ -3934,5 +3988,26 @@ mod tests {
         assert_eq!(jump_window(remembered, (7, 0, 12), 1 << 20), None);
         assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
+    }
+
+    /// Tables of the same records print alike wherever they lie; one word
+    /// changed anywhere in a record's first three, or another length,
+    /// prints otherwise; the rest of a record does not count.
+    #[test]
+    fn a_table_prints_by_its_records() {
+        let records: Vec<u32> = (0..4 * 8).map(|i| 0x5649_4500 ^ i * 0x0101_0101).collect();
+        let print = |words: &[u32], n: u32| table_print(words.as_ptr() as u64, n);
+        let first = print(&records, 4);
+        assert_eq!(first, print(&records.clone(), 4));
+        assert_ne!(first, print(&records, 3));
+        for at in (0..4).flat_map(|k| (0..3).map(move |w| k * 8 + w)) {
+            let mut other = records.clone();
+            other[at] ^= 1 << (at % 32);
+            assert_ne!(print(&other, 4), first, "word {at}");
+        }
+        let mut rest = records.clone();
+        rest[3] ^= 1;
+        rest[31] ^= 1;
+        assert_eq!(print(&rest, 4), first);
     }
 }

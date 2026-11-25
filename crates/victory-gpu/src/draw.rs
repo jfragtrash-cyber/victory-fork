@@ -584,6 +584,34 @@ impl std::hash::Hasher for Fast {
 
 type FastMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<Fast>>;
 
+/// Root parameter slots as a set, in slot order: the tables
+/// [`State::tables`] makes afresh, without a vector of them for each stage
+/// of each draw.
+#[derive(Default, Clone, Copy)]
+struct SlotSet([u64; 4]);
+
+impl SlotSet {
+    fn insert(&mut self, slot: u8) {
+        self.0[usize::from(slot >> 6)] |= 1 << (slot & 63);
+    }
+
+    fn contains(&self, slot: u8) -> bool {
+        self.0[usize::from(slot >> 6)] & 1 << (slot & 63) != 0
+    }
+
+    /// The slots, lowest first.
+    fn iter(self) -> impl Iterator<Item = u8> {
+        (0..4u8).flat_map(move |word| {
+            let mut bits = self.0[usize::from(word)];
+            std::iter::from_fn(move || {
+                let bit = (bits != 0).then(|| bits.trailing_zeros() as u8)?;
+                bits &= bits - 1;
+                Some(word * 64 + bit)
+            })
+        })
+    }
+}
+
 /// A 64-bit print of the first three words of `n` descriptor records of
 /// 32 bytes from `table` (tag, view index, generation: all a record
 /// names): equal tables print alike, and tables that differ in one word
@@ -2874,17 +2902,15 @@ impl State {
         compute: bool,
     ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
-        let mut fresh: Vec<u8> = used
-            .iter()
-            .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
-            .map(|u| u.slot)
-            .collect();
+        let mut fresh = SlotSet::default();
+        for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
+            fresh.insert(u.slot);
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
         for u in used.iter().filter(tables) {
-            if fresh.contains(&u.slot) {
+            if fresh.contains(u.slot) {
                 continue;
             }
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
@@ -2898,26 +2924,20 @@ impl State {
                 continue;
             };
             if index >= host.count() {
-                fresh.push(u.slot);
+                fresh.insert(u.slot);
             }
         }
-        fresh.sort_unstable();
-        fresh.dedup();
         for u in used.iter().filter(tables) {
-            if !fresh.contains(&u.slot) {
+            if !fresh.contains(u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
         let mut made = Vec::new();
-        for slot in fresh {
+        for slot in fresh.iter() {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
+            let entries = || used.iter().filter(tables).filter(move |u| u.slot == slot);
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
@@ -2943,8 +2963,7 @@ impl State {
                 .collect();
             selected.sort_unstable();
             selected.dedup();
-            let n = entries
-                .iter()
+            let n = entries()
                 .map(|u| u.table_offset_dwords / 8)
                 .chain(selected.last().copied())
                 .max()
@@ -2960,14 +2979,14 @@ impl State {
             // The table and what its entries hold (record words).
             let key = (table, n, table_print(table, n));
             if let Some(&first) = self.fresh_tables.get(&key) {
-                for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
                     }
                 }
                 for k in selected {
-                    if entries.iter().any(|u| u.table_offset_dwords / 8 == k) {
+                    if entries().any(|u| u.table_offset_dwords / 8 == k) {
                         continue;
                     }
                     let handle = table + u64::from(k) * 32;
@@ -2996,7 +3015,7 @@ impl State {
             // used-resource list names (descriptor arrays).
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let used = entries().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
@@ -3988,6 +4007,19 @@ mod tests {
         assert_eq!(jump_window(remembered, (7, 0, 12), 1 << 20), None);
         assert_eq!(jump_window(remembered, (7, 10, 16), 1 << 20), None);
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
+    }
+
+    /// Slots come out of the set once each, lowest first, over all four
+    /// words.
+    #[test]
+    fn slot_sets_hold_each_slot_once_in_order() {
+        let mut set = SlotSet::default();
+        for slot in [200, 3, 64, 3, 0, 255, 63, 127] {
+            set.insert(slot);
+        }
+        assert_eq!(set.iter().collect::<Vec<u8>>(), [0, 3, 63, 64, 127, 200, 255]);
+        assert!(set.contains(64) && !set.contains(65));
+        assert_eq!(SlotSet::default().iter().count(), 0);
     }
 
     /// Tables of the same records print alike wherever they lie; one word

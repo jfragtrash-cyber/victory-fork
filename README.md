@@ -45,6 +45,44 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Frame rate in the world | 8 to 10 fps in the first rooms: 97 to 104 ms a frame at about 3,850 draws, 122 ms in a heavier view (6,774 draws). 5 to 8.5 fps through the opening cutscene, by stretch (runs 271 to 273, with `VICTORY_CARD_WINDOWS_MB`). All measured with the switch set of run 253, which is off by default: `VICTORY_LEVELS_ON_DEMAND=1 VICTORY_ASYNC_SUBMIT=1 VICTORY_QUEUE2=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_TEXTURE_NO_WAIT=1 VICTORY_MERGE_GAP=64 VICTORY_MERGE_RUNS=4096 VICTORY_STAGING_POOL=0 VICTORY_COPY_PLAIN=1 VICTORY_JOIN_PARTS=1 VICTORY_BACK_OWN_VIEW=1 VICTORY_INDIRECT_GATHER=1 VICTORY_CARD_REHASH_RUNS=1`. The plain defaults were last measured at 420 to 450 ms a frame and not since. It started at 3 to 6 seconds a frame |
 | Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
 
+### Newest (2026-11-26, night)
+
+**Play at 100-114 ms a frame (about 9-10 fps) in the cell view with run
+253's switches and `VICTORY_ASYNC_PRESENT=1 VICTORY_VIEW_KNOWN=1`, from
+250-335 ms with the merged defaults (run AC against run L).** The picture
+is right (skin, walls, light). Measured on an RTX 3090 / Ryzen 9 5950X.
+What did it, all in the tree, most on by default (see MOONSHOT.md's day 2):
+- Precise indirect windows (`VICTORY_INDIRECT_PRECISE`, on with
+  `VICTORY_INDIRECT_WINDOW=1`): a window of clamped indirect records ends
+  only when a write meets its records, sized to the range a culling pass
+  wrote. 6,632 clamp passes a frame (each a trip of the card from drawing
+  to compute and back) became 232; the card stopped being the limit.
+- Textures whose pages show at several addresses are no longer hashed at
+  every check where the guards already follow every view (42-47 -> 7-10 ms
+  of texture work a frame).
+- Memory tracking (kept answers about unmapped blocks, refresh copies on
+  the kept threads, small fills in place) and command translation
+  (lock-free reads of made descriptor slots, per-thread lookup caches):
+  the recording threads' calls fell from ~310 to ~150 ms a frame in all.
+- DirectStorage writes into physical pages through one kept view of our
+  own per section (`VICTORY_OWN_SECTION_VIEWS`).
+
+What bounds a frame now: the title stays two frames ahead of its fences,
+and a fence is set only after our preparing, the card's work and the
+landing of shaders' writes (~55 ms a frame on the relay thread), so a
+frame is about half of that chain. The low points are texture streaming:
+the GPU's page-mapping copies cost two system calls a page (120-1,000 us
+each in the running title) and cutscene frames reach 1-3.5 s. Copies
+instead of views (`VICTORY_ALIAS_COPY=1`) are 31 us a page but stay off:
+the title's processor uses those pages too (run AA ended on a breakpoint
+of the title's).
+
+New switches: `VICTORY_INDIRECT_PRECISE`, `VICTORY_OWN_SECTION_VIEWS`,
+`VICTORY_ALIAS_RUNS`, `VICTORY_ALIAS_COPY`, `VICTORY_PRESENTS_AHEAD`,
+`VICTORY_ABSENT_KEEP`, `VICTORY_SPREAD_COPIES`, `VICTORY_COPY_PLAIN_SMALL`,
+`VICTORY_SLOT_LOCKS`, `VICTORY_LOOKUP_CACHE`, `VICTORY_VIEWS_SEEN`; each is
+documented where it is read.
+
 ### Newest (2026-11-25, evening UTC)
 
 **Update, 2026-11-25 evening: a frame capture built into the layer, and a

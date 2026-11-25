@@ -2208,27 +2208,49 @@ fn changed_chunks(now: &[u8], was: &[u8], chunk: usize) -> Vec<(usize, usize)> {
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
+///
+/// Eight bytes at a time, equal or differing: a word whose bytes all
+/// differ goes on with the run as one that is all equal ends it, and only
+/// a word of both kinds is looked at byte by byte. The bytes that differed
+/// were walked one at a time: in run P the merge of the title's writes
+/// under ranges shaders write (`Shadow::merge_under_writes`) spent 2.4 ms
+/// a frame of the submitting thread here, most of a page differing where
+/// the title had rewritten it.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    const HIGH: u64 = !LOW;
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
+    // Where the run being walked began.
+    let mut open: Option<usize> = None;
+    let mut byte = |at: usize, differs: bool, runs: &mut Vec<(usize, usize)>| {
+        if differs {
+            open.get_or_insert(at);
+        } else if let Some(first) = open.take() {
+            runs.push((first, at - first));
+        }
+    };
     let mut i = 0;
-    while i < n {
-        // Equal bytes, eight at a time while they last.
-        while i + 8 <= n && now[i..i + 8] == was[i..i + 8] {
-            i += 8;
+    while i + 8 <= n {
+        let word = |s: &[u8]| u64::from_le_bytes(s[i..i + 8].try_into().unwrap_or_default());
+        let x = word(now) ^ word(was);
+        // The top bit of each byte that differs (no carry crosses a byte:
+        // seven bits and 0x7f make at most 0xfe).
+        let differ = ((x & LOW).wrapping_add(LOW) | x) & HIGH;
+        if differ == 0 || differ == HIGH {
+            byte(i, differ != 0, &mut runs);
+        } else {
+            for k in 0..8 {
+                byte(i + k, differ >> (8 * k + 7) & 1 != 0, &mut runs);
+            }
         }
-        while i < n && now[i] == was[i] {
-            i += 1;
-        }
-        if i >= n {
-            break;
-        }
-        let first = i;
-        while i < n && now[i] != was[i] {
-            i += 1;
-        }
-        runs.push((first, i - first));
+        i += 8;
     }
+    while i < n {
+        byte(i, now[i] != was[i], &mut runs);
+        i += 1;
+    }
+    byte(n, false, &mut runs);
     runs
 }
 
@@ -2424,6 +2446,35 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    /// A page rewritten nearly whole is one run between the bytes that
+    /// stayed (the walk goes eight bytes at a time through it), wherever
+    /// those fall against the words.
+    #[test]
+    fn a_page_rewritten_whole_is_its_runs_between_the_bytes_that_stayed() {
+        const N: usize = 64 << 10;
+        let was: Vec<u8> = (0..N).map(|i| (i * 31 + 7) as u8).collect();
+        let now: Vec<u8> = was.iter().map(|b| !b).collect();
+        assert_eq!(changed_runs(&now, &was), [(0, N)]);
+        for kept in [vec![0usize], vec![N - 1], vec![7, 8], vec![4096, 4097, 4103, 40000], vec![3, 11, 19]] {
+            let mut now = now.clone();
+            for &at in &kept {
+                now[at] = was[at];
+            }
+            let mut want = Vec::new();
+            let mut from = 0;
+            for &at in &kept {
+                if at > from {
+                    want.push((from, at - from));
+                }
+                from = at + 1;
+            }
+            if from < N {
+                want.push((from, N - from));
+            }
+            assert_eq!(changed_runs(&now, &was), want, "{kept:?}");
+        }
     }
 }
 
@@ -3448,7 +3499,22 @@ impl Shadow {
             return true;
         }
         let base = start / PAGE;
-        let mut title = vec![0u8; PAGE];
+        // A page of title memory, kept from call to call: a page made and
+        // freed for each was 1.2 ms a frame in run P.
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let mut title = TITLE.with(|t| std::mem::take(&mut *t.borrow_mut()));
+        title.resize(PAGE, 0);
+        let settle = self.merge_pages(busy, base, &mut title, runs_left);
+        TITLE.with(|t| *t.borrow_mut() = title);
+        settle
+    }
+
+    /// [`Shadow::merge_under_writes`] for the ranges `busy` (cut to the
+    /// copy), with `title` a page to read title memory into.
+    fn merge_pages(&self, busy: Vec<(usize, usize)>, base: usize, title: &mut [u8], runs_left: &mut usize) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,

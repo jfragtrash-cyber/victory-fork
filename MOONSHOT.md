@@ -422,3 +422,14 @@ already reach.
   the title writes pages after mapping them; `crate::alias` now takes a
   copy again when its source is written, and writes shaders' bytes back to
   the source (run Y measures it).
+- 2026-11-26, night. Corrections. The periodic 300-400 ms frames of the
+  captured runs are the capture: a saved frame is always presented the old
+  way (it is read back at once). Without capture (runs AB, AC, AD, AF) play
+  runs a 3-frame cycle of about 3, 110-125 and 200 ms, the long one a
+  present running the queue's line itself. The limit is our submitting
+  thread, ~94% busy (about 44 + 44 + 221 ms of work per 3 frames): not the
+  relay's copy-back (~40 ms a frame on its own thread, 1,150 pieces, 71 MB
+  fetched, 31 MB actually changed) and not the card (~70% busy). Run AD
+  (staging pool back on): 100-108 ms a frame; run AF (card hashes a group a
+  piece, the relay merging on four threads): 109-114 ms, no gain while the
+  submitting thread is the limit.

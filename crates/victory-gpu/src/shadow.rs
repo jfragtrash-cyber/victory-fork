@@ -3890,7 +3890,13 @@ const FOUND: usize = 256;
 /// one another. A copy is held weakly: what nothing else holds goes.
 struct Found<T> {
     entries: [FoundEntry<T>; FOUND],
+    /// Asks, and asks answered here, not yet added to [`FOUND_STATS`].
+    counts: [u32; 2],
 }
+
+/// Since the last frame line: asks of [`lookup`], and those answered
+/// from what the asking thread remembered ([`Found`]), added in batches.
+static FOUND_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 struct FoundEntry<T> {
     address: u64,
@@ -3912,6 +3918,19 @@ impl<T> Found<T> {
                     holder: None,
                 }
             }; FOUND],
+            counts: [0; 2],
+        }
+    }
+
+    /// Counts an ask, answered here or not: in [`FOUND_STATS`] every 4096
+    /// (a shared count changed by every ask would be met by all threads).
+    fn count(&mut self, answered: bool) {
+        self.counts[0] += 1;
+        self.counts[1] += u32::from(answered);
+        if self.counts[0] >= 4096 {
+            for (stat, n) in FOUND_STATS.iter().zip(std::mem::take(&mut self.counts)) {
+                stat.fetch_add(u64::from(n), Ordering::Relaxed);
+            }
         }
     }
 
@@ -4136,7 +4155,13 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let cache = lookup_cache();
     if cache {
         let changes = BUFFERS_CHANGES.load(Ordering::Acquire);
-        match FOUND_HERE.try_with(|found| found.borrow().get(address, end, changes)) {
+        let answer = FOUND_HERE.try_with(|found| {
+            let mut found = found.borrow_mut();
+            let answer = found.get(address, end, changes);
+            found.count(answer.is_some());
+            answer
+        });
+        match answer {
             Ok(Some(Some(shadow))) => return Some(shadow),
             Ok(Some(None)) => return loose(address, end, len <= 1, any),
             _ => {}
@@ -4510,6 +4535,27 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
     Some(shadow)
+}
+
+/// With the frame line: asks for the copy of title memory per frame over
+/// `frames`, the share each thread answered from what it remembered
+/// ([`Found`]), and the changes of the title buffers that made them look
+/// again. Nothing while there were none (or `VICTORY_LOOKUP_CACHE=0`).
+pub(crate) fn lookup_line(frames: f64) {
+    static CHANGES: AtomicU64 = AtomicU64::new(1);
+    let [asks, answered] = [0, 1].map(|i| FOUND_STATS[i].swap(0, Ordering::Relaxed));
+    let now = BUFFERS_CHANGES.load(Ordering::Relaxed);
+    let changes = now - CHANGES.swap(now, Ordering::Relaxed);
+    if asks == 0 {
+        return;
+    }
+    tracing::info!(
+        "title memory lookups (VICTORY_LOOKUP_CACHE=0: none remembered): {:.0} per frame, {:.1} % answered from what \
+         the asking thread remembered; the title buffers changed {:.1} times per frame",
+        asks as f64 / frames,
+        answered as f64 * 100.0 / asks as f64,
+        changes as f64 / frames
+    );
 }
 
 /// With the frame line: the buffer views that got a copy of their own

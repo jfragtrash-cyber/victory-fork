@@ -65,6 +65,8 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Whether the program writes the loop report.
+    pub loop_report: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -78,6 +80,9 @@ pub(crate) struct Parts<'a> {
     pub prims: Vec<SigElement>,
     /// Mesh: what the group id arrives multiplied by.
     pub mesh_stride: u32,
+    /// The program's [`super::report_tag`] when loops stopped by the
+    /// iteration limit note it in the loop report ([`super::loop_report`]).
+    pub loop_report: Option<u32>,
 }
 
 enum Stop {
@@ -293,8 +298,12 @@ struct Lower<'a> {
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
-    /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
-    abort: Option<usize>,
+    /// Loop headers (IR blocks) a lane outside EXEC there never leaves
+    /// ([`parked_stay`]): such a lane leaves the program at the back edge.
+    parked: HashSet<usize>,
+    /// The blocks a loop stopped by [`LOOP_LIMIT`] leaves the program from:
+    /// one per loop header with the loop report, else one for all.
+    aborts: HashMap<usize, usize>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -932,6 +941,229 @@ fn lane_constant_masks(st: &Structured) -> bool {
     false
 }
 
+/// The iterations of the loop at `header` when a counter decides them: a
+/// scalar that starts at a constant, moves by a constant every iteration
+/// and is compared with a constant at the loop's only back edge
+/// (`s_add_i32 s2, s2, 1` ... `s_cmpk_eq_i32 s2, 0x400`,
+/// `s_cbranch_scc0 loop`). The whole wave takes that branch together, so
+/// such a loop always leaves and needs no iteration limit. None for other
+/// loops and past 2^16 iterations.
+fn fixed_trips(p: &Program, header: usize, rpo: &[usize]) -> Option<u32> {
+    const MAX: u32 = 1 << 16;
+    let h = &p.blocks[header];
+    let mut back = h.preds.iter().enumerate().filter(|&(_, &q)| rpo[header] <= rpo[q]);
+    let (edge, &latch) = back.next()?;
+    if back.next().is_some() {
+        return None;
+    }
+    let Exit::Branch { taken, not_taken } = p.blocks[latch].exit else {
+        return None;
+    };
+    let branch = p.blocks[latch].insts.last()?;
+    let one = match branch.name() {
+        "s_cbranch_scc1" => true,
+        "s_cbranch_scc0" => false,
+        _ => return None,
+    };
+    // the SCC that goes round again
+    let again = match (taken == header, not_taken == header) {
+        (true, false) => one,
+        (false, true) => !one,
+        _ => return None,
+    };
+    let defs: HashMap<Value, &Inst> = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .flat_map(|i| i.writes.iter().map(move |&(_, v)| (v, i)))
+        .collect();
+    let cmp = *defs.get(&branch.read(Reg::Scc)?)?;
+    let name = cmp.name();
+    let kind = name.strip_prefix("s_cmpk_").or_else(|| name.strip_prefix("s_cmp_"))?;
+    let (op, signed) = match kind.split_once('_')? {
+        (op, "i32") => (op, true),
+        (op, "u32") => (op, false),
+        _ => return None,
+    };
+    let Fields::Sop { src, imm, .. } = &cmp.fields else {
+        return None;
+    };
+    // (counter, constant), or (constant, counter) when `flip`
+    let (x, k, flip) = if name.starts_with("s_cmpk_") {
+        let imm = imm.map(|i| if signed { i as i16 as u32 } else { u32::from(i) })?;
+        (register(cmp, src.first()?)?, imm, false)
+    } else {
+        match (register(cmp, src.first()?), register(cmp, src.get(1)?)) {
+            (Some(x), _) if operand_const(&defs, cmp, &src[1]).is_some() => {
+                (x, operand_const(&defs, cmp, &src[1])?, false)
+            }
+            (_, Some(x)) => (x, operand_const(&defs, cmp, &src[0])?, true),
+            _ => return None,
+        }
+    };
+    // back from the compared value to the header's phi, one constant step at a time
+    let mut step = 0u32;
+    let mut v = x;
+    let phi = loop {
+        if let Some(phi) = h.phis.iter().find(|phi| phi.value == v) {
+            break phi;
+        }
+        let i = *defs.get(&v)?;
+        let Fields::Sop { dst, src, imm } = &i.fields else {
+            return None;
+        };
+        let (from, by) = match i.name() {
+            "s_addk_i32" => (register(i, dst.as_ref()?)?, (*imm)? as i16 as u32),
+            "s_add_i32" | "s_add_u32" | "s_sub_i32" | "s_sub_u32" => {
+                let (from, by) = match (register(i, &src[0]), operand_const(&defs, i, &src[1])) {
+                    (Some(r), Some(c)) => (r, c),
+                    _ if i.name().starts_with("s_add") => {
+                        (register(i, &src[1])?, operand_const(&defs, i, &src[0])?)
+                    }
+                    _ => return None,
+                };
+                (from, if i.name().starts_with("s_sub") { by.wrapping_neg() } else { by })
+            }
+            _ => return None,
+        };
+        step = step.wrapping_add(by);
+        v = from;
+    };
+    if phi.args[edge] != x {
+        return None;
+    }
+    let mut starts = phi
+        .args
+        .iter()
+        .enumerate()
+        .filter(|&(n, _)| n != edge)
+        .map(|(_, &a)| value_const(&defs, a));
+    let start = starts.next()??;
+    if !starts.all(|s| s == Some(start)) {
+        return None;
+    }
+    let test: fn(std::cmp::Ordering) -> bool = match op {
+        "eq" => std::cmp::Ordering::is_eq,
+        "lg" => std::cmp::Ordering::is_ne,
+        "gt" => std::cmp::Ordering::is_gt,
+        "ge" => std::cmp::Ordering::is_ge,
+        "lt" => std::cmp::Ordering::is_lt,
+        "le" => std::cmp::Ordering::is_le,
+        _ => return None,
+    };
+    let holds = |x: u32| {
+        let (a, b) = if flip { (k, x) } else { (x, k) };
+        test(if signed { (a as i32).cmp(&(b as i32)) } else { a.cmp(&b) })
+    };
+    let mut x = start;
+    for n in 1..=MAX {
+        x = x.wrapping_add(step);
+        if holds(x) != again {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// Whether a lane outside EXEC at the loop `header` stays in the loop
+/// until the iteration limit stops it: every back edge keeps it outside
+/// EXEC, and no way out of the loop is open to it. A program without its
+/// early-outs (`ir::without_early_outs`) walks such loops with the lanes
+/// that would have left, on the path of a wave with no lane left: in the
+/// title's light loops (`v_ffbl_b32`/`v_xor_b32` over the lane's own mask,
+/// left once the wave's mask of lanes still at it is empty) that path only
+/// goes round again. Those lanes then leave the program at the limit
+/// anyway; they can as well leave at once.
+fn parked_stay(p: &Program, st: &Structured, header: usize, rpo: &[usize]) -> bool {
+    let h = &p.blocks[header];
+    let Some(phi) = h.phis.iter().find(|phi| phi.reg == Reg::S(EXEC)) else {
+        return false;
+    };
+    let Some(&outside) = st.masks.get(&phi.value) else {
+        return false;
+    };
+    let latches: Vec<(usize, usize)> = h
+        .preds
+        .iter()
+        .enumerate()
+        .filter(|&(_, &q)| rpo[q] != usize::MAX && rpo[header] <= rpo[q])
+        .map(|(n, &q)| (n, q))
+        .collect();
+    for &(n, _) in &latches {
+        match st.masks.get(&phi.args[n]) {
+            Some(&next) if !st.bools.meet(&[(next, true), (outside, false)]) => {}
+            _ => return false,
+        }
+    }
+    // the loop: the blocks that reach a back edge without passing the header
+    let mut body = HashSet::from([header]);
+    let mut work: Vec<usize> = latches.iter().map(|&(_, q)| q).collect();
+    while let Some(b) = work.pop() {
+        if body.insert(b) {
+            work.extend(p.blocks[b].preds.iter().copied().filter(|&q| rpo[q] != usize::MAX));
+        }
+    }
+    // where a lane outside EXEC at the header may go
+    let mut seen = HashSet::from([header]);
+    let mut work = vec![header];
+    while let Some(b) = work.pop() {
+        let to = match st.exits[b] {
+            LaneExit::Jump(t) => vec![t],
+            LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } => [(taken, true), (not_taken, false)]
+                .into_iter()
+                .filter(|&(_, holds)| st.bools.meet(&[(when, holds), (outside, false)]))
+                .map(|(t, _)| t)
+                .collect(),
+            LaneExit::End | LaneExit::Indirect => return false,
+        };
+        for t in to {
+            if !body.contains(&t) {
+                return false;
+            }
+            if seen.insert(t) {
+                work.push(t);
+            }
+        }
+    }
+    true
+}
+
+/// The value the scalar register operand `op` holds at `i`.
+fn register(i: &Inst, op: &Operand) -> Option<Value> {
+    match *op {
+        Operand::Scalar { code, dwords: 1 } => i.read(Reg::S(code)),
+        _ => None,
+    }
+}
+
+/// The constant `op` is at `i`: inline, literal, or a scalar moved from one.
+fn operand_const(defs: &HashMap<Value, &Inst>, i: &Inst, op: &Operand) -> Option<u32> {
+    match *op {
+        Operand::Const(c @ 128..=192) => Some(u32::from(c - 128)),
+        Operand::Const(c @ 193..=208) => Some((192 - i32::from(c)) as u32),
+        Operand::Literal(l) => Some(l),
+        Operand::Scalar { .. } => value_const(defs, register(i, op)?),
+        _ => None,
+    }
+}
+
+/// The constant `v` is when an `s_mov_b32` or `s_movk_i32` made it.
+fn value_const(defs: &HashMap<Value, &Inst>, v: Value) -> Option<u32> {
+    let i = *defs.get(&v)?;
+    match (i.name(), &i.fields) {
+        ("s_mov_b32", Fields::Sop { src, .. }) => match src.first()? {
+            Operand::Scalar { .. } => None,
+            op => operand_const(defs, i, op),
+        },
+        ("s_movk_i32", Fields::Sop { imm, .. }) => Some((*imm)? as i16 as u32),
+        _ => None,
+    }
+}
+
 /// The widest wave the host GPU runs (0: not known – no host-specific forms); see
 /// [`set_host_max_wave`].
 static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1550,7 +1782,8 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
-            abort: None,
+            parked: HashSet::new(),
+            aborts: HashMap::new(),
         }
     }
 
@@ -2038,16 +2271,21 @@ impl<'a> Lower<'a> {
                 self.s.m.new_block()
             });
         }
-        // Loop headers count iterations (`LOOP_LIMIT`).
+        // Loop headers count iterations (`LOOP_LIMIT`), but for loops a
+        // counter ends (`fixed_trips`).
         for &b in &order {
             let header = p.blocks[b]
                 .preds
                 .iter()
                 .any(|&q| self.block[q].is_some() && self.rpo[b] <= self.rpo[q]);
-            if header {
+            if header && fixed_trips(p, b, &self.rpo).is_none() {
                 let blk = self.block[b].expect("reachable");
                 let phi = self.s.m.phi(blk, self.s.t.i32);
                 self.counters.insert(b, (phi, Vec::new()));
+                let compute = !self.s.pixel && self.s.mesh.is_none() && self.s.threads.is_some();
+                if compute && parked_stay(p, self.x.st, b, &self.rpo) {
+                    self.parked.insert(b);
+                }
             }
         }
         self.cur = self.s.entry;
@@ -2124,6 +2362,7 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            loop_report: self.s.loop_report.is_some(),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4156,6 +4395,28 @@ impl<'a> Lower<'a> {
         let lane = self.s.m.select(c, any, lane, me);
         let at = self.read_lane(x, lane);
         (self.s.m.select(c, any, at, first), any)
+    }
+
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader:
+    /// a helper lane takes its own value instead (upstream VIctory #1733).
+    ///
+    /// On the console, whole-quad mode puts helper lanes in EXEC, so a
+    /// waterfall loop (read the first lane's value, run the lanes with that
+    /// value, take them out of EXEC) serves helper lanes too. On the host,
+    /// wave operations leave helper lanes out (DXIL before
+    /// `WaveOpsIncludeHelperLanes`): once only helper lanes are left in such
+    /// a loop, `WaveReadLaneFirst` reads no lane, no lane matches, and the
+    /// loop runs to the iteration limit in every such lane: draws of 0.3 to
+    /// 1.3 s each, then DEVICE_HUNG. With its own value a helper lane
+    /// matches in the first pass and leaves; what a helper lane computes
+    /// only feeds derivatives, and its stores are dropped.
+    fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.s.pixel {
+            return first;
+        }
+        let c = self.cur;
+        let helper = self.s.op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        self.s.m.select(c, helper, own, first)
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
@@ -7315,6 +7576,7 @@ impl<'a> Lower<'a> {
                 } else {
                     mine
                 };
+                let r = self.helper_reads_own(a, r);
                 int(self, r)
             }
             _ => {
@@ -10431,8 +10693,23 @@ impl<'a> Lower<'a> {
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
-                Term::CondBr(ok, self.block[t].expect("reachable"), abort)
+                let abort = self.abort_block(t);
+                let header = self.block[t].expect("reachable");
+                if self.parked.contains(&t) {
+                    // A lane outside EXEC for the next round leaves the
+                    // program now, not at the limit (`parked_stay`).
+                    let n = self.x.p.blocks[t].preds.iter().position(|&q| q == b).expect("a pred");
+                    let phi = self.x.p.blocks[t].phis.iter().find(|phi| phi.reg == Reg::S(EXEC));
+                    let next = self.x.st.masks[&phi.expect("an EXEC phi").args[n]];
+                    let on = self.boolean(next, self.cur).map_err(|w| unsupported(offset, w))?;
+                    let go = self.s.m.bin(self.cur, Bin::And, ok, on);
+                    let (out, leave) = (self.s.m.new_block(), self.s.m.new_block());
+                    self.s.m.terminate(leave, Term::Ret);
+                    self.s.m.terminate(out, Term::CondBr(on, abort, leave));
+                    Term::CondBr(go, header, out)
+                } else {
+                    Term::CondBr(ok, header, abort)
+                }
             }
             LaneExit::Jump(t) => {
                 self.enter_loop(b, t, self.cur);
@@ -10466,24 +10743,48 @@ impl<'a> Lower<'a> {
                 let back =
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
                 // (No `xor` of a compare: a loop exit testing one hung the
-                // AMD driver.)
+                // AMD driver.) With the loop report, the limit's own test
+                // (header, at or above the limit) too.
+                let report = self.x.loop_report.is_some();
+                let mut stopped = None;
                 let cond = if back(self, taken) {
                     let ok = self.count_iteration(taken, pred::IULT);
+                    // (Not when the exit is an outer loop's back edge, whose
+                    // count comes from this block.)
+                    if report && !back(self, not_taken) {
+                        stopped = Some((taken, self.limit_reached(taken)));
+                    }
                     self.s.m.bin(self.cur, Bin::And, cond, ok)
                 } else if back(self, not_taken) {
                     let stop = self.count_iteration(not_taken, pred::IUGE);
+                    if report && !back(self, taken) {
+                        stopped = Some((not_taken, stop));
+                    }
                     self.s.m.bin(self.cur, Bin::Or, cond, stop)
                 } else {
                     cond
                 };
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
-                let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
-                for (to, via) in [(taken, t), (not_taken, f)] {
+                let (t0, f0) = (self.edge(b, taken), self.edge(b, not_taken));
+                let (mut t, mut f) = (t0, f0);
+                // The limit's lanes leave through the exit edge: noted there,
+                // the edge then ending in a join block.
+                let mut joins = [None, None];
+                if let Some((header, flag)) = stopped {
+                    if header == taken {
+                        let (test, join) = self.report_exit(b, not_taken, f0, header, flag);
+                        (f, joins[1]) = (test, Some(join));
+                    } else {
+                        let (test, join) = self.report_exit(b, taken, t0, header, flag);
+                        (t, joins[0]) = (test, Some(join));
+                    }
+                }
+                for ((to, via), join) in [(taken, t0), (not_taken, f0)].into_iter().zip(joins) {
                     if !back(self, to) {
-                        // From an edge block, or from here.
+                        // From an edge block, or from here (or the join).
                         let from = if Some(via) == self.block[to] {
-                            self.cur
+                            join.unwrap_or(self.cur)
                         } else {
                             via
                         };
@@ -10527,23 +10828,7 @@ impl<'a> Lower<'a> {
         let next = self.s.m.bin(c, Bin::Add, phi, one);
         self.s.m.tag(phi, Tag::Counter);
         self.s.m.tag(next, Tag::Counter);
-        // Per stage unless the switch names one: a loop that never meets its
-        // exit (a count read from a buffer the host has not got yet, say)
-        // runs to the limit in every lane. A million iterations a pixel
-        // hung the GPU for seconds a draw until Windows reset it
-        // (PS_Textured_Eight, 2026-11-24, run 12).
-        // shortcut: a pixel loop past 128 iterations, a vertex or mesh loop
-        // past 256 or a compute loop past 4,096 is cut short. (They were
-        // 1,024, 4,096 and 65,536: the opening cutscene then lost the card
-        // 14-25 frames in, in a minimap or shadow mesh draw; with every
-        // loop cut at 64 it ran 90 frames. Raise them again once shaders
-        // stop reading data that is not there yet.)
-        let limit = match super::loop_limit() {
-            LOOP_LIMIT if self.s.pixel => 1 << 7,
-            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
-            LOOP_LIMIT => 1 << 12,
-            named => named,
-        };
+        let limit = self.loop_limit();
         let limit = self.s.m.i32(limit);
         self.counters
             .get_mut(&to)
@@ -10555,20 +10840,136 @@ impl<'a> Lower<'a> {
         over
     }
 
-    /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
-    fn abort_block(&mut self) -> usize {
-        if let Some(a) = self.abort {
+    /// This program's iteration limit.
+    ///
+    /// Per stage unless the switch names one: a loop that never meets its
+    /// exit (a count read from a buffer the host has not got yet, say)
+    /// runs to the limit in every lane. A million iterations a pixel
+    /// hung the GPU for seconds a draw until Windows reset it
+    /// (PS_Textured_Eight, 2026-11-24, run 12).
+    /// shortcut: a pixel loop past 1,024 iterations, a vertex or mesh
+    /// loop past 4,096 or a compute loop past 65,536 is cut short. (Cut
+    /// at 128, 256 and 4,096 for a while, the loop report,
+    /// `VICTORY_SHADER_LOOP_REPORT`, named only loops a counter ends,
+    /// 256 rounds of LUT sums, which now have no limit (`fixed_trips`),
+    /// and light loops walked by lanes outside EXEC, which now leave at
+    /// once (`parked_stay`). At these values the opening cutscene once
+    /// lost the card 14-25 frames in, in a minimap or shadow mesh draw.)
+    fn loop_limit(&self) -> u32 {
+        match super::loop_limit() {
+            LOOP_LIMIT if self.s.pixel => 1 << 10,
+            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 12,
+            LOOP_LIMIT => 1 << 16,
+            named => named,
+        }
+    }
+
+    /// Whether the iteration just counted on the back edge to `to` reached
+    /// the limit.
+    fn limit_reached(&mut self, to: usize) -> V {
+        let next = self.counters[&to].1.last().expect("counted").0;
+        let limit = self.loop_limit();
+        let limit = self.s.m.i32(limit);
+        let at = self.s.m.cmp(self.cur, pred::IUGE, next, limit);
+        self.s.m.tag(at, Tag::Counter);
+        at
+    }
+
+    /// The block a lane stopped by the iteration limit in the loop at IR
+    /// block `header` leaves through.
+    fn abort_block(&mut self, header: usize) -> usize {
+        let report = self.x.loop_report.is_some();
+        let key = if report { header } else { usize::MAX };
+        if let Some(&a) = self.aborts.get(&key) {
             return a;
         }
         let a = self.s.m.new_block();
+        let end = if report { self.report_stop(a, header) } else { a };
         if self.s.pixel {
             let t = self.s.m.bool(true);
             self.s
-                .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+                .op(end, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
         }
-        self.s.m.terminate(a, Term::Ret);
-        self.abort = Some(a);
+        self.s.m.terminate(end, Term::Ret);
+        self.aborts.insert(key, a);
         a
+    }
+
+    /// Diagnostics: the exit edge from IR block `from` to `exit` (DXIL block
+    /// `to`) of the loop at `header`, through a note in the loop report
+    /// when `stopped`. Returns the block to branch to and the edge's last
+    /// block, which phis in `exit` see.
+    fn report_exit(
+        &mut self,
+        from: usize,
+        exit: usize,
+        to: usize,
+        header: usize,
+        stopped: V,
+    ) -> (usize, usize) {
+        let (test, note, join) = (self.s.m.new_block(), self.s.m.new_block(), self.s.m.new_block());
+        self.s.m.terminate(test, Term::CondBr(stopped, note, join));
+        let noted = self.report_stop(note, header);
+        self.s.m.terminate(noted, Term::Br(join));
+        self.s.m.terminate(join, Term::Br(to));
+        if Some(to) == self.block[exit] {
+            self.edges.insert((from, exit), join);
+        }
+        (test, join)
+    }
+
+    /// Diagnostics: notes, from DXIL block `at`, a lane that the iteration
+    /// limit stopped in the loop at IR block `header` (layout at
+    /// [`super::loop_report`]). Returns the block that goes on.
+    fn report_stop(&mut self, at: usize, header: usize) -> usize {
+        let tag = self.x.loop_report.expect("reporting");
+        let key = self.x.p.blocks[header].offset as u32 + 1;
+        let base = 16 + 16 * super::report_slot(tag, key);
+        let h = self.s.loop_report_handle();
+        self.report_atomic(at, h, 0, None, 1);
+        // The slot is this loop's if it holds its tag and key, or they go
+        // into an empty one; else the lane counts as lost.
+        let old = self.report_atomic(at, h, base, Some(0), tag);
+        let mine = self.report_claimed(at, old, tag);
+        let [held, hit, lost, end] = [(); 4].map(|()| self.s.m.new_block());
+        self.s.m.terminate(at, Term::CondBr(mine, held, lost));
+        let old = self.report_atomic(held, h, base + 4, Some(0), key);
+        let mine = self.report_claimed(held, old, key);
+        self.s.m.terminate(held, Term::CondBr(mine, hit, lost));
+        self.report_atomic(hit, h, base + 8, None, 1);
+        self.s.m.terminate(hit, Term::Br(end));
+        self.report_atomic(lost, h, 4, None, 1);
+        self.s.m.terminate(lost, Term::Br(end));
+        end
+    }
+
+    /// An atomic add of `value` (or, with `compare`, a compare-exchange to
+    /// it) on the loop report dword at byte `at`; the old value.
+    fn report_atomic(&mut self, block: usize, h: V, at: u32, compare: Option<u32>, value: u32) -> V {
+        let i32t = self.s.t.i32;
+        let u = self.s.m.undef(i32t);
+        let (at, value) = (self.s.m.i32(at), self.s.m.i32(value));
+        match compare {
+            Some(c) => {
+                let c = self.s.m.i32(c);
+                let args = [h, at, u, u, c, value];
+                self.s
+                    .op(block, "atomicCompareExchange.i32", Attr::NoUnwind, i32t, 79, &args)
+            }
+            None => {
+                let add = self.s.m.i32(0);
+                let args = [h, add, at, u, u, value];
+                self.s.op(block, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+            }
+        }
+    }
+
+    /// Whether a slot dword that held `old` now holds `mine`.
+    fn report_claimed(&mut self, block: usize, old: V, mine: u32) -> V {
+        let (z, m) = (self.s.m.i32(0), self.s.m.i32(mine));
+        let free = self.s.m.cmp(block, pred::EQ, old, z);
+        let same = self.s.m.cmp(block, pred::EQ, old, m);
+        self.s.m.bin(block, Bin::Or, free, same)
     }
 
     /// The DXIL block a branch from IR block `from` to `to` goes to.
@@ -10911,6 +11312,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            loop_report: None,
         })
         .map(|_| ())
     }
@@ -10961,6 +11363,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            loop_report: None,
         })
     }
 
@@ -11072,6 +11475,7 @@ mod tests {
             outputs: vec![],
             prims: vec![],
             mesh_stride: 0,
+            loop_report: None,
         }).unwrap();
 
         let container =

@@ -47,8 +47,16 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named
+        || n == ASKED.load(std::sync::atomic::Ordering::Relaxed)
+        || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
 }
+
+/// A frame asked for while the title runs: a file named `now` put in the
+/// capture folder makes the frame after next [`listed`] (its picture, its
+/// targets with `VICTORY_DUMP_TARGETS`, its ops), and is removed. (The
+/// next frame may already be partly recorded when a present sees the file.)
+static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
 /// the frame's `frame-<n>-ops.txt`, one line per draw, dispatch, copy or
@@ -128,6 +136,12 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
+    if let Some(now) = folder().map(|f| f.join("now"))
+        && std::fs::remove_file(&now).is_ok()
+    {
+        ASKED.store(frame + 2, Relaxed);
+        tracing::info!(frame = frame + 2, "a frame asked for: captured");
+    }
     if world_on()
         && drawn.saturating_sub(before) >= 500
         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()

@@ -14,11 +14,15 @@
 //! wholly uncommitted are skipped while they remain so; one query can
 //! confirm a whole region, including ordinary reservations between views.
 //!
-//! shortcut: writes into physical pages through another view (xmem's
-//! `write_physical`, DirectStorage's page destinations) are not seen at
-//! the guarded addresses; they go to the texture pool, whose textures are
-//! hashed, not guarded. A system call writing into a guarded block fails
-//! (none is known to).
+//! The title may show the same physical pages at several addresses and
+//! write them at any: a guarded block's other addresses are made read-only
+//! with it, and a write at one counts for all (`Guards::twins`).
+//!
+//! shortcut: our own writes into physical pages through a view of ours
+//! (xmem's `write_physical`, DirectStorage's page destinations) are not
+//! seen at the guarded addresses; they go to the texture pool, whose
+//! textures are hashed, not guarded. A system call writing into a guarded
+//! block fails (none is known to).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
@@ -379,12 +383,16 @@ struct Guards {
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
     absent: BTreeSet<usize>,
+    /// Blocks that show the same physical pages as others, by block: a write
+    /// to one is a write to those ([`protect`] guards them together).
+    twins: BTreeMap<usize, Vec<usize>>,
 }
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     absent: BTreeSet::new(),
+    twins: BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -529,13 +537,44 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
     };
     if set(from, to) {
         note(g, from, to);
+    } else {
+        for block in from..to {
+            if set(block, block + 1) {
+                note(g, block, block + 1);
+            } else if block < uncommitted_end(block) {
+                g.absent.insert(block);
+            }
+        }
+    }
+    // The title may write these pages at other addresses that show them
+    // (the opening video decodes its frames through another view; the
+    // cutscene's vegetation and light came from buffers written so): those
+    // are made read-only too, and a write at one counts for both.
+    // `VICTORY_GUARD_TWINS=0` guards the range's own addresses only, as before.
+    static TWINS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*TWINS.get_or_init(|| std::env::var_os("VICTORY_GUARD_TWINS").is_none_or(|v| v != "0")) {
         return;
     }
-    for block in from..to {
-        if set(block, block + 1) {
-            note(g, block, block + 1);
-        } else if block < uncommitted_end(block) {
-            g.absent.insert(block);
+    for (own, alias, bytes) in crate::inplace::aliases(from * BLOCK, (to - from) * BLOCK) {
+        for k in 0..bytes.div_ceil(BLOCK) {
+            let (mine, twin) = (own / BLOCK + k, alias / BLOCK + k);
+            if !g.protected.contains(&mine) {
+                continue;
+            }
+            if !g.protected.contains(&twin) {
+                if !set(twin, twin + 1) {
+                    // Not guarded: what it shows cannot be trusted here.
+                    g.clean.remove(&mine);
+                    continue;
+                }
+                g.protected.insert(twin);
+            }
+            for (a, b) in [(mine, twin), (twin, mine)] {
+                let list = g.twins.entry(a).or_default();
+                if !list.contains(&b) {
+                    list.push(b);
+                }
+            }
         }
     }
 }
@@ -571,8 +610,27 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        // The same pages shown elsewhere are written too.
+        if let Some(twins) = g.twins.get(&block) {
+            for twin in twins.clone() {
+                g.clean.remove(&twin);
+            }
+        }
     }
     !blocks.is_empty()
+}
+
+/// Another address now shows pages of `[at, at + len)` too
+/// (`crate::inplace::title_memory_view`): what the guards said of the range
+/// no longer holds; its next copy looks again and guards the new address
+/// with it.
+pub(crate) fn aliases_appeared(at: usize, len: usize) {
+    let mut g = guards();
+    let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
+    let blocks: Vec<usize> = g.clean.range(range).copied().collect();
+    for block in blocks {
+        g.clean.remove(&block);
+    }
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
@@ -586,8 +644,13 @@ pub fn writing(at: usize, len: usize) {
     crate::descriptor::host::remapped(at, len);
 }
 
-/// Held shared by a read of title memory in place, and alone by the runtime
-/// while it changes what title memory shows.
+/// Who holds which title memory: reads in place by range, shared, and the
+/// runtime's changes of what title memory shows by range, alone. A change
+/// waits only for reads of memory it touches, and a read only for changes
+/// of the memory it reads (one lock for the whole address space was held
+/// by the runtime's 1,459 remappings a world frame for 778 ms of it, and
+/// texture refreshes stood behind it for 490-1,040 ms a frame, whatever
+/// they read: MOONSHOT.md, run 6).
 ///
 /// The runtime does not change a mapping in one step. To unmap one page of
 /// a view it unmaps the whole view and maps what stays again
@@ -599,46 +662,149 @@ pub fn writing(at: usize, len: usize) {
 /// had asked whether the texture was all mapped and been told yes. Asking
 /// cannot help; not changing the mapping while such a read is under way
 /// does.
-static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+static MAPPING: std::sync::Mutex<Holders> = std::sync::Mutex::new(Holders { reading: Vec::new(), remapping: Vec::new(), waiting: Vec::new() });
+/// Woken whenever a holder lets go.
+static LET_GO: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Ranges `[from, to)` held, one entry per holder.
+struct Holders {
+    reading: Vec<(usize, usize)>,
+    remapping: Vec<(usize, usize)>,
+    /// Changes waiting for reads to end: reads of their memory that begin
+    /// meanwhile wait behind them, so that a change is not put off for
+    /// ever by reads that keep coming.
+    waiting: Vec<(usize, usize)>,
+}
+
+fn held() -> std::sync::MutexGuard<'static, Holders> {
+    MAPPING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `[at, at + len)` as a range of at least one byte.
+fn range(at: usize, len: usize) -> (usize, usize) {
+    (at, at.saturating_add(len.max(1)))
+}
+
+fn meets(held: &[(usize, usize)], (from, to): (usize, usize)) -> bool {
+    held.iter().any(|&(a, b)| a < to && from < b)
+}
+
+fn let_go(list: &mut Vec<(usize, usize)>, range: (usize, usize)) {
+    if let Some(i) = list.iter().position(|&r| r == range) {
+        list.swap_remove(i);
+    }
+}
 
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
+pub struct Remapping(
+    (usize, usize),
+    /// When the lock was had (diagnostics: [`REMAPS`]).
+    #[cfg(feature = "diagnostics")]
+    std::time::Instant,
+);
+
+/// Since the last frame-rate line (diagnostics): the runtime's remappings,
+/// the microseconds it waited for the lock and those it held it, and of
+/// those the microseconds in [`title_memory_remapped`] and in
+/// `crate::inplace::title_memory_view`.
+#[cfg(feature = "diagnostics")]
+pub(crate) static REMAPS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Adds its time to [`REMAPS`]' place `.0` when dropped.
+#[cfg(feature = "diagnostics")]
+pub(crate) struct Timed(pub(crate) usize, pub(crate) std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for Timed {
+    fn drop(&mut self) {
+        REMAPS[self.0].fetch_add(self.1.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        REMAPS[2].fetch_add(self.1.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        let_go(&mut held().remapping, self.0);
+        LET_GO.notify_all();
+    }
+}
 
 /// The runtime is about to map, unmap or move physical pages of title
-/// memory: until what it returns is dropped, no read of title memory in
-/// place is under way and none begins ([`title_memory_reading`]). Taken
-/// around the whole change, the unmapping and the mapping again.
-pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+/// memory `[at, at + len)`: until what it returns is dropped, no read in
+/// place of memory there is under way and none begins
+/// ([`title_memory_reading`]). Taken around the whole change, the
+/// unmapping and the mapping again, for all the memory the change touches
+/// (an unmapping takes whole views away and maps what stays again).
+pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
+    #[cfg(feature = "diagnostics")]
+    let asked = std::time::Instant::now();
+    let range = range(at, len);
+    let mut h = held();
+    if meets(&h.reading, range) {
+        h.waiting.push(range);
+        while meets(&h.reading, range) {
+            h = LET_GO.wait(h).unwrap_or_else(|e| e.into_inner());
+        }
+        let_go(&mut h.waiting, range);
+    }
+    h.remapping.push(range);
+    drop(h);
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        REMAPS[0].fetch_add(1, Relaxed);
+        REMAPS[1].fetch_add(asked.elapsed().as_micros() as u64, Relaxed);
+        Remapping(range, std::time::Instant::now())
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    Remapping(range)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
+pub struct Reading((usize, usize));
 
-/// For reading title memory in place: until what it returns is dropped,
-/// the runtime changes no mapping, so memory found mapped stays mapped.
-/// Not to be taken twice by one thread, nor held across anything that
-/// maps title memory.
-pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
+impl Drop for Reading {
+    fn drop(&mut self) {
+        let_go(&mut held().reading, self.0);
+        LET_GO.notify_all();
+    }
+}
+
+/// For reading title memory `[at, at + len)` in place: until what it
+/// returns is dropped, the runtime changes no mapping there, so memory
+/// found mapped stays mapped. Not to be taken twice by one thread for
+/// memory that overlaps, nor held across anything that maps title memory.
+pub fn title_memory_reading(at: usize, len: usize) -> Reading {
+    let range = range(at, len);
+    let mut h = held();
+    while meets(&h.remapping, range) || meets(&h.waiting, range) {
+        h = LET_GO.wait(h).unwrap_or_else(|e| e.into_inner());
+    }
+    h.reading.push(range);
+    Reading(range)
 }
 
 /// [`title_memory_reading`] if it can be had at once: `None` while the
-/// runtime changes a mapping (or waits to), for a caller that has another
-/// way to read and would rather not wait.
-pub fn title_memory_reading_now() -> Option<Reading> {
-    match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+/// runtime changes a mapping there (or waits to), for a caller that has
+/// another way to read and would rather not wait.
+pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
+    let range = range(at, len);
+    let mut h = held();
+    if meets(&h.remapping, range) || meets(&h.waiting, range) {
+        return None;
     }
+    h.reading.push(range);
+    Some(Reading(range))
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    let _timed = Timed(3, std::time::Instant::now());
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -652,10 +818,20 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in absent {
         g.absent.remove(&block);
     }
-    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
+    let blocks: Vec<usize> = g.protected.range(range.clone()).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+    }
+    // What the range showed elsewhere it no longer shows.
+    let twinned: Vec<usize> = g.twins.range(range).map(|(&b, _)| b).collect();
+    for block in twinned {
+        for twin in g.twins.remove(&block).unwrap_or_default() {
+            g.clean.remove(&twin);
+            if let Some(list) = g.twins.get_mut(&twin) {
+                list.retain(|&b| b != block);
+            }
+        }
     }
 }
 
@@ -810,6 +986,43 @@ mod tests {
             )
         };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    /// The same pages at two addresses: guarding one guards the other, and
+    /// a write at the other is a write to the one (the opening video's
+    /// frames were decoded so, and taken one frame in eight).
+    #[test]
+    fn a_write_at_another_address_of_the_same_pages_is_seen() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped twice read-write.
+        let (section, one, other) = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (2 * BLOCK) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let map = || MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize;
+            (section, map(), map())
+        };
+        assert!(one != 0 && other != 0 && one != other);
+        crate::inplace::title_memory_view(one, 2 * BLOCK, section as usize, 0);
+        crate::inplace::title_memory_view(other, 2 * BLOCK, section as usize, 0);
+        assert!(guard(one, one + 2 * BLOCK).is_some());
+        assert_eq!(guard(one, one + 2 * BLOCK), Some(Vec::new()), "nothing written yet");
+        // SAFETY: the second block of the other view; it faults once.
+        unsafe { ((other + BLOCK + 8) as *mut u8).write(7) };
+        assert_eq!(
+            guard(one, one + 2 * BLOCK),
+            Some((one / PAGE + 1..one / PAGE + 2).collect()),
+            "the write at the other address"
+        );
+        // SAFETY: the same byte through the first view.
+        assert_eq!(unsafe { ((one + BLOCK + 8) as *const u8).read() }, 7);
+        for at in [one, other] {
+            // SAFETY: our views.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut _ }) };
+            title_memory_remapped(at, 2 * BLOCK);
+        }
     }
 
     #[test]
@@ -1068,15 +1281,17 @@ mod mapping_tests {
     /// a read in place waits for a change of mapping.
     #[test]
     fn reads_in_place_and_remappings_wait_for_each_other() {
+        // (addresses of this test's own: the lock is the process's)
+        const AT: usize = 0x7000_0000_0000;
         // A reader holds; the change does not begin until it lets go.
         let changed = Arc::new(AtomicBool::new(false));
-        let reading = title_memory_reading();
+        let reading = title_memory_reading(AT, 0x1_0000);
         let (began, wait) = mpsc::channel();
         let change = {
             let changed = changed.clone();
             std::thread::spawn(move || {
                 began.send(()).unwrap();
-                let _changing = title_memory_remapping();
+                let _changing = title_memory_remapping(AT + 0x8000, 0x10_0000);
                 changed.store(true, Ordering::SeqCst);
             })
         };
@@ -1088,13 +1303,13 @@ mod mapping_tests {
         assert!(changed.load(Ordering::SeqCst));
         // A change holds; the read does not begin until it is done.
         let read = Arc::new(AtomicBool::new(false));
-        let changing = title_memory_remapping();
+        let changing = title_memory_remapping(AT, 0x1_0000);
         let (began, wait) = mpsc::channel();
         let reader = {
             let read = read.clone();
             std::thread::spawn(move || {
                 began.send(()).unwrap();
-                let _reading = title_memory_reading();
+                let _reading = title_memory_reading(AT + 0xfff0, 0x100);
                 read.store(true, Ordering::SeqCst);
             })
         };
@@ -1104,5 +1319,38 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    /// Memory elsewhere is not waited for, either way; and a change that
+    /// waits holds back new reads of its memory, not of other memory.
+    #[test]
+    fn reads_and_remappings_of_other_memory_go_on() {
+        const AT: usize = 0x7100_0000_0000;
+        let reading = title_memory_reading(AT, 0x1_0000);
+        let (done, wait) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _changing = title_memory_remapping(AT + 0x1_0000, 0x1_0000);
+            done.send(()).unwrap();
+        });
+        wait.recv_timeout(Duration::from_secs(5)).expect("a change of the next page waited for a read of this one");
+        let changing = title_memory_remapping(AT + 0x2_0000, 0x1_0000);
+        assert!(super::title_memory_reading_now(AT + 0x3_0000, 16).is_some(), "a read beside a change");
+        assert!(super::title_memory_reading_now(AT + 0x2_fff0, 32).is_none(), "a read that meets a change");
+        drop(changing);
+        // A change waiting for `reading` holds back new reads of the same
+        // memory, not of other memory.
+        let (asked, wait) = mpsc::channel();
+        let change = std::thread::spawn(move || {
+            asked.send(()).unwrap();
+            let _changing = title_memory_remapping(AT, 0x100);
+        });
+        wait.recv().unwrap();
+        while !super::held().waiting.contains(&(AT, AT + 0x100)) {
+            std::thread::yield_now();
+        }
+        assert!(super::title_memory_reading_now(AT + 0x80, 16).is_none(), "a read behind a waiting change");
+        assert!(super::title_memory_reading_now(AT + 0x5_0000, 16).is_some(), "a read of other memory");
+        drop(reading);
+        change.join().unwrap();
     }
 }

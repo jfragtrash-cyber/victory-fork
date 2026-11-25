@@ -19,6 +19,10 @@ pub mod runtime;
 pub use host::HostPolicy;
 pub use registry::{HleExport, HleModule, registry};
 pub use victory_gpu::console;
+/// Diagnostics: the thread working on a title frame and since when
+/// (`VICTORY_STALLS`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use victory_gpu::frame::busy as frame_busy;
 
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;

@@ -898,6 +898,8 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            #[cfg(feature = "diagnostics")]
+            self.probe_constant(list, &stage.shader.hash, &t.used, compute);
             STORES.set(t.stores);
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
@@ -1048,6 +1050,20 @@ impl State {
                 };
                 if !self.root_uav(list, address, param, compute, writes) {
                     return false;
+                }
+            }
+        }
+        if let Some(param) = p.loop_report {
+            let Some(gpu) = crate::loop_report::gpu() else {
+                once!("no loop report buffer: draws and dispatches that write it dropped");
+                return false;
+            };
+            // SAFETY: an open list; the report lives as long as the process.
+            unsafe {
+                if compute {
+                    l.SetComputeRootUnorderedAccessView(param, gpu);
+                } else {
+                    l.SetGraphicsRootUnorderedAccessView(param, gpu);
                 }
             }
         }
@@ -1833,6 +1849,88 @@ impl State {
         }
     }
 
+    /// Diagnostics: `VICTORY_PROBE_CB=<shader hash>:<table offset>:<offset>`
+    /// (offsets in hex bytes): at each draw of that shader (at most 200),
+    /// logs the dword at `<offset>` of the constant buffer its descriptor
+    /// table names at `<table offset>`, as title memory holds it at the draw
+    /// and when the list is submitted (what the copy to upload memory takes).
+    #[cfg(feature = "diagnostics")]
+    fn probe_constant(&self, list: &HostList, hash: &str, used: &[UsedResource], compute: bool) {
+        static PROBE: std::sync::OnceLock<Option<(String, u32, u64)>> = std::sync::OnceLock::new();
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        let Some((want, entry, at)) = PROBE.get_or_init(|| {
+            let v = std::env::var("VICTORY_PROBE_CB").ok()?;
+            let mut it = v.split(':');
+            let hex = |s: Option<&str>| u64::from_str_radix(s?.trim().trim_start_matches("0x"), 16).ok();
+            let hash = it.next()?.trim().to_owned();
+            Some((hash, hex(it.next())? as u32, hex(it.next())?))
+        }) else {
+            return;
+        };
+        if hash != want || LOGGED.load(Ordering::Relaxed) >= 200 {
+            return;
+        }
+        for u in used.iter().filter(|u| u.root == RootType::Table) {
+            if u.table_offset_dwords * 4 != *entry {
+                continue;
+            }
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+                continue;
+            };
+            let view = crate::descriptor::view(table + u64::from(*entry));
+            // A buffer view: its memory from the first element on (a
+            // description's dwords: format, dimension, mapping, padding,
+            // FirstElement (two), NumElements, StructureByteStride, Flags).
+            let buffer = match view {
+                Some(View::Constant(address, size)) => Some((address, size)),
+                Some(View::Shader(r, desc)) => crate::resource::buffer_bytes(r as _).map(|(p, len)| {
+                    let (first, stride) = desc.map_or((0, 0), |d| (u64::from(d[4]) | u64::from(d[5]) << 32, d[7]));
+                    let skip = first * u64::from(if stride == 0 { 4 } else { stride });
+                    (p as u64 + skip, len.saturating_sub(skip) as u32)
+                }),
+                // Title memory: the address after the plain description,
+                // the buffer's bytes in the resource description.
+                Some(View::Placed(_, r, d)) => {
+                    let (first, stride) = (u64::from(d[4]) | u64::from(d[5]) << 32, d[7]);
+                    let skip = first * u64::from(if stride == 0 { 4 } else { stride });
+                    let bytes = u64::from(r[4]) | u64::from(r[5]) << 32;
+                    Some(((u64::from(d[10]) | u64::from(d[11]) << 32) + skip, bytes.saturating_sub(skip) as u32))
+                }
+                _ => None,
+            };
+            let Some((address, size)) = buffer else {
+                LOGGED.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    hash,
+                    kind = ?u.kind,
+                    slot = u.slot,
+                    table = format_args!("{table:#x}"),
+                    view = describe(view.as_ref()),
+                    "probe: the entry is no constant buffer view"
+                );
+                continue;
+            };
+            let read = move || {
+                let mut word = [0u8; 4];
+                (u64::from(size) >= at + 4 && crate::host::read_into((address + at) as *const u8, &mut word))
+                    .then(|| u32::from_le_bytes(word))
+            };
+            let (drawn, frame, hash) = (read(), crate::frame::current(), hash.to_owned());
+            LOGGED.fetch_add(1, Ordering::Relaxed);
+            list.defer_host(move || {
+                tracing::warn!(
+                    hash,
+                    frame,
+                    buffer = format_args!("{address:#x}"),
+                    size,
+                    at_draw = ?drawn,
+                    at_submit = ?read(),
+                    "probe: constant dword"
+                );
+            });
+        }
+    }
+
     fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
@@ -2196,7 +2294,7 @@ impl State {
                 // The vertices are read in place, at submission: no change
                 // of mapping under the read (see
                 // `crate::watch::title_memory_reading`).
-                let _mapped = crate::watch::title_memory_reading();
+                let _mapped = crate::watch::title_memory_reading(from, n * 3 * stride);
                 // SAFETY: the vertices lie in a title buffer (checked when
                 // recorded) and the scratch memory is the list's.
                 let (src, dst) = unsafe {

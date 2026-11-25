@@ -76,7 +76,7 @@ pub(crate) struct Shadow {
     /// the title's own bytes and nothing is copied either way. The heap,
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
-    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64, bool)>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -1436,7 +1436,7 @@ impl Drop for Shadow {
     fn drop(&mut self) {
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
-            crate::inplace::gone(self.window, self.len);
+            crate::inplace::gone(self.window, self.len, self.place.as_ref().is_some_and(|p| p.2));
             return;
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
@@ -1680,6 +1680,25 @@ unsafe impl Send for Shadow {}
 unsafe impl Sync for Shadow {}
 
 impl Shadow {
+    /// The copy's bytes at title address `address`, as dwords (tests).
+    #[cfg(test)]
+    pub(crate) fn read_host(&self, address: u64, n: usize) -> Vec<u32> {
+        let at = (address - self.start) as usize;
+        assert!(at + 4 * n <= self.len as usize);
+        // SAFETY: inside the mapping (checked); the GPU is done with it.
+        unsafe { std::slice::from_raw_parts(self.data.add(at).cast::<u32>(), n).to_vec() }
+    }
+
+    /// Writes `bytes` into the copy at title address `address`, as shaders
+    /// do (tests).
+    #[cfg(test)]
+    pub(crate) fn write_host(&self, address: u64, bytes: &[u8]) {
+        let at = (address - self.start) as usize;
+        assert!(at + bytes.len() <= self.len as usize);
+        // SAFETY: inside the mapping (checked).
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(at), bytes.len()) };
+    }
+
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
@@ -1729,7 +1748,7 @@ impl Shadow {
         LIVE[1].fetch_sub(len, Ordering::Relaxed);
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
-        shadow.place = Some((placed.heap, placed.bias));
+        shadow.place = Some((placed.heap, placed.bias, placed.pins));
         shadow
     }
 
@@ -1787,14 +1806,19 @@ impl Shadow {
     /// a GPU-side dirty mask would save that if big ranges make it slow.
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         // In place the shaders write title memory itself: no snapshot, no
-        // compare, nothing to copy back, and no wait on its account.
+        // compare, nothing to copy back, and no wait on its account. With
+        // submissions sent ahead (`crate::host::late`) the range is still
+        // declared, and nothing else is done with it: the flights must
+        // know what their shaders write, so that our own reads of that
+        // memory (buffer copies, fills, textures) wait for them, as they
+        // do for a copy's (MOONSHOT.md, phase 5).
         // shortcut: another host copy of the same bytes (a title buffer
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
-        if self.place.is_some() {
+        let len = len.min(self.left(address));
+        if self.place.is_some() && !crate::host::late() {
             return;
         }
-        let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
@@ -2412,12 +2436,17 @@ impl Shadow {
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame).
+            // gaps whole cost ~1 s per frame). Under them, what the title
+            // wrote since it was taken (`update_busy`).
             busy.sort_unstable();
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
+                let (a, e) = (a.max(from), e.min(to));
                 if a > at {
                     bytes += self.update_free(at, a);
+                }
+                if e > a.max(at) {
+                    bytes += self.update_busy(a.max(at), e);
                 }
                 at = at.max(e);
             }
@@ -2427,6 +2456,44 @@ impl Shadow {
             return bytes;
         }
         self.update_free(from, to)
+    }
+
+    /// [`Shadow::update`] of `[from, to)` where a list submitted earlier
+    /// declared that shaders write. A submission waits for the one before
+    /// it, so none of this submission's shaders has run yet: the pages the
+    /// title wrote since they were taken are copied as anywhere else.
+    /// Skipped, the title's constants there stayed stale for the whole
+    /// submission (upstream VIctory #1322: a dispatch read its sizes as
+    /// zeros and looped until the device was removed). The same bytes go
+    /// into the snapshot `writing` took, so copy-back neither takes them
+    /// for the GPU's nor puts them back over a later title write. A copy in
+    /// the card's memory needs no snapshot: its CPU side is the reference.
+    /// Not with submissions sent ahead (`crate::host::late`), whose shaders
+    /// may be running: there [`Shadow::merge_under_writes`] takes such bytes.
+    fn update_busy(&self, from: usize, to: usize) -> usize {
+        if crate::host::late() || self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            return 0;
+        }
+        let Some((now, written)) = crate::watch::writes(from, to, true) else {
+            return 0;
+        };
+        let copied = self.copy_stale(from, to, now, &written);
+        if copied > 0 && self.card.is_none() {
+            let start = self.start as usize;
+            let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(snapshot) = before.as_mut() {
+                let (a, b) = (from - start, (to - start).min(snapshot.capacity()));
+                if a < b {
+                    // SAFETY: the snapshot's allocation holds the copy's bytes
+                    // at the copy's offsets (`writing`; its length stays 0),
+                    // `[a, b)` is a declared range inside it, and the copy's
+                    // mapping holds it too; nothing writes either before the
+                    // submission runs.
+                    unsafe { std::ptr::copy_nonoverlapping(self.data.add(a), snapshot.as_mut_ptr().add(a), b - a) };
+                }
+            }
+        }
+        copied
     }
 
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
@@ -2508,6 +2575,11 @@ impl Shadow {
 
     /// Whether shaders read and write this copy in the card's own memory
     /// ([`cards`]).
+    /// Whether this is title memory in place, not a copy ([`Shadow::placed`]).
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
+    }
+
     pub(crate) fn carded(&self) -> bool {
         self.card.is_some()
     }
@@ -2763,6 +2835,29 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
         crate::host::retire(shadow);
     }
     n
+}
+
+/// Whether bytes at title `address` are, or will be, read from a host
+/// copy rather than in place: a title buffer holding it has a copy, or is
+/// big enough for the card's memory (in place leaves those out), or a
+/// window outside buffers with a copy holds it. Nothing is made. For the
+/// raw-address directory's mirrors (`crate::memory`): a shader reaching
+/// such bytes through a mirror would see other bytes than one reaching
+/// them through the copy.
+pub(crate) fn copied(address: u64) -> bool {
+    {
+        let map = buffers();
+        let holder = map.range(..=(address, usize::MAX)).rev().take(64).find(|(key, e)| key.0 <= address && e.end > address);
+        if let Some((key, entry)) = holder {
+            return match &entry.shadow {
+                Some(shadow) => shadow.place.is_none(),
+                None => cards() && (entry.end - key.0).next_multiple_of(1 << 16) >= card_limits().0,
+            };
+        }
+    }
+    let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    map.range((address.saturating_sub(WINDOW), 0)..=(address, u64::MAX))
+        .any(|(key, shadow)| key.0 + key.1 > address && shadow.place.is_none())
 }
 
 /// For the in-place census (`crate::inplace`): the title buffers (start,
@@ -3229,4 +3324,52 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod busy_tests {
+    use super::*;
+
+    /// The title writes a constant under a range an earlier list of the
+    /// submission declared as written by shaders: the refresh before the
+    /// submission runs still brings it to the copy, a shader's write still
+    /// goes back, and a title write made after the refresh is not undone
+    /// (upstream VIctory #1322).
+    #[test]
+    fn title_writes_under_a_busy_range_are_copied() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let len = 2 * PAGE;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert!(p != 0 && p.is_multiple_of(PAGE));
+        register(p, p as u64, len as u64);
+        let done = || {
+            unregister(p, p as u64);
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        };
+        let Some(copy) = find(p as u64, len as u64).filter(|c| c.place.is_none() && c.card.is_none()) else {
+            done();
+            return; // no host GPU here, or a copy this test does not cover
+        };
+        let title = |at: usize| (p + at) as *mut u8;
+        let host = |at: usize| copy.read_host((p + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
+        copy.update(p, len);
+        // An earlier list declares all of it as written by shaders.
+        copy.writing(p, len);
+        // SAFETY: (all title reads and writes below) bytes of our allocation.
+        unsafe { title(PAGE + 20).write_volatile(0x55) };
+        assert!(copy.update(p + PAGE + 16, 16) > 0, "the title's write is copied");
+        assert_eq!(host(PAGE + 20), 0x55, "the title's constant reaches the copy");
+        // The shaders run: one byte written. The title writes meanwhile.
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        unsafe { title(PAGE + 20).write_volatile(0x66) };
+        copy.copy_back(p, len);
+        unsafe {
+            assert_eq!(title(10).read_volatile(), 0xaa, "the shader's write goes back");
+            assert_eq!(title(PAGE + 20).read_volatile(), 0x66, "the title's later write stays");
+        }
+        done();
+    }
 }

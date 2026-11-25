@@ -591,6 +591,21 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     list.defer_texture(staging);
 }
 
+/// Whether `[start, start + size)` shows physical pages shown elsewhere too
+/// (`crate::inplace::aliased`); in diagnostics builds each such texture is
+/// named once.
+fn aliased(start: usize, size: usize) -> bool {
+    let aliased = crate::inplace::aliased(start, size);
+    #[cfg(feature = "diagnostics")]
+    if aliased {
+        static SEEN: std::sync::Mutex<Option<std::collections::HashSet<usize>>> = std::sync::Mutex::new(None);
+        if SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(start) {
+            tracing::info!(memory = format_args!("{start:#x}"), size, "a guarded texture's pages are shown elsewhere too: hashed at every check");
+        }
+    }
+    aliased
+}
+
 impl Staging {
     /// The title memory the texture is read from: address and bytes.
     pub(crate) fn memory(&self) -> (usize, usize) {
@@ -654,7 +669,12 @@ impl Staging {
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            // Pages shown at another address too may be written by a way
+            // that faults nowhere (the guards' twins see the title's own
+            // writes, not ours through views of our own): such a texture is
+            // hashed at every check, as before the guard. The opening
+            // video's frames were otherwise seen one frame in eight (run 25).
+            if unwritten && !turn && !aliased(start, size) {
                 return 0;
             }
         }
@@ -664,16 +684,16 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let mapped = if no_wait() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+            let Some(mapped) = crate::watch::title_memory_reading_now(self.memory as usize, size) else {
                 return self.refresh_unlocked(last, size);
             };
             mapped
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            waited(2, || crate::watch::title_memory_reading(self.memory as usize, size))
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
@@ -692,6 +712,8 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                // Read: the runtime may remap again (see below).
+                drop(mapped);
                 let hash = blake3::hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -711,6 +733,7 @@ impl Staging {
             return size;
         }
         if through_copy() {
+            drop(mapped);
             return with_title(self.memory, size, |tiled| {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
@@ -726,7 +749,7 @@ impl Staging {
             });
         }
         // SAFETY: committed memory of the texture's layout size, and it
-        // stays committed while `_mapped` is held.
+        // stays committed while `mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
@@ -735,7 +758,15 @@ impl Staging {
             return size;
         }
         last.hash = Some(hash);
-        self.detile(tiled);
+        // Copied out, then detiled with the lock let go: while the runtime
+        // waits to remap, every refresh that begins waits behind it, so a
+        // read held through the detiling held up all of them (2.1 s a
+        // frame of waits while the world streams in, run O).
+        with_read(size, |read| {
+            read.copy_from_slice(tiled);
+            drop(mapped);
+            self.detile(read);
+        });
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size

@@ -1975,7 +1975,54 @@ impl<'a> Tracer<'a> {
             return Err(SELECT);
         }
         let reach = (lanes.reach[b], true);
-        let meet = |conditions: &[(Bool, bool)]| self.meet(lanes, conditions);
+        // Mask phis of the loop that join the same mask on every edge are
+        // equal in every pass: the same on entry, the same function of
+        // them on the back edge. The console compiler copies EXEC before
+        // the loop and narrows the copy with it (`s_mov_b64 s[38:39],
+        // exec`, then `s_andn2_wrexec_b64 s[38:39], s[38:39]`); where lanes
+        // may arrive with EXEC clear (the skip around the loop left out,
+        // `ir::without_skips`) the two are joins of their own, which the
+        // proof needs to know are one.
+        let mut same: Vec<(Bool, Bool)> = Vec::new();
+        let mut joins: Vec<(Bool, Vec<Bool>)> = Vec::new();
+        for phi in &block.phis {
+            let Some(&m) = lanes.masks.get(&phi.value) else {
+                continue;
+            };
+            let Some(args) = phi
+                .args
+                .iter()
+                .map(|a| lanes.masks.get(a).copied())
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            match joins.iter().find(|j| j.1 == args) {
+                Some(&(other, _)) if other != m => same.push((other, m)),
+                Some(_) => {}
+                None => joins.push((m, args)),
+            }
+        }
+        same.truncate(4);
+        // Whether some lane meets `conditions`, the equal joins taken as
+        // equal. Without the block's reach first: what no lane meets
+        // anyway needs no search through it, and the reach of a block
+        // behind skips left out can be past `meet`'s budget, which then
+        // answers yes.
+        let meet = |conditions: &[(Bool, bool)]| {
+            let some = |all: Vec<(Bool, bool)>| {
+                (0..1usize << same.len()).any(|k| {
+                    let mut all = all.clone();
+                    for (j, &(x, y)) in same.iter().enumerate() {
+                        let holds = k >> j & 1 != 0;
+                        all.extend([(x, holds), (y, holds)]);
+                    }
+                    self.meet(lanes, &all)
+                })
+            };
+            some(conditions.iter().copied().filter(|&c| c != reach).collect())
+                && some(conditions.to_vec())
+        };
         let mut out = Waterfall::default();
         let mut required = vec![(remaining, true)];
         for (i, inst) in block.insts[..access].iter().enumerate() {
@@ -3117,6 +3164,39 @@ pub(crate) mod tests {
         assert!(address.dynamic.is_some(), "{address:?}");
         assert_eq!(r.waterfall.compares.len(), 1);
         assert_eq!(r.waterfall.reads.len(), 1);
+        assert_eq!(r.waterfall.loads, [load]);
+    }
+
+    /// [`WATERFALL_INDEXED_WAVE32`] behind a per-lane branch that skips
+    /// nothing (`s_and_saveexec` to the lanes below 16, no
+    /// `s_cbranch_execz`): lanes outside EXEC reach the loop, so EXEC and
+    /// its copy before the loop are joins of their own there, equal in
+    /// every pass. 1f1fbd86 (a wave64 compute program on 32-lane hosts,
+    /// taken without its skips) left 27 such loops unproven; they ran
+    /// literally and 5 lanes a dispatch stayed in 7 of them to the
+    /// iteration limit.
+    #[test]
+    fn a_waterfall_lanes_outside_exec_reach_is_one() {
+        let w = WATERFALL_INDEXED_WAVE32;
+        let words = [
+            &w[..14],
+            &[
+                0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+                0xBE98_3C6A, // s_and_saveexec_b32 s24, vcc_lo
+            ],
+            &w[14..],
+        ]
+        .concat();
+        let r = waterfall(&words, false).unwrap();
+        let image = r
+            .descriptors
+            .iter()
+            .find(|d| d.role == Role::Resource)
+            .unwrap();
+        let Source::Loaded { load, first: 0 } = image.source else {
+            panic!("{:?}", image.source)
+        };
+        assert_eq!(r.waterfall.compares.len(), 1);
         assert_eq!(r.waterfall.loads, [load]);
     }
 

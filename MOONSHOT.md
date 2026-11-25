@@ -283,6 +283,31 @@ already reach.
   because it is correct and tested: committed pool chunks, view placement,
   directory mirrors, flight declarations.
 - 2026-11-25. Runs 4 to 6: the card's memory for copies, then the default (Results).
+- 2026-11-25. Run 6's log showed what texture refreshes were doing.
+  Across all threads they took 600-1,190 ms a frame, and 490-1,040 ms of
+  that was waiting for title memory to hold still. One lock covered the
+  whole address space, and the runtime's 1,459 remappings a frame held it
+  for 778 ms of it. The lock now covers ranges (`watch::title_memory_reading`
+  and `title_memory_remapping` take the memory they read or change; `xmem`
+  passes the extent of the views a change touches). A change waits only
+  for reads of its memory, and a read only for changes of its memory. A
+  change that waits holds back new reads of its own memory, so it cannot be
+  put off for ever. Run 7, defaults plus this: texture lock waiting is 0.0
+  ms, texture refreshes take 51-84 ms a frame on all threads, and the
+  cutscene runs at 630 ms a frame, CPU 230 (textures 112), GPU 200. Before
+  this it was 734 / 387 (254) / 207. Play: 401 / 140 / 125, against
+  521 / 257 / 147 on the old defaults.
+- 2026-11-25. Run 7, play: the card is 28-38 % busy. The submitting thread
+  waits for the card 110-118 ms a frame, and the card waits behind it
+  140-200 ms. The submissions are serialised.
+- 2026-11-25. Run 8: run 7's defaults and `VICTORY_RELAY=2`, the fork's
+  existing switch that sends submissions ahead. Cutscene 468 ms a frame,
+  CPU 252. Play **256 ms (about 3.9 fps)**, CPU 136. The card is 45-52 %
+  busy, and the submitting thread waits 68 ms a frame. Its "on the GPU"
+  numbers (33-59 ms) are counted differently with late wait and cannot be
+  compared. The black-frame check is left out with late presents, so its
+  0 proves nothing. No crash. The relay stays off by default until frames
+  captured with and without it have been compared.
 - 2026-11-25. Where the same table points instead: for scattered reads, the
   card's own memory is 28 times faster than today's host copies, and today
   every buffer below 16 MiB, and everything past 512 MB of card copies,

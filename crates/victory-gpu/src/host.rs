@@ -2408,7 +2408,7 @@ fn relay_worker() {
 fn relay_hand_back(back: &[Declared]) {
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
-        if shadow.carded() {
+        if shadow.carded() || shadow.in_place() {
             continue;
         }
         let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -2665,7 +2665,8 @@ fn hand_back(back: &[Declared]) {
         // threads), then the merges, in order, as below.
         let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         for (shadow, declared) in back {
-            if shadow.carded() {
+            // (in place: declared for the flights only, nothing to hand back)
+            if shadow.carded() || shadow.in_place() {
                 continue;
             }
             let mut sorted = declared.clone();
@@ -3370,7 +3371,9 @@ impl Host {
                 .collect();
             if !flights.is_empty() {
                 // SAFETY: a plain query.
-                if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                let removed = unsafe { self.device.GetDeviceRemovedReason() }.is_err();
+                crate::loop_report::log(removed);
+                if removed {
                     let runs: Vec<&HostList> = flights.iter().flat_map(|f| f.order.iter().map(|&i| f.lists[i].host())).collect();
                     fail(format_args!(
                         "host GPU device removed after {} submissions sent ahead (VICTORY_RELAY=1) of {} lists{}{}",
@@ -3767,7 +3770,9 @@ impl Host {
                     format!("{flights} submissions sent ahead, settled together")
                 });
                 // SAFETY: a plain query.
-                if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+                let removed = unsafe { self.device.GetDeviceRemovedReason() }.is_err();
+                crate::loop_report::log(removed);
+                if removed {
                     let runs: Vec<&HostList> = items
                         .iter()
                         .filter_map(|i| match i {
@@ -4090,7 +4095,9 @@ impl Host {
             tracing::warn!(ms = gpu.as_millis(), lists = runs.len(), ?pipelines, "slow host submission");
         }
         // SAFETY: a plain query.
-        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+        let removed = unsafe { self.device.GetDeviceRemovedReason() }.is_err();
+        crate::loop_report::log(removed);
+        if removed {
             fail(format_args!(
                 "host GPU device removed after a submission of {} lists{}{}",
                 runs.len(),
@@ -5644,6 +5651,8 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         #[cfg(feature = "diagnostics")]
+        crate::frame::set_busy(false);
+        #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
         #[cfg(feature = "diagnostics")]
@@ -5688,6 +5697,20 @@ impl Meter {
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
                      ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
                     if rehash_runs() { "on" } else { "off" }
+                );
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            let [count, waited, held, gone, shown] =
+                [0, 1, 2, 3, 4].map(|i| crate::watch::REMAPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if count >= 1.0 {
+                tracing::info!(
+                    "runtime remappings of title memory per frame: {count:.0}, waiting {:.1} ms for reads to end, holding                      the lock {:.1} ms (of which {:.1} ms telling us of ranges gone, {:.1} ms of views shown)",
+                    waited / 1000.0,
+                    held / 1000.0,
+                    gone / 1000.0,
+                    shown / 1000.0
                 );
             }
         }
@@ -5972,7 +5995,11 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
+            #[cfg(feature = "diagnostics")]
+            let started = std::time::Instant::now();
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            #[cfg(feature = "diagnostics")]
+            present_stats(&p.swap_chain, frame, started);
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -6479,4 +6506,38 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             before.as_secs_f64() / after.as_secs_f64()
         );
     }
+}
+
+/// Diagnostics (`VICTORY_LOG=victory_gpu::present=debug`): each host
+/// present, for frame pacing: the title frame, the time since the last
+/// present and the call's own, and DXGI's statistics: the presents made
+/// (`count`), the last one on screen (`shown`) and the vblank it went up at
+/// (`refresh`).
+#[cfg(feature = "diagnostics")]
+fn present_stats(swap_chain: &IDXGISwapChain3, frame: u64, started: std::time::Instant) {
+    if !tracing::enabled!(target: "victory_gpu::present", tracing::Level::DEBUG) {
+        return;
+    }
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let last = LAST.lock().unwrap_or_else(|e| e.into_inner()).replace(started);
+    let since = last.map_or(0, |t| (started - t).as_micros() as u64);
+    let mut stats = DXGI_FRAME_STATISTICS::default();
+    // SAFETY: plain queries.
+    let (ok, count) = unsafe {
+        (
+            swap_chain.GetFrameStatistics(&mut stats).is_ok(),
+            swap_chain.GetLastPresentCount().unwrap_or(0),
+        )
+    };
+    tracing::debug!(
+        target: "victory_gpu::present",
+        frame,
+        since_us = since,
+        call_us = started.elapsed().as_micros() as u64,
+        count,
+        shown = stats.PresentCount,
+        refresh = stats.SyncRefreshCount,
+        ok,
+        "host present"
+    );
 }

@@ -51,9 +51,14 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
+        if victory_shader::emit::loop_report() {
+            tracing::warn!("VICTORY_SHADER_LOOP_REPORT: loops stopped at the limit are logged");
+        }
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                // So is the loop report.
+                bytes.push(u8::from(victory_shader::emit::loop_report()));
                 // Which group barriers wait is part of the translation too.
                 bytes.push(victory_shader::emit::group_sync());
                 // So are the switches that pick the form of a wave64 program:
@@ -153,7 +158,7 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -244,6 +249,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, u32::from(s.loop_report));
     out
 }
 
@@ -312,8 +318,10 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let loop_report = r.word()? != 0;
     r.0.is_empty().then_some(HostShader {
         stage,
+        loop_report,
         dxil,
         user_data,
         samplers,
@@ -332,6 +340,7 @@ mod tests {
     fn shader() -> HostShader {
         HostShader {
             stage: HwStage::Ps,
+            loop_report: true,
             dxil: b"DXBC and the rest".to_vec(),
             user_data: vec![UserData {
                 index: 8,

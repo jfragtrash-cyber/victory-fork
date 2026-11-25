@@ -74,11 +74,12 @@ pub(crate) fn probe_level() -> u8 {
 /// reserved, which the host refuses, and what a view shows changes when
 /// the title maps pages.
 ///
-/// What it assumes, for 2: nothing reads title memory that a submission
-/// not yet run writes through such a buffer. With every submission waited
-/// for (the default) that holds; with `VICTORY_LATE_WAIT` it does not,
-/// since the flights' rules know shader writes only by the ranges copies
-/// declare. Do not combine 2 with late wait.
+/// What it assumes, for 2: nothing of ours reads title memory that a
+/// submission not yet run writes through such a buffer. With every
+/// submission waited for (the default) that holds; with `VICTORY_LATE_WAIT`
+/// the ranges in place are declared written like a copy's
+/// (`Shadow::gpu_writes`), so the flights' rules see them, and nothing is
+/// copied back for them.
 ///
 /// shortcut: while a window is in place the title cannot decommit, free
 /// or protect its pages (the call fails with error 87; the probe shows
@@ -88,6 +89,13 @@ pub(crate) fn probe_level() -> u8 {
 pub(crate) fn level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// Whether title memory is put in place at all ([`level`] 1 or more): the
+/// runtime then makes the page pool of committed sections, which alone can
+/// be opened as host heaps.
+pub fn in_place_wanted() -> bool {
+    level() >= 1
 }
 
 /// The most title memory in place at once, in bytes
@@ -100,9 +108,28 @@ fn most() -> u64 {
 
 /// In place now: windows and their bytes, title buffers and their bytes;
 /// then, since the start: asks turned down because the memory is a view
-/// or not private memory committed whole, because the host refused,
-/// because of [`most`]; and what was let go because its memory changed.
-static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// that cannot be opened (scattered, holed, aliased, or of a reserved
+/// section) or not private memory committed whole, because the host
+/// refused, because of [`most`]; and what was let go because its memory
+/// changed. Then, now: bytes of private memory in place (each opening pins
+/// its own pages) and bytes of the pool's sections opened (pinned whole);
+/// and since the start, placements in view memory.
+static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+
+/// Heaps opened on committed sections of the page pool, by section handle,
+/// with the section's bytes: one opening per section, on first use, kept
+/// while the runtime knows the section (opening pins its pages, so
+/// [`most`] counts them).
+///
+/// shortcut: a section the title gives back stays pinned while its heap is
+/// kept; the title allocates its pool once.
+static SECTION_HEAPS: Mutex<Vec<(usize, ID3D12Heap, u64)>> = Mutex::new(Vec::new());
+
+/// Of the asks turned down as memory that cannot be opened, since the
+/// start: views scattered or holed, one run but shown at another address
+/// too, one run of a section not committed (or over [`most`]), private
+/// memory not committed whole.
+static WHY_NOT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
@@ -110,6 +137,9 @@ pub(crate) struct Placed {
     pub(crate) heap: ID3D12Heap,
     /// The host GPU address of the title memory's first byte.
     pub(crate) gpu: u64,
+    /// Whether the opening pinned pages of its own (private memory), not
+    /// a part of a section heap opened once.
+    pub(crate) pins: bool,
     /// Bytes from the buffer's first byte to the title memory's first.
     pub(crate) bias: u64,
 }
@@ -128,7 +158,109 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, gpu, bias: start - at })
+    Ok(Placed { buffer, heap, gpu, pins: true, bias: start - at })
+}
+
+/// The heap of committed section `section`, opened now if it was not yet.
+/// `Err(None)` if the section is not known committed, or opening it would
+/// pass [`most`].
+fn section_heap(device: &ID3D12Device, section: usize) -> Result<ID3D12Heap, Option<windows::core::Error>> {
+    let Some(bytes) = views().sections.iter().find(|s| s.0 == section && s.2).map(|s| s.1) else {
+        return Err(None);
+    };
+    let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, heap, _)) = heaps.iter().find(|h| h.0 == section) {
+        return Ok(heap.clone());
+    }
+    if pinned() + bytes > most() {
+        STATS[6].fetch_add(1, Ordering::Relaxed);
+        return Err(None);
+    }
+    let started = std::time::Instant::now();
+    let heap = open(device, From::Section(section)).map_err(Some)?;
+    STATS[9].fetch_add(bytes, Ordering::Relaxed);
+    tracing::info!(
+        section = format_args!("{section:#x}"),
+        mb = bytes >> 20,
+        ms = format_args!("{:.1}", started.elapsed().as_secs_f64() * 1e3),
+        "a section of physical pages opened as a host heap: its views go in place"
+    );
+    heaps.push((section, heap.clone(), bytes));
+    Ok(heap)
+}
+
+/// A buffer over the whole heap of committed section `section`, for the
+/// raw-address directory (`crate::memory`): every view of the section is
+/// the buffer at the view's offset. None unless title memory goes in place
+/// and the section is known committed, no more than 2 GiB (shaders address
+/// a raw view in 32 bits) and can be opened.
+pub(crate) fn mirror(section: usize) -> Option<(ID3D12Resource, u64)> {
+    if level() < 1 {
+        return None;
+    }
+    let bytes = views().sections.iter().find(|s| s.0 == section && s.2)?.1;
+    if bytes > 1 << 31 {
+        return None;
+    }
+    let host = crate::host::host()?;
+    let heap = section_heap(&host.device, section).ok()?;
+    let buffer = place(&host.device, &heap, 0, bytes).ok()?;
+    crate::host::name(&buffer, || format!("physical pages {section:#x}: the whole section in place, for shaders' raw addresses"));
+    Some((buffer, bytes))
+}
+
+/// The views of `section` now: address, bytes, offset in the section.
+pub(crate) fn views_of(section: usize) -> Vec<(usize, usize, u64)> {
+    let v = views();
+    v.shown.range((section, 0, 0)..(section.saturating_add(1), 0, 0)).map(|(&(_, offset, at), &len)| (at, len, offset)).collect()
+}
+
+/// Changes of the views since the raw-address directory last looked
+/// (`crate::memory::ready`), while it is in use: a view mapped (address,
+/// bytes, section, offset) or what a range showed gone (section 0).
+static VIEW_CHANGES: Mutex<Vec<(usize, usize, usize, u64)>> = Mutex::new(Vec::new());
+static VIEW_CHANGES_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The raw-address directory follows the views from now on.
+pub(crate) fn follow_views() {
+    VIEW_CHANGES_ON.store(true, Ordering::Relaxed);
+}
+
+/// The view changes since the last call, oldest first.
+pub(crate) fn take_view_changes() -> Vec<(usize, usize, usize, u64)> {
+    std::mem::take(&mut *VIEW_CHANGES.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+fn view_changed(at: usize, len: usize, section: usize, offset: u64) {
+    if VIEW_CHANGES_ON.load(Ordering::Relaxed) {
+        VIEW_CHANGES.lock().unwrap_or_else(|e| e.into_inner()).push((at, len, section, offset));
+    }
+}
+
+/// Bytes of the PC's memory pinned by what is in place.
+fn pinned() -> u64 {
+    STATS[8].load(Ordering::Relaxed) + STATS[9].load(Ordering::Relaxed)
+}
+
+/// Title memory `[start, start + len)`, one run of committed section
+/// `section` from `offset` on, as a buffer placed in the section's heap.
+pub(crate) fn place_view(
+    device: &ID3D12Device,
+    section: usize,
+    offset: u64,
+    start: u64,
+    len: u64,
+) -> Result<Placed, Option<windows::core::Error>> {
+    let heap = section_heap(device, section)?;
+    // Views begin on 64 KiB lines of both the address and the section.
+    let at = offset & !(K64 as u64 - 1);
+    let bias = offset - at;
+    debug_assert_eq!(bias, start % K64 as u64);
+    let bytes = (offset + len.max(1)).next_multiple_of(K64 as u64) - at;
+    let buffer = place(device, &heap, at, bytes).map_err(Some)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + bias;
+    Ok(Placed { buffer, heap, gpu, pins: false, bias })
 }
 
 /// Title memory `[start, start + len)` in place, for a window outside
@@ -138,25 +270,43 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
-    // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
+    // View memory, known from the runtime without asking Windows: in place
+    // when it is one run of one committed section that no other address
+    // shows (a copy elsewhere of the same pages would not see what shaders
+    // write here).
+    let run = match cover(start as usize, len as usize) {
+        Cover::None => None,
+        Cover::Run(section, offset) if !aliased(start as usize, len as usize) => Some((section, offset)),
+        cover => {
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            WHY_NOT[if matches!(cover, Cover::Run(..)) { 1 } else { 0 }].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+    if run.is_none() && pinned() + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let host = crate::host::host()?;
-    match place_part(&host.device, start, len) {
+    let placed = match run {
+        Some((section, offset)) => place_view(&host.device, section, offset, start, len),
+        None => place_part(&host.device, start, len),
+    };
+    match placed {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
             STATS[at + 1].fetch_add(len, Ordering::Relaxed);
+            if placed.pins {
+                STATS[8].fetch_add(len, Ordering::Relaxed);
+            } else {
+                STATS[10].fetch_add(1, Ordering::Relaxed);
+            }
             Some(placed)
         }
         Err(None) => {
             STATS[4].fetch_add(1, Ordering::Relaxed);
+            WHY_NOT[if run.is_some() { 2 } else { 3 }].fetch_add(1, Ordering::Relaxed);
             None
         }
         Err(Some(e)) => {
@@ -168,11 +318,14 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
-/// What [`place_for`] gave is gone.
-pub(crate) fn gone(window: bool, bytes: u64) {
+/// What [`place_for`] gave is gone; `pins` as it said ([`Placed::pins`]).
+pub(crate) fn gone(window: bool, bytes: u64, pins: bool) {
     let at = if window { 0 } else { 2 };
     STATS[at].fetch_sub(1, Ordering::Relaxed);
     STATS[at + 1].fetch_sub(bytes, Ordering::Relaxed);
+    if pins {
+        STATS[8].fetch_sub(bytes, Ordering::Relaxed);
+    }
 }
 
 /// Title memory `[at, at + len)` is about to show something else, or the
@@ -200,7 +353,8 @@ fn say() {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
         "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
-         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
+         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed; {} placed in view memory so far, \
+         {} MB of private memory and {} MB of the pool's sections pinned; turned down as memory: {} views scattered or holed, {} shown at two addresses,          {} of a section not committed, {} private not committed whole",
         s[0],
         s[1] >> 20,
         s[2],
@@ -208,7 +362,14 @@ fn say() {
         s[4],
         s[5],
         s[6],
-        s[7]
+        s[7],
+        s[10],
+        s[8] >> 20,
+        s[9] >> 20,
+        WHY_NOT[0].load(Ordering::Relaxed),
+        WHY_NOT[1].load(Ordering::Relaxed),
+        WHY_NOT[2].load(Ordering::Relaxed),
+        WHY_NOT[3].load(Ordering::Relaxed)
     );
 }
 
@@ -267,11 +428,64 @@ pub(crate) fn place(device: &ID3D12Device, heap: &ID3D12Heap, offset: u64, size:
 struct Views {
     /// By address: bytes, the section's handle, the offset in it.
     views: BTreeMap<usize, (usize, usize, u64)>,
+    /// The same views by what they show: (section, offset, address) to
+    /// bytes. [`aliases`] looks here, near the offsets it asks about: going
+    /// through every view held the runtime's mapping lock for long while it
+    /// maps pages one by one (texture refreshes waited on it for most of
+    /// the slow frames), and cost the guards' every protection.
+    shown: BTreeMap<(usize, u64, usize), usize>,
+    /// The longest view in `shown` yet: how far before an offset a view
+    /// showing it can begin.
+    longest: usize,
+    /// Views longer than [`BIG`], kept out of `shown` and looked at one by
+    /// one (a few: the title's pool views). In `shown` the longest, a pool
+    /// view of 6 GiB, made every look go through every view of its section
+    /// (thousands, one per page of the GPU's page mappings): 0.5 ms of each
+    /// remapping under the lock, a quarter of a second a frame (run Q).
+    big: BTreeMap<(usize, u64, usize), usize>,
     /// Sections by handle: bytes, and whether made committed.
     sections: Vec<(usize, u64, bool)>,
+    /// [`aliased`] by range, until the views change.
+    aliased: Option<std::collections::HashMap<(usize, usize), bool>>,
 }
 
-static VIEWS: Mutex<Views> = Mutex::new(Views { views: BTreeMap::new(), sections: Vec::new() });
+impl Views {
+    const fn new() -> Self {
+        Views {
+            views: BTreeMap::new(),
+            shown: BTreeMap::new(),
+            longest: 0,
+            big: BTreeMap::new(),
+            sections: Vec::new(),
+            aliased: None,
+        }
+    }
+
+    fn insert(&mut self, at: usize, len: usize, section: usize, offset: u64) {
+        self.remove(at);
+        self.views.insert(at, (len, section, offset));
+        if len > BIG {
+            self.big.insert((section, offset, at), len);
+        } else {
+            self.shown.insert((section, offset, at), len);
+            self.longest = self.longest.max(len);
+        }
+        self.aliased = None;
+    }
+
+    fn remove(&mut self, at: usize) {
+        if let Some((_, section, offset)) = self.views.remove(&at) {
+            self.shown.remove(&(section, offset, at));
+            self.big.remove(&(section, offset, at));
+            self.aliased = None;
+        }
+    }
+}
+
+/// Views longer than this are [`Views::big`].
+const BIG: usize = 16 << 20;
+
+static VIEWS: Mutex<Views> = Mutex::new(Views::new());
 
 fn views() -> std::sync::MutexGuard<'static, Views> {
     VIEWS.lock().unwrap_or_else(|e| e.into_inner())
@@ -280,21 +494,46 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
-    let mut v = views();
-    v.sections.retain(|s| s.0 != section);
-    v.sections.push((section, bytes, committed));
+    {
+        let mut v = views();
+        v.sections.retain(|s| s.0 != section);
+        v.sections.push((section, bytes, committed));
+    }
+    // A handle used again: the heap opened on the section it named is not
+    // this one's (what is placed in it keeps it alive).
+    let mut heaps = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(i) = heaps.iter().position(|h| h.0 == section) {
+        STATS[9].fetch_sub(heaps.remove(i).2, Ordering::Relaxed);
+    }
 }
 
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
-    views().views.insert(at, (len, section, offset));
+    #[cfg(feature = "diagnostics")]
+    let _timed = crate::watch::Timed(4, std::time::Instant::now());
+    let shown = {
+        let mut v = views();
+        v.insert(at, len, section, offset);
+        aliases_in(&v, at, len)
+    };
+    view_changed(at, len, section, offset);
+    // What other addresses show of the same pages may be written through
+    // this one from now on, with no guard of theirs to see it; and what is
+    // in place there is no longer the only address of its pages (copies
+    // here would not see what shaders write there): let go, so that the
+    // next ask makes a copy.
+    for (_, alias, bytes) in shown {
+        crate::watch::aliases_appeared(alias, bytes);
+        title_memory_freeing(alias, bytes);
+    }
 }
 
 /// What `[at, at + len)` showed is gone ([`crate::title_memory_remapped`]):
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
+    view_changed(at, len, 0, 0);
     let mut v = views();
     if v.views.is_empty() {
         return;
@@ -303,8 +542,70 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
     let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
     for base in gone {
-        v.views.remove(&base);
+        v.remove(base);
     }
+}
+
+/// Whether physical pages that `[at, at + len)` shows are shown at another
+/// address too ([`aliases`]), remembered until the views change.
+pub(crate) fn aliased(at: usize, len: usize) -> bool {
+    let mut v = views();
+    let v = &mut *v;
+    *v.aliased
+        .get_or_insert_with(Default::default)
+        .entry((at, len))
+        .or_insert_with(|| !aliases_in_parts(&v.views, &v.shown, &v.big, v.longest, at, len).is_empty())
+}
+
+/// The other addresses that show physical pages `[at, at + len)` shows:
+/// `(address in the range, address elsewhere, bytes)`, one per overlap of
+/// two views.
+pub(crate) fn aliases(at: usize, len: usize) -> Vec<(usize, usize, usize)> {
+    aliases_in(&views(), at, len)
+}
+
+fn aliases_in(v: &Views, at: usize, len: usize) -> Vec<(usize, usize, usize)> {
+    aliases_in_parts(&v.views, &v.shown, &v.big, v.longest, at, len)
+}
+
+fn aliases_in_parts(
+    views: &BTreeMap<usize, (usize, usize, u64)>,
+    shown: &BTreeMap<(usize, u64, usize), usize>,
+    big: &BTreeMap<(usize, u64, usize), usize>,
+    longest: usize,
+    at: usize,
+    len: usize,
+) -> Vec<(usize, usize, usize)> {
+    let end = at.saturating_add(len);
+    let first = views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at);
+    // The parts of sections the range shows: the view's address, the
+    // section, the offsets in it, and the address of the first byte.
+    let mine: Vec<(usize, usize, u64, u64, usize)> = first
+        .into_iter()
+        .chain(views.range(at.saturating_add(1)..end))
+        .map(|(&base, &(bytes, section, offset))| {
+            let (from, to) = (base.max(at), (base + bytes).min(end));
+            (base, section, offset + (from - base) as u64, offset + (to - base) as u64, from)
+        })
+        .collect();
+    let mut found = Vec::new();
+    if mine.is_empty() {
+        return found;
+    }
+    for &(own, section, from, to, address) in &mine {
+        // The views of the section that begin less than the longest view
+        // before `from` and before `to`: those that may show part of it.
+        let low = (section, from.saturating_sub(longest as u64), 0);
+        let near = shown.range(low..(section, to, 0));
+        let long = big.range((section, 0, 0)..(section, to, 0));
+        for (&(_, offset, base), &bytes) in near.chain(long) {
+            let (lo, hi) = (from.max(offset), to.min(offset + bytes as u64));
+            if base != own && lo < hi {
+                found.push((address + (lo - from) as usize, base + (lo - offset) as usize, (hi - lo) as usize));
+            }
+        }
+    }
+    found
 }
 
 /// How the views cover `[at, at + len)`.
@@ -488,6 +789,52 @@ impl Rig {
             list.SetComputeRootUnorderedAccessView(0, gpu);
             list.Dispatch(1, 1, 1);
         })
+    }
+
+    /// Milliseconds the card takes for shaders to gather from `bytes` of
+    /// the buffer at GPU address `gpu` (raw view, unordered access): 64K
+    /// threads, each 256 dependent 4-byte loads at pseudo-random places,
+    /// the best of three. What vertex fetch and structured reads of a
+    /// big title buffer do, unlike a copy's streaming.
+    #[cfg(test)]
+    fn gather_ms(&mut self, gpu: u64, bytes: u64) -> windows::core::Result<f64> {
+        const SOURCE: &str = "#define RS \"UAV(u0), RootConstants(num32BitConstants=1, b0)\"
+RWByteAddressBuffer b : register(u0);
+cbuffer c : register(b0) { uint mask; };
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) { uint x = id.x * 2654435761u; uint sum = 0; for (uint i = 0; i < 256; i++) { x = x * 1664525u + 1013904223u + sum; sum += b.Load((x & mask) & ~3u); } if (sum == 0x12345678) b.Store(0, sum); }
+";
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: as in `shade`.
+        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+            D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("gather"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, None)?;
+            let code = code.ok_or_else(windows::core::Error::empty)?;
+            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+            let pso = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+                ..Default::default()
+            })?;
+            (root, pso)
+        };
+        let mask = (bytes.next_power_of_two() >> 1).max(4) as u32 - 1;
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            // SAFETY: an open list of ours; the view names a live buffer of
+            // `bytes` or more, and every load lies below `mask`.
+            self.run(|list| unsafe {
+                list.SetComputeRootSignature(&root);
+                list.SetPipelineState(&pso);
+                list.SetComputeRootUnorderedAccessView(0, gpu);
+                list.SetComputeRoot32BitConstant(1, mask, 0);
+                list.Dispatch(1024, 1, 1);
+            })?;
+            best = best.min(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        Ok(best)
     }
 
     /// Milliseconds the card takes to copy `bytes` of `from` into its own
@@ -1041,6 +1388,34 @@ mod tests {
         assert_eq!(cover_in(&views, at - K64, 2 * K64), Cover::None);
     }
 
+    /// A range whose section pages another view shows too has aliases,
+    /// where those pages are; one whose pages only it shows, or that no
+    /// view holds, has none.
+    #[test]
+    fn pages_shown_at_two_addresses_are_aliased() {
+        let mut views = Views::new();
+        let (a, b) = (0x7_0000_0000usize, 0x8_0000_0000usize);
+        views.insert(a, 4 * K64, 9, 0);
+        // Pages 2 and 3 of section 9 again, elsewhere.
+        views.insert(b, 2 * K64, 9, 2 * K64 as u64);
+        // Another section at the same offsets.
+        views.insert(b + 4 * K64, 4 * K64, 5, 0);
+        assert!(aliases_in(&views, a, 2 * K64).is_empty());
+        assert_eq!(aliases_in(&views, a + K64, 2 * K64), [(a + 2 * K64, b, K64)]);
+        assert_eq!(aliases_in(&views, b, K64), [(b, a + 2 * K64, K64)]);
+        assert!(aliases_in(&views, b + 4 * K64, 4 * K64).is_empty());
+        assert!(aliases_in(&views, a - 2 * K64, K64).is_empty());
+        // A view longer than `BIG` (a pool view), kept apart, and one page
+        // of it shown elsewhere too: found from either side.
+        let (c, d) = (0x9_0000_0000usize, 0xa_0000_0000usize);
+        let mid = 20 << 20;
+        views.insert(c, 2 * BIG, 3, 0);
+        views.insert(d, K64, 3, mid as u64);
+        assert_eq!(aliases_in(&views, d, K64), [(d, c + mid, K64)]);
+        assert_eq!(aliases_in(&views, c + mid, K64), [(c + mid, d, K64)]);
+        assert!(aliases_in(&views, c, K64).is_empty());
+    }
+
     /// What the runtime forgets when memory is mapped anew.
     #[test]
     fn remapped_memory_forgets_its_views() {
@@ -1092,6 +1467,45 @@ mod tests {
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
             device
         }
+    }
+
+    /// The first hardware adapter, for the probes that measure the card
+    /// itself (ignored tests: `cargo test -p victory-gpu -- --ignored card_`).
+    pub(crate) fn card() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        // SAFETY: plain DXGI queries and device creation.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            for i in 0.. {
+                let adapter: IDXGIAdapter1 = factory.EnumAdapters1(i).ok()?;
+                let desc = adapter.GetDesc1().ok()?;
+                if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                    continue;
+                }
+                let mut device: Option<ID3D12Device> = None;
+                if D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).is_ok() {
+                    let name = String::from_utf16_lossy(&desc.Description);
+                    eprintln!("card: {}", name.trim_end_matches('\0'));
+                    return device;
+                }
+            }
+            None
+        }
+    }
+
+    /// The probe on the card, with the cost measured over 512 MB: what the
+    /// card's driver makes of title memory in place (the moonshot's first
+    /// phase, MOONSHOT.md).
+    #[test]
+    #[ignore = "opens the card"]
+    fn card_probe_opens_title_like_memory_and_the_gpu_sees_its_bytes() {
+        let Some(device) = card() else { return };
+        let probe = probe(&device, &|| None, 512);
+        for line in &probe.lines {
+            eprintln!("in place probe: {line}");
+        }
+        assert!(probe.section_reads && probe.section_writes, "a committed section in place");
     }
 
     /// The probe, whole, on the software adapter: the same calls the card
@@ -1146,6 +1560,255 @@ mod tests {
             assert!(matches!(place_part(&device, start, len), Err(None)));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }
+    }
+
+    /// View memory in place (MOONSHOT.md, phase 2): pages 4..12 of a
+    /// committed section shown at a placeholder, the runtime's calls made
+    /// as `xmem` makes them, then a title buffer inside the view placed in
+    /// the section's heap. The GPU reads the view's bytes at the buffer's
+    /// offset and its write shows at the title's address; the heap is
+    /// opened once for both buffers placed; a view of a reserved section is
+    /// turned down without asking the host.
+    fn view_memory_goes_in_place(device: &ID3D12Device) {
+        // SAFETY: the sections, placeholder and views of the test's own.
+        unsafe {
+            let process = windows_sys::Win32::System::Threading::GetCurrentProcess();
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            let size = 16 * K64;
+            let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, size as u32, std::ptr::null());
+            let hole = mem::VirtualAlloc2(process, std::ptr::null(), size, mem::MEM_RESERVE | mem::MEM_RESERVE_PLACEHOLDER, mem::PAGE_NOACCESS, std::ptr::null_mut(), 0).cast::<u8>();
+            assert!(!handle.is_null() && !hole.is_null());
+            mem::VirtualFree(hole.cast(), 8 * K64, mem::MEM_RELEASE | mem::MEM_PRESERVE_PLACEHOLDER);
+            let view = mem::MapViewOfFile3(handle, process, hole.cast(), (4 * K64) as u64, 8 * K64, mem::MEM_REPLACE_PLACEHOLDER, mem::PAGE_READWRITE, std::ptr::null_mut(), 0);
+            assert_eq!(view.Value.cast::<u8>(), hole);
+            title_memory_section(handle as usize, size as u64, true);
+            title_memory_view(hole as usize, 8 * K64, handle as usize, (4 * K64) as u64);
+            // A buffer from 0x1230 into the view's second page, 2 pages and 5 bytes long.
+            let (start, len) = (hole as u64 + K64 as u64 + 0x1230, 2 * K64 as u64 + 5);
+            let Cover::Run(section, offset) = cover(start as usize, len as usize) else { panic!("one run of one section") };
+            assert_eq!((section, offset), (handle as usize, 5 * K64 as u64 + 0x1230));
+            let placed = place_view(device, section, offset, start, len).unwrap_or_else(|e| panic!("not placed: {e:?}"));
+            assert!(!placed.pins);
+            assert_eq!(placed.bias, 0x1230);
+            assert_eq!(placed.buffer.GetDesc().Width, 3 * K64 as u64, "the pages that hold the buffer");
+            let mut rig = Rig::new(device).unwrap();
+            fill(start as *mut u8, len as usize, 9);
+            let got = rig.fetch(&placed.buffer, placed.bias, len as usize).unwrap();
+            assert!(same(start as *const u8, &got), "the GPU reads the view's bytes");
+            rig.store(&placed.buffer, placed.bias + 16, &[0x5a; 64]).unwrap();
+            assert!(same((start + 16) as *const u8, &[0x5a; 64]), "the GPU's write is at the title's address");
+            let other = place_view(device, section, 4 * K64 as u64, hole as u64, 64).unwrap();
+            assert!(other.heap == placed.heap, "one opening per section");
+            drop((placed, other));
+            // The same handle named again for a reserved section: the
+            // heap is forgotten, and its views are turned down.
+            title_memory_section(handle as usize, size as u64, false);
+            assert!(matches!(place_view(device, section, offset, start, len), Err(None)));
+            views_gone(hole as usize, 8 * K64);
+            mem::UnmapViewOfFile2(process, view, 0);
+            mem::VirtualFree(hole.cast(), 0, mem::MEM_RELEASE);
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
+    }
+
+    /// MOONSHOT.md, phase 3b: the pool as heaps the card makes, not heaps
+    /// opened on our sections. The title maps its physical pages out of
+    /// order, so a buffer of view memory is seldom one run of a section; the
+    /// console's answer is the GPU's page tables, whose host form is a
+    /// reserved resource with tile mappings, which an opened heap must never
+    /// take (it removes the device). A heap the card made may take them; the
+    /// question is whether the CPU can show its pages at addresses of ours,
+    /// through the heap's shared handle mapped as a section. Each step says
+    /// what it found; nothing is asserted but that the steps ran.
+    fn card_heap_as_the_pool(device: &ID3D12Device) -> Vec<String> {
+        const TILE: usize = 64 << 10;
+        const TILES: usize = 16;
+        let mut lines = Vec::new();
+        let mut rig = match Rig::new(device) {
+            Ok(rig) => rig,
+            Err(e) => return vec![format!("no rig: {e}")],
+        };
+        let wb = (D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_MEMORY_POOL_L0);
+        let wc = (D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE, D3D12_MEMORY_POOL_L0);
+        let na = (D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE, D3D12_MEMORY_POOL_L0);
+        let shared = D3D12_HEAP_FLAG_SHARED;
+        let cross = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_SHARED_CROSS_ADAPTER;
+        let buffers = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+        for (name, (page, pool), flags) in [
+            ("write-back, shared", wb, shared),
+            ("write-back, shared, buffers", wb, shared | buffers),
+            ("write-back, cross-adapter", wb, cross),
+            ("write-combine, shared", wc, shared),
+            ("write-combine, cross-adapter", wc, cross),
+            ("not CPU-visible in the PC's memory, cross-adapter", na, cross),
+            ("not CPU-visible in the PC's memory, shared", na, shared),
+        ] {
+            // SAFETY (the loop body): objects and views of the test's own;
+            // every address used lies in a view mapped here.
+            unsafe {
+                let desc = D3D12_HEAP_DESC {
+                    SizeInBytes: (TILES * TILE) as u64,
+                    Properties: D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_CUSTOM,
+                        CPUPageProperty: page,
+                        MemoryPoolPreference: pool,
+                        ..Default::default()
+                    },
+                    Alignment: 0,
+                    Flags: flags,
+                };
+                let mut heap: Option<ID3D12Heap> = None;
+                if let Err(e) = device.CreateHeap(&desc, &mut heap) {
+                    lines.push(format!("{name}: the card makes no such heap: {e}"));
+                    continue;
+                }
+                let heap = heap.unwrap();
+                let handle = match device.CreateSharedHandle(&heap, None, 0x1000_0000, windows::core::PCWSTR::null()) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        lines.push(format!("{name}: heap made, no shared handle: {e}"));
+                        continue;
+                    }
+                };
+                let view = mem::MapViewOfFile(handle.0, mem::FILE_MAP_ALL_ACCESS, 0, 0, TILES * TILE);
+                if view.Value.is_null() {
+                    lines.push(format!(
+                        "{name}: heap made, shared handle made, the CPU cannot map it as a section: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                    windows_sys::Win32::Foundation::CloseHandle(handle.0);
+                    continue;
+                }
+                let cpu = view.Value.cast::<u8>();
+                for t in 0..TILES {
+                    std::ptr::write_bytes(cpu.add(t * TILE), t as u8 + 1, TILE);
+                }
+                lines.push(format!("{name}: the CPU maps the card's heap as a section, read-write"));
+                // The page table: tile k of a reserved buffer shows heap tile 15 - k.
+                let mut reserved: Option<ID3D12Resource> = None;
+                let made = device.CreateReservedResource(
+                    &buffer_desc((TILES * TILE) as u64, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut reserved,
+                );
+                match (made, reserved) {
+                    (Ok(()), Some(reserved)) => {
+                        let starts: Vec<D3D12_TILED_RESOURCE_COORDINATE> =
+                            (0..TILES as u32).map(|k| D3D12_TILED_RESOURCE_COORDINATE { X: k, Y: 0, Z: 0, Subresource: 0 }).collect();
+                        let sizes = vec![D3D12_TILE_REGION_SIZE { NumTiles: 1, UseBox: false.into(), Width: 1, Height: 1, Depth: 1 }; TILES];
+                        let flags = [D3D12_TILE_RANGE_FLAG_NONE; TILES];
+                        let offsets: Vec<u32> = (0..TILES as u32).map(|k| TILES as u32 - 1 - k).collect();
+                        let counts = [1u32; TILES];
+                        rig.queue.UpdateTileMappings(
+                            &reserved,
+                            TILES as u32,
+                            Some(starts.as_ptr()),
+                            Some(sizes.as_ptr()),
+                            &heap,
+                            TILES as u32,
+                            Some(flags.as_ptr()),
+                            Some(offsets.as_ptr()),
+                            Some(counts.as_ptr()),
+                            D3D12_TILE_MAPPING_FLAG_NONE,
+                        );
+                        let read = rig.fetch(&reserved, 0, TILES * TILE);
+                        let ordered = read.as_ref().is_ok_and(|got| (0..TILES).all(|k| got[k * TILE] == (TILES - k) as u8 && got[k * TILE + TILE - 1] == (TILES - k) as u8));
+                        lines.push(format!(
+                            "{name}: a reserved buffer tile-mapped onto it in reverse: {}",
+                            match &read {
+                                Ok(_) if ordered => "the GPU reads each tile's CPU bytes through the page table".to_owned(),
+                                Ok(got) => format!("read, but not the CPU's bytes (first byte {})", got[0]),
+                                Err(e) => format!("not read: {e}"),
+                            }
+                        ));
+                        let wrote = rig.store(&reserved, 0, &[0xc3; 256]).is_ok() && same(cpu.add((TILES - 1) * TILE), &[0xc3; 256]);
+                        lines.push(format!("{name}: the GPU's write through tile 0 shows at the CPU's tile 15: {wrote}"));
+                        let removed = device.GetDeviceRemovedReason();
+                        lines.push(format!("{name}: the device after the tile mappings: {}", if removed.is_ok() { "fine".to_owned() } else { format!("{removed:?}") }));
+                    }
+                    (made, _) => lines.push(format!("{name}: no reserved buffer: {made:?}")),
+                }
+                mem::UnmapViewOfFile(view);
+                windows_sys::Win32::Foundation::CloseHandle(handle.0);
+            }
+        }
+        lines
+    }
+
+    /// Why world run 2 spent twice the card's time with buffers in place:
+    /// scattered shader reads from memory the card made against memory
+    /// opened in place (private and a section), 256 MB each.
+    #[test]
+    #[ignore = "opens the card"]
+    fn card_gathers_from_memory_in_place() {
+        let Some(device) = card() else { return };
+        let mut rig = Rig::new(&device).unwrap();
+        let bytes = 256usize << 20;
+        let mut line = |name: &str, buffer: &ID3D12Resource| {
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let round = |r: windows::core::Result<f64>| r.map(|m| (m * 10.0).round() / 10.0);
+            let gather = round(rig.gather_ms(gpu, bytes as u64));
+            // The same reads over 1 MiB, which the card's cache holds.
+            let hot = round(rig.gather_ms(gpu, 1 << 20));
+            let copy = round(rig.copy_ms(buffer, bytes as u64));
+            eprintln!("gather probe: {name}: scattered reads over 256 MB {gather:?} ms, over 1 MB {hot:?} ms, a copy {copy:?} ms");
+        };
+        // SAFETY: objects and memory of the test's own.
+        unsafe {
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            };
+            let mut made: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc(bytes as u64, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_COMMON, None, &mut made)
+                .unwrap();
+            line("a host copy of today's kind (committed, the PC's memory)", &made.unwrap());
+            let card = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let mut made: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(&card, D3D12_HEAP_FLAG_NONE, &buffer_desc(bytes as u64, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS), D3D12_RESOURCE_STATE_COMMON, None, &mut made)
+                .unwrap();
+            line("the card's own memory", &made.unwrap());
+            let base = mem::VirtualAlloc(std::ptr::null(), bytes, mem::MEM_RESERVE | mem::MEM_COMMIT | MEM_WRITE_WATCH, mem::PAGE_READWRITE);
+            let placed = place_part(&device, base as u64, bytes as u64).unwrap_or_else(|e| panic!("{e:?}"));
+            line("private memory in place", &placed.buffer);
+            drop(placed);
+            mem::VirtualFree(base, 0, mem::MEM_RELEASE);
+            let invalid = windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+            let handle = mem::CreateFileMappingW(invalid, std::ptr::null(), mem::PAGE_READWRITE | mem::SEC_COMMIT, 0, bytes as u32, std::ptr::null());
+            let heap = open(&device, From::Section(handle as usize)).unwrap();
+            let buffer = place(&device, &heap, 0, bytes as u64).unwrap();
+            line("a committed section in place", &buffer);
+            drop((buffer, heap));
+            windows_sys::Win32::Foundation::CloseHandle(handle);
+        }
+    }
+
+    #[test]
+    #[ignore = "opens the card"]
+    fn card_heap_as_the_pool_probe() {
+        let Some(device) = card() else { return };
+        for line in card_heap_as_the_pool(&device) {
+            eprintln!("phase 3b probe: {line}");
+        }
+    }
+
+    #[test]
+    fn warp_view_memory_goes_in_place() {
+        let Some(device) = warp() else { return };
+        view_memory_goes_in_place(&device);
+    }
+
+    #[test]
+    #[ignore = "opens the card"]
+    fn card_view_memory_goes_in_place() {
+        let Some(device) = card() else { return };
+        view_memory_goes_in_place(&device);
     }
 
     /// The census names each kind of memory.

@@ -42,6 +42,89 @@ pub fn dump_stacks_on_schedule() {
     });
 }
 
+/// `VICTORY_STALLS=<ms>`: while `busy` names a thread that has worked on a
+/// title frame for longer than that, samples its stack every 5 ms; once the
+/// frame is presented, logs how long it took and the stacks seen, most
+/// often first, to find what holds a frame up. The first three stalls past
+/// about 50 ms also print every thread's stack ([`dump_stacks`]): what the
+/// frame waits on.
+pub fn watch_stalls(busy: fn() -> Option<(u32, std::time::Instant)>) {
+    use std::time::Duration;
+    let Some(over) = std::env::var("VICTORY_STALLS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    else {
+        return;
+    };
+    let over = Duration::from_millis(over);
+    std::thread::spawn(move || {
+        let mut dumped = 0;
+        loop {
+            std::thread::sleep(Duration::from_millis(2));
+            let Some(stall @ (id, since)) = busy() else {
+                continue;
+            };
+            if since.elapsed() < over {
+                continue;
+            }
+            // SAFETY: opens a thread of our own process.
+            let thread = unsafe {
+                OpenThread(
+                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+                    0,
+                    id,
+                )
+            };
+            if thread.is_null() {
+                continue;
+            }
+            let mut stacks: Vec<(Vec<u64>, u32)> = Vec::new();
+            let mut samples = 0;
+            while busy() == Some(stall) && since.elapsed() < Duration::from_secs(2) {
+                let (mut frames, _) = frames_of(thread);
+                frames.truncate(10);
+                samples += 1;
+                if samples == 6 && dumped < 3 {
+                    dumped += 1;
+                    eprintln!(
+                        "VIctory: title frame stall {} ms in, thread {id}",
+                        since.elapsed().as_millis()
+                    );
+                    dump_stacks();
+                }
+                match stacks.iter_mut().find(|(f, _)| *f == frames) {
+                    Some(s) => s.1 += 1,
+                    None => stacks.push((frames, 1)),
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let ms = since.elapsed().as_millis();
+            // SAFETY: we opened it.
+            unsafe { CloseHandle(thread) };
+            stacks.sort_by_key(|s| std::cmp::Reverse(s.1));
+            let mut text = String::new();
+            for (frames, n) in stacks.iter().take(4) {
+                text += &format!(
+                    "
+  {n} of {samples} samples:"
+                );
+                for &pc in frames {
+                    text += &format!(
+                        "
+    {}",
+                        locate(pc as usize)
+                    );
+                }
+            }
+            tracing::warn!(thread = id, ms, samples, "title frame stall{text}");
+            // the same frame is not sampled twice
+            while busy() == Some(stall) {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    });
+}
+
 /// `THREAD_BASIC_INFORMATION` (ntddk).
 #[repr(C)]
 struct BasicInfo {

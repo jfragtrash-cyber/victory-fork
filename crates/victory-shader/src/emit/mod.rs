@@ -97,6 +97,8 @@ mod threading;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
+mod loop_report_tests;
+#[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
@@ -113,7 +115,7 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    LOOP_REPORT_SPACE, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     set_view_heap_limit,
 };
@@ -200,6 +202,50 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
     parsed.map_or(bitcode::opt::ALL, |n| n & bitcode::opt::ALL)
 }
 
+/// Whether translated loops note, in the loop report, the lanes that the
+/// iteration limit stops: with the `diagnostics` feature and
+/// `VICTORY_SHADER_LOOP_REPORT` set. Part of the translation, like
+/// [`loop_limit`].
+///
+/// The report is a raw buffer, `u0` in [`LOOP_REPORT_SPACE`], of
+/// [`LOOP_REPORT_BYTES`]: dword 0 counts the lanes stopped, dword 1 those
+/// whose slot another loop holds; then [`LOOP_REPORT_SLOTS`] slots of four
+/// dwords: the program's [`report_tag`], the loop header's console code
+/// offset plus 1, the lanes stopped there, unused. A loop's slot is
+/// [`report_slot`] of the first two.
+pub fn loop_report() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_SHADER_LOOP_REPORT").is_some()
+    })
+}
+
+/// Slots in the loop report.
+pub const LOOP_REPORT_SLOTS: u32 = 4096;
+/// Size of the loop report in bytes.
+pub const LOOP_REPORT_BYTES: u64 = 16 + 16 * LOOP_REPORT_SLOTS as u64;
+
+/// What names a program in the loop report: FNV-1a of its container's
+/// digest and parts, never 0.
+pub fn report_tag(c: &Container) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    let parts = c.parts.iter().flat_map(|p| p.data.iter());
+    for &b in c.digest.iter().chain(parts) {
+        h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
+    }
+    h.max(1)
+}
+
+/// [`report_tag`] of a container's bytes.
+pub fn report_tag_of(container: &[u8]) -> Option<u32> {
+    Container::parse(container).ok().map(|c| report_tag(&c))
+}
+
+/// The loop report slot of `tag` and `key` (code offset plus 1).
+pub fn report_slot(tag: u32, key: u32) -> u32 {
+    (tag ^ key.wrapping_mul(0x9e37_79b1)).wrapping_mul(0x85eb_ca6b) >> 20
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
@@ -219,6 +265,9 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostShader {
     pub stage: HwStage,
+    /// Whether the shader writes the loop report ([`loop_report`]): the
+    /// host binds it as a root UAV.
+    pub loop_report: bool,
     /// The DXIL container, hashed as D3D12 expects.
     pub dxil: Vec<u8>,
     /// The user-data dwords the shader reads.
@@ -377,11 +426,12 @@ pub fn emit(
         // Off unless asked for (`VICTORY_WAVE_WIDE=1`), for a console wave run as two host
         // waves: this form puts group barriers inside branches and loops, and runs 121-124
         // lost the card in a submission of two programs that had just moved to it
-        // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
-        // has no barrier, stays on.
+        // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`); it is tried last (below). The 32-lane
+        // programs' form below, which has no barrier, stays on.
         let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
+        let mut deep_form = None;
         for exact in [true, false] {
             if !exact {
                 // Before anything approximate, the exact forms that cost group barriers.
@@ -398,24 +448,7 @@ pub fn emit(
                         return again.map(|(shader, _)| shader);
                     }
                 }
-                // Still stopped where not every lane runs: the per-lane branches around
-                // those places taken as the console takes them, by the whole wave at once
-                // ([`widen`]), at two group barriers per such branch.
-                if wide_on {
-                    let bases = [
-                        deep.as_ref().map(|f| &f.0),
-                        forms[1].1.as_ref().map(|f| &f.0),
-                        forms[0].1.as_ref().map(|f| &f.0),
-                        Some(p),
-                    ];
-                    if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why);
-                        report("wave-wide branches", &again);
-                        if done(&again) {
-                            return again.map(|(shader, _)| shader);
-                        }
-                    }
-                }
+                deep_form = deep;
                 if strict {
                     break;
                 }
@@ -458,6 +491,27 @@ pub fn emit(
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        // Last of all, for programs no other form takes off 64-lane waves (which the host
+        // refuses): the per-lane branches around the places where not every lane runs taken
+        // as the console takes them, by the whole wave at once ([`widen`]), at two group
+        // barriers per such branch. Tried before the approximate forms, it also took
+        // programs those run, and one of them (2561af95, a tiled lighting pass) lost the
+        // card in its first frame.
+        if wide_on {
+            let bases = [
+                deep_form.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
                 }
             }
         }
@@ -635,10 +689,12 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
+        loop_report: loop_report().then(|| report_tag(c)),
     })?;
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
+        loop_report: l.loop_report,
         dxil: l.dxil,
         user_data: l.user_data,
         static_samplers: l
@@ -1024,6 +1080,7 @@ mod tests {
             return;
         };
         let ps = super::HostShader {
+            loop_report: false,
             stage: crate::HwStage::Ps,
             dxil: constant_color(),
             user_data: Vec::new(),
@@ -1036,6 +1093,7 @@ mod tests {
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
+                loop_report: false,
                 stage,
                 dxil: std::fs::read(p).unwrap(),
                 user_data: Vec::new(),
@@ -1313,6 +1371,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            loop_report: None,
         })
         .unwrap();
         let mut dxil = l.dxil;
@@ -1325,6 +1384,7 @@ mod tests {
         #[cfg(windows)]
         if let Ok(host) = super::host::Host::new(false) {
             let cs = super::HostShader {
+                loop_report: false,
                 stage: super::HwStage::Cs,
                 dxil,
                 user_data: l.user_data,

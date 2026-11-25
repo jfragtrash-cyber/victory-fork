@@ -62,12 +62,29 @@ const CELL: u64 = 4 << 20;
 /// A directory page.
 const PAGE: u64 = 1 << 16;
 
+/// What a numbered copy is.
+enum Copy {
+    /// A title buffer's copy or a window's (or one of them in place).
+    Shadow(Arc<Shadow>),
+    /// A mirror (MOONSHOT.md, phase 4): a buffer over the whole heap of a
+    /// committed section of the page pool, in place, which every view of
+    /// the section reaches at its offset in it. Its directory entries are
+    /// written for every page the section's views show, as they are mapped,
+    /// and cleared when they go: a pointer into such memory reaches it
+    /// whether or not anything named it before.
+    ///
+    /// shortcut: a page a copy holds ([`crate::shadow::copied`]) is left
+    /// to the copy, so that a raw address and a root view reach the same
+    /// bytes; a copy made after the page was given the mirror is not seen.
+    Mirror { section: usize, buffer: ID3D12Resource, bytes: u64 },
+}
+
 struct Memory {
     /// Buffer, its mapping, its GPU address.
     directory: (ID3D12Resource, *mut u32, u64),
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
-    copies: Vec<Arc<Shadow>>,
+    copies: Vec<Copy>,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -104,6 +121,10 @@ impl Memory {
             Some((buffer, data.cast::<u32>(), gpu))
         };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
+        // (mirrors exist only with title memory in place)
+        if crate::inplace::in_place_wanted() {
+            crate::inplace::follow_views();
+        }
         Some(Memory {
             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
@@ -112,6 +133,94 @@ impl Memory {
             frame: u64::MAX,
             refused: Default::default(),
         })
+    }
+
+    /// The directory entry of `page`.
+    fn entry(&self, page: u64) -> *mut u32 {
+        debug_assert!(page < u64::from(MEMORY_PAGES));
+        // SAFETY: inside the directory's mapping.
+        unsafe { self.directory.1.add(page as usize * 2) }
+    }
+
+    /// Sets an empty entry of `page` to copy `n` (from 0) at byte `offset`.
+    fn fill(&self, page: u64, n: usize, offset: u64) {
+        let entry = self.entry(page);
+        // SAFETY: inside the directory's mapping; the offset first: a
+        // shader that sees the number sees it too.
+        unsafe {
+            if entry.read() == 0 {
+                entry.add(1).write_volatile(offset as u32);
+                entry.write_volatile(n as u32 + 1);
+            }
+        }
+    }
+
+    /// Gives every page view `[at, at + len)` of mirror `n` shows, from
+    /// `offset` in its section, the mirror (pages a copy holds excepted).
+    fn fill_view(&self, n: usize, at: usize, len: usize, offset: u64) {
+        for (page, offset) in view_pages(at, len, offset) {
+            if !crate::shadow::copied(page * PAGE) {
+                self.fill(page, n, offset);
+            }
+        }
+    }
+
+    /// The mirror of the section whose view shows `start` (a page), made
+    /// now if there is none; with every page of the section's views given
+    /// it. False if `start` is no view of a committed section, or a copy
+    /// holds it.
+    fn mirror(&mut self, start: u64) -> bool {
+        let crate::inplace::Cover::Run(section, _) = crate::inplace::cover(start as usize, PAGE as usize) else {
+            return false;
+        };
+        if crate::shadow::copied(start) {
+            return false;
+        }
+        let n = match self.copies.iter().position(|c| matches!(c, Copy::Mirror { section: s, .. } if *s == section)) {
+            Some(n) => n,
+            None if self.copies.len() < COPIES as usize => {
+                let Some((buffer, bytes)) = crate::inplace::mirror(section) else {
+                    return false;
+                };
+                tracing::info!(
+                    section = format_args!("{section:#x}"),
+                    mb = bytes >> 20,
+                    "title memory by address: physical pages reached in place, the whole section"
+                );
+                self.copies.push(Copy::Mirror { section, buffer, bytes });
+                self.copies.len() - 1
+            }
+            None => return false,
+        };
+        for (at, len, offset) in crate::inplace::views_of(section) {
+            self.fill_view(n, at, len, offset);
+        }
+        true
+    }
+
+    /// The views mapped and gone since the last look: a mirror's entries
+    /// where a view went are cleared (a mirror is by section, so they no
+    /// longer say what the address shows; the next touch is a fault, and
+    /// the page is given what shows there then; a copy is by address and
+    /// keeps its entries), a view of a mirrored section is given its
+    /// mirror.
+    fn follow_views(&mut self) {
+        for (at, len, section, offset) in crate::inplace::take_view_changes() {
+            if section == 0 {
+                for (page, _) in view_pages(at, len, 0) {
+                    let entry = self.entry(page);
+                    // SAFETY: inside the directory's mapping.
+                    let n = unsafe { entry.read() } as usize;
+                    if n != 0 && matches!(self.copies.get(n - 1), Some(Copy::Mirror { .. })) {
+                        // SAFETY: as above; the number first: a shader that
+                        // sees no number reads no offset.
+                        unsafe { entry.write_volatile(0) };
+                    }
+                }
+            } else if let Some(n) = self.copies.iter().position(|c| matches!(c, Copy::Mirror { section: s, .. } if *s == section)) {
+                self.fill_view(n, at, len, offset);
+            }
+        }
     }
 
     /// Gives the page of `address` its copy, if it has none and the memory
@@ -138,6 +247,10 @@ impl Memory {
             self.refused.insert(page);
             return;
         }
+        // View memory of a committed section: the section's mirror.
+        if self.mirror(start) {
+            return;
+        }
         // The copy a root view at that address would get; a buffer that
         // ends inside the page is passed over for what holds all of it.
         let whole = |s: &Arc<Shadow>| s.offset_in(start).is_some_and(|_| s.left(start) >= PAGE);
@@ -152,10 +265,10 @@ impl Memory {
         if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
             return;
         }
-        let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
+        let n = match self.copies.iter().position(|c| matches!(c, Copy::Shadow(s) if Arc::ptr_eq(s, &shadow))) {
             Some(n) => n,
             None if self.copies.len() < COPIES as usize => {
-                self.copies.push(shadow.clone());
+                self.copies.push(Copy::Shadow(shadow.clone()));
                 let n = self.copies.len() - 1;
                 // Every page the copy holds whole, not only the one asked
                 // for: a structure is more than 64 KiB.
@@ -166,10 +279,12 @@ impl Memory {
                 while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
                     // SAFETY: inside the directory's mapping.
                     let other = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
-                    // SAFETY: as above; the offset first, as below.
+                    // SAFETY: as above; the offset first, as below. The
+                    // byte in the copy's buffer: in place, the buffer
+                    // begins on the page line before the title memory.
                     unsafe {
                         if other.read() == 0 {
-                            other.add(1).write_volatile((at - first) as u32);
+                            other.add(1).write_volatile(shadow.offset(at) as u32);
                             other.write_volatile(n as u32 + 1);
                         }
                     }
@@ -185,7 +300,7 @@ impl Memory {
                 return;
             }
         };
-        let offset = shadow.offset_in(start).unwrap_or(0);
+        let offset = shadow.offset(start);
         // The offset first: a shader that sees the number sees it too.
         // SAFETY: inside the directory's mapping.
         unsafe {
@@ -233,6 +348,16 @@ impl Memory {
     }
 }
 
+/// The directory pages a view `[at, at + len)` showing its section from
+/// `offset` on covers, each with the byte of the section it begins at
+/// (views lie on 64 KiB lines); none past the directory's last entry,
+/// which stays empty.
+fn view_pages(at: usize, len: usize, offset: u64) -> impl Iterator<Item = (u64, u64)> {
+    let last = u64::from(MEMORY_PAGES) - 1;
+    let (from, to) = ((at as u64 / PAGE).min(last), ((at + len) as u64).div_ceil(PAGE).min(last));
+    (from..to).map(move |page| (page, offset + page * PAGE - at as u64))
+}
+
 /// Before a draw whose shader reads title memory by address: what its
 /// root arguments name gets its copies (`addresses`: its root views;
 /// `constants`: its root constants, see the module), every numbered copy
@@ -257,6 +382,7 @@ pub(crate) fn ready(
         m.refused.clear();
         m.take_faults();
     }
+    m.follow_views();
     let numbered = m.copies.len();
     for &address in addresses {
         m.name(address);
@@ -285,9 +411,16 @@ pub(crate) fn ready(
             (base, 0)
         }
     };
-    for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+    for (n, copy) in m.copies.iter().enumerate().skip(made as usize) {
+        match copy {
+            // From the buffer's first byte, which in place lies before the
+            // title memory's (the directory's offsets count from it).
+            Copy::Shadow(shadow) => {
+                let (start, len) = shadow.span();
+                heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, shadow.offset(start) + len);
+            }
+            Copy::Mirror { buffer, bytes, .. } => heap.raw_uav_at(base + 1 + n as u32, buffer, 0, *bytes),
+        }
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
     // Once per list, and for copies numbered since: the builder alone
@@ -298,7 +431,9 @@ pub(crate) fn ready(
     const WRITE: usize = usize::MAX - 0x6e;
     let first_read = list.first_use(READ);
     let first_write = writes && list.first_use(WRITE);
-    for (n, shadow) in m.copies.iter().enumerate() {
+    for (n, copy) in m.copies.iter().enumerate() {
+        // A mirror is the title's memory: nothing to bring up to date.
+        let Copy::Shadow(shadow) = copy else { continue };
         let (start, len) = shadow.span();
         if first_read || n >= numbered {
             shadow.refresh(list, start, len);
@@ -316,4 +451,23 @@ pub(crate) fn ready(
         faults: m.faults.2,
         base,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A view's pages are the section's bytes at the view's offset on, and
+    /// the directory's last entry is never given (addresses past the
+    /// directory read it).
+    #[test]
+    fn a_view_gives_each_page_its_byte_in_the_section() {
+        let at = 0x40_0000_0000usize; // 256 GiB, past the directory's 128
+        let got: Vec<(u64, u64)> = view_pages(0x1_0002_0000, 3 * PAGE as usize, 0x50_0000).collect();
+        assert_eq!(got, [(0x1_0002, 0x50_0000), (0x1_0003, 0x51_0000), (0x1_0004, 0x52_0000)]);
+        let last = u64::from(MEMORY_PAGES) - 1;
+        let near = (last as usize - 1) * PAGE as usize;
+        assert_eq!(view_pages(near, 4 * PAGE as usize, 0).map(|(p, _)| p).collect::<Vec<_>>(), [last - 1]);
+        assert_eq!(view_pages(at, PAGE as usize, 0).count(), 0, "past the directory");
+    }
 }

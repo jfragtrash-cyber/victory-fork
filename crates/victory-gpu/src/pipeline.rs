@@ -60,7 +60,7 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
-    container: Vec<u8>,
+    pub(crate) container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -116,6 +116,18 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             })
         })
         .clone()
+}
+
+/// The shaders seen by their loop report tag
+/// ([`victory_shader::emit::report_tag`]).
+#[cfg(windows)]
+pub(crate) fn by_report_tag() -> HashMap<u32, Arc<Shader>> {
+    let shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+    shaders
+        .iter()
+        .flat_map(HashMap::values)
+        .filter_map(|s| Some((victory_shader::emit::report_tag_of(&s.container)?, s.clone())))
+        .collect()
 }
 
 /// A translated shader and the console resources its code reads.

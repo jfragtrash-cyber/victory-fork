@@ -295,6 +295,9 @@ pub(crate) struct HostPipeline {
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
     pub(crate) stages: Vec<Stage>,
+    /// The root parameter of the loop report (diagnostics), if a stage
+    /// writes it.
+    pub(crate) loop_report: Option<u32>,
     /// The vertex buffer slots it reads (bit per slot).
     pub(crate) slots: u32,
     pub(crate) inputs: Vec<Input>,
@@ -488,6 +491,24 @@ impl HostPipeline {
             }
             bound.push(stage);
         }
+        // Diagnostics: the loop report, one root UAV for every stage.
+        let loop_report = stages
+            .iter()
+            .any(|(s, _)| s.translated().is_some_and(|t| t.host.loop_report))
+            .then(|| {
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: 0,
+                            RegisterSpace: victory_shader::emit::LOOP_REPORT_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                });
+                params.len() as u32 - 1
+            });
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
@@ -535,6 +556,7 @@ impl HostPipeline {
                 pso,
                 root,
                 stages: bound,
+                loop_report,
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
@@ -573,6 +595,7 @@ impl HostPipeline {
                 pso,
                 root,
                 stages: bound,
+                loop_report,
                 name: format!("{shaders:?}"),
                 slots: 0,
                 inputs: Vec::new(),
@@ -685,6 +708,7 @@ impl HostPipeline {
             pso,
             root,
             stages: bound,
+            loop_report,
             name: format!("{shaders:?}"),
             slots: g.slots(),
             inputs: g.elements(),

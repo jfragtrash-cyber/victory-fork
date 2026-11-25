@@ -79,6 +79,27 @@ pub(crate) extern "system" fn schedule(
     S_OK
 }
 
+/// Diagnostics: the thread past its last frame wait and since when, until
+/// it presents ([`busy`]).
+#[cfg(all(windows, feature = "diagnostics"))]
+static BUSY: Mutex<Option<(u32, Instant)>> = Mutex::new(None);
+
+/// Diagnostics: the thread working on a title frame (past its last frame
+/// wait, not presented yet) and since when; for `VICTORY_STALLS`.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub fn busy() -> Option<(u32, Instant)> {
+    *BUSY.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Diagnostics: this thread starts work on a frame (`on`), or waits or
+/// presents.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn set_busy(on: bool) {
+    // SAFETY: a plain query.
+    let me = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+    *BUSY.lock().unwrap_or_else(|e| e.into_inner()) = on.then(|| (me, Instant::now()));
+}
+
 /// Frames begun so far (frame waits that ended).
 pub(crate) fn current() -> u64 {
     FRAME.load(Ordering::Relaxed)
@@ -125,6 +146,8 @@ pub(crate) extern "system" fn wait(
     flags: u32,
     token: *mut u64,
 ) -> HRESULT {
+    #[cfg(all(windows, feature = "diagnostics"))]
+    set_busy(false);
     let origin = kind == ORIGIN;
     let (mut tick, mut wait) = next_tick(kind);
     let limit = Duration::from_millis(u64::from(timeout_ms));
@@ -176,6 +199,8 @@ pub(crate) extern "system" fn wait(
         frame = current(),
         "frame wait"
     );
+    #[cfg(all(windows, feature = "diagnostics"))]
+    set_busy(true);
     hr
 }
 

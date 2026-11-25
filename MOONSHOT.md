@@ -364,3 +364,39 @@ already reach.
   card's own memory is 28 times faster than today's host copies, and today
   every buffer below 16 MiB, and everything past 512 MB of card copies,
   stays in the PC's memory. That is the next lever (run 4).
+
+## Day 2: upstream merged, the card set free, 20 fps as the target
+
+- 2026-11-25. Upstream's twenty commits since our base are merged
+  (`merge-upstream`). With its texture fixes and run 253's switch set the
+  picture is right again: skin, walls, light (run M). Its frame-rate work
+  sits behind switches, so the merged defaults still play at 250-335 ms a
+  frame (run L).
+- 2026-11-25. Timing run K: of the card's ~145 ms of title commands a
+  frame, ~100 ms were indirect commands, 6,632 a frame, each behind a
+  clamp pass of ours with a full UAV barrier on either side: the card went
+  from drawing to compute and back 13,000 times a frame. The records come
+  from the card itself: a culling dispatch writes a run of them (1,024 of
+  32 bytes in K's frame), then hundreds of mesh draws read one each.
+- 2026-11-25. **Precise indirect windows** (`VICTORY_INDIRECT_PRECISE`, on
+  with `VICTORY_INDIRECT_WINDOW=1`): each host list logs what its shaders
+  may write (the ranges declared as views are bound, and commands whose
+  code stores through computed addresses, `Translated::raw_stores`). A
+  window of clamped records ends only when a write meets its records, not
+  at every dispatch or direct draw; a record is gathered for the list's
+  prelude unless something recorded before it may have written it; a
+  record in a range written earlier in the list opens a window over the
+  rest of that range (up to 4,096 records). Indirect dispatches and
+  storing shaders are windowed too. Run N: **232 clamp passes a frame
+  instead of 6,632** (3,154 commands read from windows, 2,498 from
+  gathered records); the submitting thread no longer waits for the card.
+- 2026-11-25. Textures whose pages are shown at several addresses were
+  hashed at every check: 124 MB a frame of run N's 128. Upstream's guards
+  now guard every view of a page together, so only pages with more than
+  `MANY_VIEWS` views still need it (`inplace::aliased`). Texture work fell
+  from 42-47 to 7-10 ms a frame (run O).
+- 2026-11-25. With the card no longer the limit, upstream's
+  `VICTORY_ASYNC_PRESENT=1` (measured as "no gain" while the card was the
+  limit) lets the title record the next frame while our thread prepares
+  this one. Play: 214 ms (M) -> 163-173 ms (N) -> **142-150 ms at 6,300
+  draws (O), about 7 fps**; 147 ms in the lighter cell view of M.

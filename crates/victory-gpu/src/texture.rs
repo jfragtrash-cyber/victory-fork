@@ -176,6 +176,13 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// For a texture in view memory: whether all of it was mapped, and the
+    /// runtime's change number when that was found
+    /// (`crate::watch::remap_seq`). What view memory shows changes only by
+    /// the runtime's remappings, so the answer holds until one meets the
+    /// texture's memory (the kernel was asked at every refresh: 5.9 ms a
+    /// frame of `QueryWorkingSetEx` in run N's play).
+    mapped: Option<(u64, bool)>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -1118,7 +1125,20 @@ impl Staging {
         } else {
             waited(2, || crate::watch::title_memory_reading(self.memory as usize, size))
         };
-        if !committed(self.memory, size) {
+        let whole = if why == 3 {
+            committed(self.memory, size)
+        } else {
+            match last.mapped {
+                Some((seq, whole)) if !crate::watch::remapped_since(seq, start, size) => whole,
+                _ => {
+                    let seq = crate::watch::remap_seq();
+                    let whole = committed(self.memory, size);
+                    last.mapped = Some((seq, whole));
+                    whole
+                }
+            }
+        };
+        if !whole {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
             // copy, which stands unmapped pages (zeros), and upload what

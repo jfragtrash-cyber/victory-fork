@@ -1225,6 +1225,15 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
 pub fn title_memory_remapped(at: usize, len: usize) {
     #[cfg(feature = "diagnostics")]
     let _timed = Timed(3, std::time::Instant::now());
+    {
+        let mut log = REMAP_LOG.lock().unwrap_or_else(|e| e.into_inner());
+        log.next += 1;
+        let seq = log.next;
+        if log.entries.len() >= REMAP_LOG_MOST {
+            log.entries.pop_front();
+        }
+        log.entries.push_back((seq, at, at.saturating_add(len)));
+    }
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -1266,6 +1275,42 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in viewed {
         g.viewed.remove(&block);
     }
+}
+
+/// The runtime's changes of what title memory shows, in order
+/// ([`title_memory_remapped`]): the number of the last, and the most recent
+/// ones with their numbers, for [`remapped_since`].
+struct RemapLog {
+    next: u64,
+    entries: std::collections::VecDeque<(u64, usize, usize)>,
+}
+
+static REMAP_LOG: std::sync::Mutex<RemapLog> =
+    std::sync::Mutex::new(RemapLog { next: 0, entries: std::collections::VecDeque::new() });
+
+/// The changes [`REMAP_LOG`] keeps (some 80 a frame in play).
+const REMAP_LOG_MOST: usize = 16384;
+
+/// The number of the runtime's last change of what title memory shows. Read
+/// while holding [`title_memory_reading`] of a range: what is found mapped
+/// there stays so until a later change.
+pub(crate) fn remap_seq() -> u64 {
+    REMAP_LOG.lock().unwrap_or_else(|e| e.into_inner()).next
+}
+
+/// Whether the runtime may have changed what `[at, at + len)` shows since
+/// its change number `seq` ([`remap_seq`]): a later change that meets the
+/// range, or one too old to be kept any more.
+pub(crate) fn remapped_since(seq: u64, at: usize, len: usize) -> bool {
+    let log = REMAP_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    if log.next == seq {
+        return false;
+    }
+    if log.entries.front().is_none_or(|&(first, _, _)| first > seq + 1) {
+        return true;
+    }
+    let end = at.saturating_add(len);
+    log.entries.iter().rev().take_while(|&&(n, _, _)| n > seq).any(|&(_, from, to)| from < end && at < to)
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead

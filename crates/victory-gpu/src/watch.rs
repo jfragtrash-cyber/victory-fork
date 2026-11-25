@@ -750,7 +750,11 @@ fn is_view(start: usize, end: usize) -> bool {
     let holes = *HOLES.get_or_init(|| std::env::var_os("VICTORY_GUARD_HOLES").is_none_or(|v| v != "0"));
     let mut at = start;
     loop {
-        let known = if holes { known_hole(&guards(), at / BLOCK) } else { None };
+        // Held from the look at what is kept to the noting of the answer: a
+        // mapping told meanwhile (`title_memory_remapped`) comes after the
+        // note and forgets it.
+        let mut g = guards();
+        let known = if holes { known_hole(&g, at / BLOCK) } else { None };
         if let Some((hole_end, mapped)) = known {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::HolesKnown, 1);
@@ -785,8 +789,9 @@ fn is_view(start: usize, end: usize) -> bool {
         crate::copystat::add(crate::copystat::C::HolesAsked, 1);
         let (first, last) = ((info.BaseAddress as usize).div_ceil(BLOCK), next / BLOCK);
         if first < last {
-            note_hole(&mut guards(), first, last, false);
+            note_hole(&mut g, first, last, false);
         }
+        drop(g);
         if next <= at || next >= end {
             return true;
         }
@@ -981,12 +986,16 @@ fn fresh(hole: &Hole, now_frame: u64, now_ms: u64, keep: u64) -> bool {
 /// it says is fresh: (end block, whether a mapped view).
 fn known_hole(g: &Guards, block: usize) -> Option<(usize, bool)> {
     let keep = hole_keep();
-    if keep == 0 {
+    if keep == 0 || g.holes.is_empty() {
         return None;
     }
+    known_hole_at(g, block, crate::frame::current(), crate::host::now_ms(), keep)
+}
+
+/// [`known_hole`] at frame `frame` and millisecond `ms`, kept `keep` ms.
+fn known_hole_at(g: &Guards, block: usize, frame: u64, ms: u64, keep: u64) -> Option<(usize, bool)> {
     let (_, hole) = g.holes.range(..=block).next_back()?;
-    (hole.end > block && fresh(hole, crate::frame::current(), crate::host::now_ms(), keep))
-        .then_some((hole.end, hole.mapped))
+    (hole.end > block && fresh(hole, frame, ms, keep)).then_some((hole.end, hole.mapped))
 }
 
 /// [`uncommitted_end`]'s end, from [`Guards::holes`] while it is fresh
@@ -1723,8 +1732,13 @@ mod tests {
             holes: BTreeMap::new(),
         };
         let spans = |g: &Guards| g.holes.iter().map(|(&s, h)| (s, h.end)).collect::<Vec<_>>();
+        // Said at frame 7, millisecond 1000, and looked up a millisecond
+        // later (the frame counter and the clock are the process's).
+        let said = |g: &mut Guards| g.holes.values_mut().for_each(|h| (h.frame, h.ms) = (7, 1000));
+        let known_hole = |g: &Guards, block| known_hole_at(g, block, 7, 1001, 100);
         note_hole(&mut g, 10, 20, false);
         note_hole(&mut g, 30, 40, false);
+        said(&mut g);
         assert_eq!(known_hole(&g, 15), Some((20, false)));
         assert_eq!(known_hole(&g, 20), None, "past its end");
         assert_eq!(known_hole(&g, 5), None);
@@ -1737,10 +1751,12 @@ mod tests {
         // A newer answer replaces what overlaps it; a committed block (an
         // answer that ends where it begins) only takes the old word away.
         note_hole(&mut g, 16, 36, true);
+        said(&mut g);
         assert_eq!(spans(&g), [(10, 12), (14, 16), (16, 36), (36, 40)]);
         assert_eq!(known_hole(&g, 33), Some((36, true)));
         note_hole(&mut g, 11, 11, false);
         assert_eq!(spans(&g), [(10, 11), (14, 16), (16, 36), (36, 40)]);
+        assert_eq!(known_hole_at(&g, 33, 8, 1001, 100), None, "a frame later");
         // Freshness: the same frame and less than `keep` ms.
         let hole = Hole { end: 1, mapped: false, frame: 7, ms: 1000 };
         assert!(fresh(&hole, 7, 1099, 100));

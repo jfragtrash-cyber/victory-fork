@@ -1082,8 +1082,12 @@ fn shown_by(physical: &Physical, at: usize) -> Option<Slice> {
 /// mapping copy, where the console shows one set of bytes at both). Run U
 /// with it on: the remappings cost 7-8 microseconds instead of 120-1,000,
 /// and the world was drawn empty (sky and fog, no geometry): the title fills
-/// pages after mapping them. Before it can be on, a copy must be taken
-/// again when its source page is written (the guards see those writes).
+/// pages after mapping them. With copies taken again when their source is
+/// written (`victory_gpu`'s `alias`, runs Y, Z, AA): 31 us a remapping and
+/// the world right, but the yard's people untextured, and run AA ended on a
+/// breakpoint of the title's 32 frames into the world, where views run on:
+/// the title's processor does use the targets, so a copy is not the same
+/// page. Kept for a later look; views stay the default.
 fn alias_copies() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPY").is_some_and(|v| v == "1"))

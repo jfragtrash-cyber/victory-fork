@@ -2427,7 +2427,7 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let mut runs = Vec::with_capacity(16);
     // Where the run being walked began.
     let mut open: Option<usize> = None;
-    let mut byte = |at: usize, differs: bool, runs: &mut Vec<(usize, usize)>, open: &mut Option<usize>| {
+    let byte = |at: usize, differs: bool, runs: &mut Vec<(usize, usize)>, open: &mut Option<usize>| {
         if differs {
             open.get_or_insert(at);
         } else if let Some(first) = open.take() {

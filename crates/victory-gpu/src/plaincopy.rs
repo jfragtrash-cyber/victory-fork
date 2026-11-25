@@ -74,8 +74,39 @@ pub(crate) fn on() -> bool {
 /// Copies made in place, their bytes, the copies that met a page that was
 /// not there (and went to the kernel's copy), and the copies not tried in
 /// place because their source faulted lately ([`RECENT`]) or they were
-/// under [`LEAST`] bytes, since the last line.
+/// under [`LEAST`] bytes, since the last line ([`count`]).
 static COUNT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+thread_local! {
+    /// This thread's part of [`COUNT`] not added yet, and the copies since
+    /// it was last added.
+    static TALLY: ([std::cell::Cell<u64>; 5], std::cell::Cell<u32>) = const {
+        ([const { std::cell::Cell::new(0) }; 5], std::cell::Cell::new(0))
+    };
+}
+
+/// Adds `n` to [`COUNT`]'s place `i`, by way of this thread's tally: added
+/// to the shared counters every 256 copies. Every copy of every thread
+/// added to the same few counters (the texture threads copy too): in run
+/// P that was 1.1 ms a frame of the submitting thread in the adds alone,
+/// for some 16,000 small copies a frame.
+fn count(i: usize, n: u64) {
+    TALLY.with(|(tally, copies)| {
+        tally[i].set(tally[i].get() + n);
+        if i != 1 {
+            copies.set(copies.get() + 1);
+        }
+        if copies.get() >= 256 {
+            copies.set(0);
+            for (k, t) in tally.iter().enumerate() {
+                let v = t.replace(0);
+                if v != 0 {
+                    COUNT[k].fetch_add(v, Relaxed);
+                }
+            }
+        }
+    });
+}
 
 /// The fewest bytes copied in place. A read of a byte or a word is how the
 /// layer ASKS whether a page is there (a texture's first page, a record):
@@ -183,25 +214,50 @@ fn guarded(_: *mut u8, _: *const u8, _: usize) -> bool {
 
 /// With [`on`]: copies title memory at `from` into host memory at `to`;
 /// false if it is off or a source page was not there (the caller then
-/// copies through the kernel, as before).
+/// copies through the kernel, as before). Under [`LEAST`] bytes it is left
+/// to the kernel: such reads are mostly askings whether a page is there.
 pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
+    copy_from(to, from, len, LEAST)
+}
+
+/// [`copy`] for a copy of title memory that is expected to be there
+/// whatever its length (`crate::host::copy_mapped`: a list's constants
+/// filled into its upload memory, a refresh): in place from one byte on
+/// (`VICTORY_COPY_PLAIN_SMALL`; on by default, `0` leaves those under
+/// [`LEAST`] bytes to the kernel, as before).
+///
+/// Run P's submissions filled some 16,000 constant buffers a frame (8.5
+/// MB, 535 bytes on average), most of them under 256 bytes and so read
+/// through the kernel: 5.7 ms a frame of the submitting thread in
+/// `ZwReadVirtualMemory`, about half a microsecond each. A source that is
+/// not there faults once and is then left to the kernel for a while
+/// ([`RECENT`]), as for longer copies.
+pub(crate) fn copy_any(to: *mut u8, from: *const u8, len: usize) -> bool {
+    static SMALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let small = *SMALL.get_or_init(|| std::env::var_os("VICTORY_COPY_PLAIN_SMALL").is_none_or(|v| v != "0"));
+    copy_from(to, from, len, if small { 1 } else { LEAST })
+}
+
+/// [`copy`], in place from `least` bytes on.
+fn copy_from(to: *mut u8, from: *const u8, len: usize, least: usize) -> bool {
     if !on() {
         return false;
     }
-    if len < LEAST {
-        COUNT[4].fetch_add(1, Relaxed);
+    if len < least {
+        count(4, 1);
         return false;
     }
     if faulted_lately(from as usize, len) {
-        COUNT[3].fetch_add(1, Relaxed);
+        count(3, 1);
         return false;
     }
     let whole = guarded(to, from, len);
     if whole {
-        COUNT[0].fetch_add(1, Relaxed);
-        COUNT[1].fetch_add(len as u64, Relaxed);
+        // The bytes first: they are added with the copy that ends a batch.
+        count(1, len as u64);
+        count(0, 1);
     } else {
-        COUNT[2].fetch_add(1, Relaxed);
+        count(2, 1);
         note_fault(from as usize, len);
     }
     whole
@@ -288,6 +344,24 @@ mod tests {
         assert!(!faulted_lately(at + 0x10000, 4096));
         assert!(!faulted_lately(at - 0x10000, 4096));
         assert_eq!(blocks(0, 0), (1 << 63, 1 << 63));
+    }
+
+    /// A thread's counts reach the shared counters every 256 copies, the
+    /// bytes with them.
+    #[test]
+    fn counts_reach_the_shared_counters_in_batches() {
+        let [copies, bytes] = [0, 1].map(|i| COUNT[i].load(Relaxed));
+        std::thread::spawn(|| {
+            for _ in 0..300 {
+                count(1, 10);
+                count(0, 1);
+            }
+        })
+        .join()
+        .unwrap();
+        // (Nothing else counts here: copies in place are off in tests.)
+        assert_eq!(COUNT[0].load(Relaxed) - copies, 256);
+        assert_eq!(COUNT[1].load(Relaxed) - bytes, 2560);
     }
 
     /// Many threads at once, half of them faulting: each gets its own answer.

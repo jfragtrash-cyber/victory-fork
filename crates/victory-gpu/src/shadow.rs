@@ -1517,6 +1517,187 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
 }
 
+/// Whether the copies of title memory a flush of a submission's refreshes
+/// makes go in together, on the threads kept for [`wide`], once the flush
+/// has found them all (`VICTORY_SPREAD_COPIES`; on by default, `0` copies
+/// each where it is found, one after the other, as before).
+///
+/// A refresh asks which pages the title wrote and copies them into the
+/// host copy, refresh after refresh on the submitting thread: in run P
+/// about 115 MB a frame in some 2,700 copies, 12.5 ms a frame in the copy
+/// instruction alone (7.7 GB/s, one core's memory speed). The copies have
+/// nothing to do with one another (each writes its own host copy and reads
+/// title memory), and nothing reads what they write before the flush ends:
+/// the steps after it (the title's copies, ranges given to shaders, the
+/// lists going to the card) come after the flush. What is noted about each
+/// copy (`copied`, the asking that took each page) is noted when it is
+/// found, as before; the snapshot and the card's side hear of the bytes
+/// once they are in ([`Shadow::copied_in`]). Copies that are read at once
+/// are not spread: the snapshot of a range shaders write
+/// ([`Shadow::update_busy`]), `VICTORY_REFRESH_CHECK`.
+pub(crate) fn spread_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPREAD_COPIES").is_none_or(|v| v != "0"))
+}
+
+/// Fewer bytes than this a flush copies on its own thread, as before: a
+/// wake of the kept threads costs tens of microseconds.
+const SPREAD_LEAST: usize = 1 << 20;
+/// The bytes of a piece of spread copying (a millisecond's eighth at one
+/// core's memory speed).
+const SPREAD_PIECE: usize = 1 << 20;
+
+/// A copy left for the end of the [`Spreading`] on its thread: the host
+/// copy (held by whoever began it) and the title addresses `[from, to)`.
+struct Later {
+    shadow: *const Shadow,
+    from: usize,
+    to: usize,
+}
+
+thread_local! {
+    /// The copies left for the [`Spreading`] that stands on this thread.
+    static LATER: std::cell::RefCell<Option<Vec<Later>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// While it stands, the copies [`Shadow::copy`] is asked to spread on this
+/// thread are left for its end ([`spread_copies`]), where they are made
+/// together. Whoever begins it holds every host copy refreshed meanwhile
+/// until it ends, and reads none of their bytes before.
+pub(crate) struct Spreading(bool);
+
+impl Spreading {
+    pub(crate) fn begin() -> Spreading {
+        if !spread_copies() {
+            return Spreading(false);
+        }
+        // One at a time on a thread: a second stands for nothing.
+        Spreading(LATER.with(|l| {
+            let mut l = l.borrow_mut();
+            l.is_none() && {
+                *l = Some(Vec::new());
+                true
+            }
+        }))
+    }
+
+    /// Makes the copies left for now; returns the microseconds it took.
+    pub(crate) fn end(mut self) -> u64 {
+        self.finish()
+    }
+
+    fn finish(&mut self) -> u64 {
+        if !std::mem::take(&mut self.0) {
+            return 0;
+        }
+        let later = LATER.with(|l| l.borrow_mut().take()).unwrap_or_default();
+        make_later(&later)
+    }
+}
+
+impl Drop for Spreading {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+/// With a [`Spreading`] on this thread: leaves the copy of title memory
+/// `[from, to)` (inside `shadow`'s buffer) for its end; false if none
+/// stands.
+fn spread_later(shadow: &Shadow, from: usize, to: usize) -> bool {
+    LATER.with(|l| match l.borrow_mut().as_mut() {
+        Some(later) => {
+            later.push(Later { shadow, from, to });
+            true
+        }
+        None => false,
+    })
+}
+
+/// `copies` (destination, source, bytes) as pieces of [`SPREAD_PIECE`]
+/// bytes (the last one fewer): long ones cut, short ones together.
+fn spread_pieces(copies: &[(usize, usize, usize)]) -> Vec<Vec<(usize, usize, usize)>> {
+    let mut pieces: Vec<Vec<(usize, usize, usize)>> = Vec::new();
+    let mut group: Vec<(usize, usize, usize)> = Vec::new();
+    let mut bytes = 0;
+    for &(dst, src, len) in copies {
+        let mut at = 0;
+        while at < len {
+            let n = (SPREAD_PIECE - bytes).min(len - at);
+            group.push((dst + at, src + at, n));
+            at += n;
+            bytes += n;
+            if bytes >= SPREAD_PIECE {
+                pieces.push(std::mem::take(&mut group));
+                bytes = 0;
+            }
+        }
+    }
+    if !group.is_empty() {
+        pieces.push(group);
+    }
+    pieces
+}
+
+/// Makes the copies a [`Spreading`] left, on several threads if they are
+/// many bytes, then tells each host copy its bytes are in; the
+/// microseconds it took.
+fn make_later(later: &[Later]) -> u64 {
+    if later.is_empty() {
+        return 0;
+    }
+    let started = std::time::Instant::now();
+    // SAFETY (for the dereferences below): the `Spreading` that left them
+    // holds every one of these host copies until now.
+    let copies: Vec<(usize, usize, usize)> = later
+        .iter()
+        .map(|l| {
+            let shadow = unsafe { &*l.shadow };
+            (shadow.data as usize + (l.from - shadow.start as usize), l.from, l.to - l.from)
+        })
+        .collect();
+    let bytes: usize = copies.iter().map(|c| c.2).sum();
+    let pieces = if bytes >= SPREAD_LEAST { spread_pieces(&copies) } else { Vec::new() };
+    if pieces.len() >= 2 {
+        let jobs: Vec<Job> = pieces
+            .into_iter()
+            .map(|piece| {
+                Box::new(move || {
+                    for (dst, src, len) in piece {
+                        crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    }
+                }) as Job
+            })
+            .collect();
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            add(C::SpreadFlushes, 1);
+            add(C::SpreadJobs, jobs.len() as u64);
+            add(C::SpreadBytes, bytes as u64);
+        }
+        wide(jobs);
+    } else {
+        for &(dst, src, len) in &copies {
+            crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
+        }
+    }
+    for l in later {
+        // SAFETY: as above.
+        unsafe { &*l.shadow }.copied_in(l.from, l.to);
+    }
+    let us = started.elapsed().as_micros() as u64;
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::SpreadUs, us);
+    us
+}
+
+/// Whether `VICTORY_REFRESH_CHECK=1` ([`Shadow::refresh_check`]).
+fn refresh_check_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1"))
+}
+
 /// About this many bytes to a piece of work for [`wide`].
 const WIDE_JOB: usize = 1 << 20;
 
@@ -3378,7 +3559,8 @@ impl Shadow {
         let Some((now, written)) = crate::watch::writes(from, to, true) else {
             return 0;
         };
-        let copied = self.copy_stale(from, to, now, &written);
+        // Not spread: the snapshot below reads the bytes at once.
+        let copied = self.copy_stale(from, to, now, &written, false);
         if copied > 0 && self.card.is_none() {
             let start = self.start as usize;
             let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -3403,7 +3585,7 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = self.copy_stale(from, to, now, &written, !refresh_check_on());
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -3419,7 +3601,7 @@ impl Shadow {
         crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        self.copy(from, to);
+        self.copy(from, to, true);
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
@@ -3435,8 +3617,7 @@ impl Shadow {
     /// the copy and the address. One that differs once is a write of the
     /// title's that arrived between the refresh and the look.
     fn refresh_check(&self, from: usize, to: usize) {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) {
+        if !refresh_check_on() {
             return;
         }
         const SAMPLE: usize = 256;
@@ -3484,8 +3665,9 @@ impl Shadow {
 
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    /// asking), whole pages within the buffer; with `spread`, as
+    /// [`Shadow::copy`] says.
+    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], spread: bool) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
@@ -3509,30 +3691,46 @@ impl Shadow {
                 }
                 run.get_or_insert(page);
             } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to), spread);
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
-            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+            bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to), spread);
         }
         bytes
     }
 
     /// Copies title memory `[from, to)`, cut to the buffer, into the copy.
-    fn copy(&self, from: usize, to: usize) -> usize {
+    /// With `spread` and a [`Spreading`] on this thread, the bytes go in
+    /// when it ends, together with the other copies' (the caller reads
+    /// none of them before).
+    fn copy(&self, from: usize, to: usize, spread: bool) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         if self.card.is_some() && from < to && copy_changed() && self.copy_changed(from, to) {
             return to - from;
         }
+        if from >= to {
+            return 0;
+        }
+        if spread && spread_later(self, from, to) {
+            return to - from;
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
-        // After the bytes are in: a snapshot taken meanwhile is not current.
+        self.copied_in(from, to);
+        to - from
+    }
+
+    /// Title memory `[from, to)` (inside the buffer) is in the copy now:
+    /// a snapshot taken meanwhile is not current, and a copy in the card's
+    /// memory sends the bytes up.
+    fn copied_in(&self, from: usize, to: usize) {
+        let start = self.start as usize;
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
-        to - from
     }
 
     /// [`Shadow::copy`] for a copy in the card's memory, with
@@ -4454,7 +4652,7 @@ mod card_merge_tests {
 
     /// A plain buffer on the software adapter: what a copy's `buffer` and
     /// its card's `staging` are; the merge never touches them.
-    fn warp_buffer() -> Option<ID3D12Resource> {
+    pub(super) fn warp_buffer() -> Option<ID3D12Resource> {
         // SAFETY: plain DXGI and D3D12 creation calls on the software adapter.
         unsafe {
             let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
@@ -4570,6 +4768,108 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod spread_tests {
+    use super::*;
+
+    /// Pieces of spread copying hold every byte of the copies once, in
+    /// order, a piece's worth each but the last.
+    #[test]
+    fn spread_pieces_hold_every_byte_once() {
+        let copies = [
+            (0x1000_0000, 0x7_0000_0123, 3 * SPREAD_PIECE + 77),
+            (0x2000_0000, 0x7_1000_0000, 100),
+            (0x3000_0000, 0x7_2000_0000, SPREAD_PIECE / 2),
+            (0x4000_0000, 0x7_3000_0000, SPREAD_PIECE),
+        ];
+        let pieces = spread_pieces(&copies);
+        let sizes: Vec<usize> = pieces.iter().map(|p| p.iter().map(|c| c.2).sum()).collect();
+        let all: usize = copies.iter().map(|c| c.2).sum();
+        assert_eq!(sizes.len(), all.div_ceil(SPREAD_PIECE));
+        assert!(sizes[..sizes.len() - 1].iter().all(|&n| n == SPREAD_PIECE));
+        let flat: Vec<(usize, usize, usize)> = pieces.into_iter().flatten().collect();
+        // Put back together, the parts are the copies.
+        let mut joined: Vec<(usize, usize, usize)> = Vec::new();
+        for (dst, src, len) in flat {
+            assert!(len > 0);
+            match joined.last_mut() {
+                Some(last) if last.0 + last.2 == dst && last.1 + last.2 == src => last.2 += len,
+                _ => joined.push((dst, src, len)),
+            }
+        }
+        assert_eq!(joined, copies);
+        assert!(spread_pieces(&[]).is_empty());
+    }
+
+    /// Refreshes under a `Spreading` leave their copies for its end: the
+    /// host copies hold the title's bytes once it ends, the first time and
+    /// after a title write alike.
+    #[test]
+    fn copies_left_for_the_end_of_a_spreading_are_made_then() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const LEN: usize = 3 << 20;
+        if !spread_copies() {
+            return;
+        }
+        let Some(buffer) = super::card_merge_tests::warp_buffer() else {
+            return;
+        };
+        let titles: Vec<usize> = (0..2)
+            .map(|k| {
+                // SAFETY: a fresh write-watched allocation, freed at the end.
+                let p = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+                assert_ne!(p, 0);
+                // SAFETY: the allocation's bytes.
+                let bytes = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, LEN) };
+                for (i, b) in bytes.iter_mut().enumerate() {
+                    *b = (i * 7 + 3 + k) as u8;
+                }
+                p
+            })
+            .collect();
+        let mut hosts: Vec<Vec<u8>> = (0..2).map(|_| vec![0u8; LEN]).collect();
+        let shadows: Vec<Shadow> = titles
+            .iter()
+            .zip(&mut hosts)
+            .map(|(&p, host)| Shadow::new(buffer.clone(), host.as_mut_ptr(), 0, p as u64, LEN as u64))
+            .collect();
+        // SAFETY (the reads below): the host copies' bytes, which nothing
+        // writes while they are read.
+        let host = |k: usize| unsafe { std::slice::from_raw_parts(shadows[k].data.cast_const(), LEN) };
+        // SAFETY: as above, title memory of the test's own.
+        let title = |k: usize| unsafe { std::slice::from_raw_parts(titles[k] as *const u8, LEN) };
+        let spreading = Spreading::begin();
+        for s in &shadows {
+            assert_eq!(s.update(s.start as usize, LEN), LEN);
+        }
+        assert!(host(0).iter().all(|&b| b == 0), "left for the end");
+        spreading.end();
+        for k in 0..2 {
+            assert!(host(k) == title(k), "copy {k} after the spreading");
+        }
+        // The title writes one byte of each: the next refresh takes its page.
+        for &p in &titles {
+            // SAFETY: a byte of the allocation.
+            unsafe { ((p + LEN / 2 + 5) as *mut u8).write_volatile(0xee) };
+        }
+        let spreading = Spreading::begin();
+        for s in &shadows {
+            assert_eq!(s.update(s.start as usize, LEN), PAGE);
+        }
+        drop(spreading);
+        for k in 0..2 {
+            assert_eq!(host(k)[LEN / 2 + 5], 0xee);
+            assert!(host(k) == title(k));
+        }
+        drop(shadows);
+        for p in titles {
+            // SAFETY: the test's allocation.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        }
+    }
 }
 
 #[cfg(test)]

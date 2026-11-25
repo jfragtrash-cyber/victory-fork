@@ -138,6 +138,13 @@ pub(crate) enum C {
     /// answer instead.
     HolesAsked,
     HolesKnown,
+    /// Flushes of refreshes whose copies were spread over the kept threads
+    /// (`shadow::Spreading`), their pieces of work and bytes, and the
+    /// microseconds of every flush's copies left for its end.
+    SpreadFlushes,
+    SpreadJobs,
+    SpreadBytes,
+    SpreadUs,
 }
 const COUNTERS: usize = 80;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
@@ -1296,6 +1303,13 @@ pub(crate) fn log(frames: f64) {
         "  runs of unmapped blocks in guarded ranges per frame: {:.0} asked of Windows, {:.0} passed over on a          recent answer (VICTORY_ABSENT_KEEP=0 asks every time)",
         c[C::HolesAsked as usize],
         c[C::HolesKnown as usize],
+    );
+    tracing::info!(
+        "  refresh copies made together at the end of their flush, per frame: {:.2} ms; spread over the kept threads:          {:.1} flushes, {:.0} pieces, {:.1} MB (VICTORY_SPREAD_COPIES=0 copies each where it is found)",
+        ms(c[C::SpreadUs as usize]),
+        c[C::SpreadFlushes as usize],
+        c[C::SpreadJobs as usize],
+        mb(c[C::SpreadBytes as usize]),
     );
     crate::draw::window_line(frames);
     tracing::info!(

@@ -7286,7 +7286,11 @@ impl Batch {
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
+        // A big refresh's copies on several threads too (`shadow` is held
+        // until they are in).
+        let spreading = crate::shadow::Spreading::begin();
         Self::update(&shadow, from, to);
+        preparing(0, spreading.end());
         Self::brought(&mut self.current, &shadow, from, to);
     }
 
@@ -7398,10 +7402,19 @@ impl Batch {
             PREPARING[0].fetch_sub(over, Ordering::Relaxed);
             crate::framelog::sub(crate::framelog::T::CopyUs, over);
         } else {
+            // The copies the refreshes find go in together once all are
+            // found (`crate::shadow::Spreading`): the copies are held until
+            // then, and nothing reads them before.
+            // (Held first: dropped after the spreading, whatever happens.)
+            let mut held = Vec::with_capacity(self.refreshes.len());
+            let spreading = crate::shadow::Spreading::begin();
             for (shadow, from, to) in self.refreshes.drain(..) {
                 Self::update(&shadow, from, to);
                 Self::brought(&mut self.current, &shadow, from, to);
+                held.push(shadow);
             }
+            preparing(0, spreading.end());
+            drop(held);
         }
         if ahead {
             crate::watch::ask_ahead_done();

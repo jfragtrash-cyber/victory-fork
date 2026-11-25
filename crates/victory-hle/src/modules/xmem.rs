@@ -538,6 +538,9 @@ struct Physical {
     /// The same by the page shown (as in `shown`): the addresses of its
     /// copies, which DirectStorage's writes into it reach ([`pages_written`]).
     copies: HashMap<(usize, usize), Vec<usize>>,
+    /// Placeholders known to be exactly a range, by start: its length
+    /// ([`map`] needs no split there). A view unmapped leaves one.
+    exact: BTreeMap<usize, usize>,
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -1218,6 +1221,32 @@ fn one_placeholder(base: usize, len: usize) -> bool {
     start(base).is_some_and(|first| start(base + len - 1) == Some(first))
 }
 
+/// Whether [`map`] skips the split of a placeholder it knows to be exactly
+/// the range (`VICTORY_EXACT_PLACEHOLDERS`; on by default, `0`: always
+/// split, as before).
+///
+/// Why: every map split its placeholder first, a system call that fails
+/// harmlessly when the placeholder is the range already, which it is
+/// after a view of the same range was unmapped: the GPU's page-mapping
+/// copies unmap a page's view and map the next one at the same address
+/// thousands of times a frame in streaming (run N: 1.7 s of `VirtualFree`
+/// beside 23 s of map and unmap calls).
+fn exact_placeholders() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EXACT_PLACEHOLDERS").is_none_or(|v| v != "0"))
+}
+
+/// Forgets what [`Physical::exact`] says of placeholders that meet
+/// `[base, base + len)`.
+fn forget_exact(physical: &mut Physical, base: usize, len: usize) {
+    let end = base.saturating_add(len);
+    let first = physical.exact.range(..=base).next_back().filter(|(at, n)| *at + *n > base).map(|(&at, _)| at);
+    let hit: Vec<usize> = first.into_iter().chain(physical.exact.range(base + 1..end).map(|(&at, _)| at)).collect();
+    for at in hit {
+        physical.exact.remove(&at);
+    }
+}
+
 /// `VirtualFree`'s flag that joins adjacent placeholders into one (not in
 /// our bindings).
 const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
@@ -1326,27 +1355,42 @@ fn map_alias_runs(physical: &mut Physical, to: usize, from: usize, len: usize) -
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
-    // SAFETY: splits the placeholder around the range (failing harmlessly
-    // when the range is the whole placeholder), then maps the section
-    // there; both act only on placeholders.
-    let view = unsafe {
-        VirtualFree(
-            base as *mut c_void,
-            len,
-            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-        );
-        MapViewOfFile3(
-            slice.section.handle(),
-            GetCurrentProcess(),
-            base as *const c_void,
-            (slice.index * PAGE) as u64,
-            len,
-            MEM_REPLACE_PLACEHOLDER,
-            PAGE_READWRITE,
-            std::ptr::null_mut(),
-            0,
-        )
+    let replace = || {
+        // SAFETY: maps the section over a placeholder of exactly the range.
+        unsafe {
+            MapViewOfFile3(
+                slice.section.handle(),
+                GetCurrentProcess(),
+                base as *const c_void,
+                (slice.index * PAGE) as u64,
+                len,
+                MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        }
     };
+    let split = || {
+        // SAFETY: splits the placeholder around the range (failing
+        // harmlessly when the range is the whole placeholder); acts only on
+        // placeholders.
+        unsafe { VirtualFree(base as *mut c_void, len, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
+    };
+    // A placeholder known to be exactly the range needs no split, a system
+    // call that fails there anyway ([`exact_placeholders`]); if the map
+    // fails all the same, the split is made and the map tried again.
+    let known = exact_placeholders() && physical.exact.get(&base) == Some(&len);
+    // Whatever stands there now is changed: what was known of it goes.
+    forget_exact(physical, base, len);
+    let mut view = MEMORY_MAPPED_VIEW_ADDRESS { Value: std::ptr::null_mut() };
+    if known {
+        view = replace();
+    }
+    if view.Value as usize != base {
+        split();
+        view = replace();
+    }
     if view.Value as usize != base {
         tracing::warn!(
             address = format_args!("{base:#x}"),
@@ -1492,7 +1536,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         }
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
+        let unmapped = unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
                 MEMORY_MAPPED_VIEW_ADDRESS {
@@ -1500,7 +1544,11 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 },
                 MEM_PRESERVE_PLACEHOLDER,
             )
-        };
+        } != 0;
+        // A placeholder of exactly the view now.
+        if unmapped {
+            physical.exact.insert(at, size);
+        }
         if at < base {
             map(physical, at, base - at, slice.clone());
         }

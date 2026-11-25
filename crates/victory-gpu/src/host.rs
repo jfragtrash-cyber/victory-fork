@@ -5425,6 +5425,9 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
         submitting(1, runs.len());
+        // Copies of physical pages whose source was written are taken again
+        // before anything of this submission reads them (`crate::alias`).
+        crate::alias::flush();
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.

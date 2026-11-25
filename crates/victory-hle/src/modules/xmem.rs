@@ -889,6 +889,8 @@ fn copy_written(pages: &[usize], offset: usize, len: usize) -> Vec<(usize, usize
             },
         };
         for &target in targets {
+            // The GPU side guards copies: their guard opens first.
+            victory_gpu::kernel_will_write(target + lo, n);
             // SAFETY: the source shows the page for as long as the table's
             // lock is held (or is our view); the target is ours.
             unsafe { std::ptr::copy_nonoverlapping(source as *const u8, (target + lo) as *mut u8, n) };
@@ -1167,10 +1169,12 @@ fn map_alias_copy(physical: &mut Physical, to: usize, from: usize, len: usize) -
         match &wanted[k] {
             None if !physical.copied.contains_key(&page) => continue,
             None => {
+                // The GPU side guards copies: their guard opens first.
+                victory_gpu::kernel_will_write(page, PAGE);
                 // SAFETY: a page of ours, committed.
                 unsafe { std::ptr::write_bytes(page as *mut u8, 0, PAGE) };
                 physical.copied.insert(page, None);
-                victory_gpu::title_memory_copied(page, false);
+                victory_gpu::title_memory_copied(page, None);
             }
             Some(slice) => {
                 if !physical.copied.contains_key(&page) && !make_copy_page(page) {
@@ -1181,13 +1185,15 @@ fn map_alias_copy(physical: &mut Physical, to: usize, from: usize, len: usize) -
                     );
                     return false;
                 }
+                // The GPU side guards copies: their guard opens first.
+                victory_gpu::kernel_will_write(page, PAGE);
                 // SAFETY: the source page is mapped where `from` shows it
                 // (a view or a copy), the target is ours and committed.
                 unsafe { std::ptr::copy_nonoverlapping((from + k * PAGE) as *const u8, page as *mut u8, PAGE) };
                 physical.copies.entry(slice.key(0)).or_default().push(page);
                 physical.copied.insert(page, Some(slice.clone()));
                 victory_gpu::title_memory_copies(copy_source);
-                victory_gpu::title_memory_copied(page, true);
+                victory_gpu::title_memory_copied(page, Some(from + k * PAGE));
             }
         }
         victory_gpu::title_memory_remapped(page, PAGE);
@@ -1443,7 +1449,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             }
             // SAFETY: a page of ours made from a placeholder.
             unsafe { VirtualFree(page as *mut c_void, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
-            victory_gpu::title_memory_copied(page, false);
+            victory_gpu::title_memory_copied(page, None);
             victory_gpu::title_memory_remapped(page, PAGE);
             run = match run {
                 Some((from, n)) if from + n * PAGE == page => Some((from, n + 1)),

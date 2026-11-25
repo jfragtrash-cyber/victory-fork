@@ -400,3 +400,25 @@ already reach.
   limit) lets the title record the next frame while our thread prepares
   this one. Play: 214 ms (M) -> 163-173 ms (N) -> **142-150 ms at 6,300
   draws (O), about 7 fps**; 147 ms in the lighter cell view of M.
+- 2026-11-25, night. Two engineers' branches merged (memory tracking:
+  kept answers about unmapped blocks, refresh copies spread over the kept
+  threads, small fills copied in place, the merge eight bytes at a time;
+  command translation: lock-free reads of made descriptor slots with
+  per-slot locks, per-thread memory of title-buffer and view lookups,
+  cheap hashing). Run X (quiet machine, same switches): the recording
+  threads' calls fell from 306-330 to 148-171 ms a frame in all; usual
+  frames 75-88 ms, but every 7-8 frames a present finds the one before it
+  still in the line and runs the old way, taking the backlog (300-350 ms,
+  then a 3 ms frame): about 120 ms a frame on average at ~3,400-9,500
+  draws (8 fps).
+- 2026-11-25, night. The low points are texture streaming: the GPU's
+  page-mapping copies, one page per call, cost two system calls each
+  (unmap, map) at 120-1,000 us in the running title (35 us in a quiet
+  process) and 16 page faults when first read; cutscene frames of 1-3.5 s
+  carried 2,000-4,800 of them (0.3-2.9 s). Views for DirectStorage's
+  writes are now kept per section (`VICTORY_OWN_SECTION_VIEWS`: page faults
+  in those frames ~100,000 -> ~75,000). Copies instead of views
+  (`VICTORY_ALIAS_COPY=1`, 5.8 us a page) drew an empty world in run U:
+  the title writes pages after mapping them; `crate::alias` now takes a
+  copy again when its source is written, and writes shaders' bytes back to
+  the source (run Y measures it).

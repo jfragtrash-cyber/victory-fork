@@ -550,6 +550,12 @@ const BLOCK: usize = PAGE;
 /// hold (read-only by our hand, or noted absent): asking the kernel's write
 /// watch about it can only fail. `VICTORY_VIEW_ASK=1` (or
 /// `VICTORY_GUARD_ASK=1`) asks the kernel anyway, as before.
+/// Whether the guarded block holding `at` is clean: guarded and not
+/// written since (a look at the guards' set, nothing asked of Windows).
+pub(crate) fn block_clean(at: usize) -> bool {
+    guards().clean.contains(&(at / BLOCK))
+}
+
 fn known_view(start: usize) -> bool {
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let ask = *ASK.get_or_init(|| {
@@ -778,7 +784,9 @@ fn is_view(start: usize, end: usize) -> bool {
         if n == 0 {
             return false;
         }
-        if info.Type == MEM_MAPPED {
+        // A copy of a physical page kept at a page-mapping copy's target
+        // counts as view memory (`crate::alias::is_copy`).
+        if info.Type == MEM_MAPPED || crate::alias::is_copy(at) {
             return true;
         }
         // Committed memory that is no view (the title's heaps, ours), or
@@ -1111,6 +1119,8 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        // Copies of the page there are taken again (`crate::alias`).
+        crate::alias::source_opened(block * BLOCK, BLOCK);
     }
     !blocks.is_empty()
 }

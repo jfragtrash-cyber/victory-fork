@@ -136,7 +136,7 @@ fn present_behind() -> bool {
 /// the queue `this` holds. False if it has to run the old way.
 #[cfg(windows)]
 fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool {
-    if this.is_null() || planes == 0 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
+    if this.is_null() || planes == 0 || PRESENTS_HELD.load(Ordering::Relaxed) >= presents_ahead() {
         return false;
     }
     let frame = FRAMES.load(Ordering::Relaxed) + 1;
@@ -172,6 +172,23 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
         wake();
     }
     sent
+}
+
+/// How many presents may wait in the queues' lines ([`send_behind`]) before
+/// one runs the old way (`VICTORY_PRESENTS_AHEAD`; 1 by default).
+///
+/// At 1 the title is one frame ahead of our thread at most. Run X's play:
+/// usual frames of 75-88 ms, and every 7-8 frames a present that found the
+/// one before it still in the line ran the line itself, 300-350 ms, then a
+/// 3 ms frame: about 120 ms a frame in all. With more room the title's and
+/// our thread's uneven frames even out, and a frame tends to the slower of
+/// the two. The title waits for its own fences before it reuses what a
+/// frame read, and those are set when the card has run the frame and its
+/// results are back (`crate::host::late`), however far ahead it records.
+#[cfg(windows)]
+fn presents_ahead() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_PRESENTS_AHEAD").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1).max(1))
 }
 
 /// Presents sent behind their queue's line since the start

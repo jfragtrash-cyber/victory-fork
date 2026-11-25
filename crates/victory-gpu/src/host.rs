@@ -2328,6 +2328,12 @@ static QUEUE_ORDER: Mutex<u64> = Mutex::new(0);
 /// copies' pieces, microseconds of landing in all.
 static RELAY_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// Since the last frame-rate line, of the landing's copy-back
+/// ([`Host::relay_land`]): microseconds with copies in the card's memory
+/// (their fetch and its wait, the merge), and with the copies in the PC's
+/// memory ([`relay_hand_back`]).
+static RELAY_SPLIT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Since the last frame-rate line, with [`inflight_fetch`]: pieces merged
 /// from the slots their flights fetched them to, their bytes, landings that
 /// went the old way because a plan's pieces overflowed the slots, and
@@ -3629,6 +3635,41 @@ fn late_line(frames: f64) {
             r[2] / 1000.0,
             r[3] / 1000.0,
             r[4] / 1000.0,
+        );
+        // What the copy-back is: where the landing's time goes, and what
+        // of the card copies' fetched pieces shaders really changed, by
+        // title buffer (run X: 46-56 ms and 56-65 MB a frame of "copying
+        // back", 75-81 MB fetched, without a word on whose).
+        let [card_ms, pc_ms] = RELAY_SPLIT.each_ref().map(|t| t.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
+        let (sums, copies) = crate::shadow::card_merged_take(8);
+        let mb = |n: u64| n as f64 / frames / (1 << 20) as f64;
+        let copies: Vec<String> = copies
+            .iter()
+            .map(|(at, len, m)| {
+                format!(
+                    "{at:#x}+{len:#x}: {:.1} pieces {:.2}/{:.2}/{:.2} MB",
+                    m[0] as f64 / frames,
+                    mb(m[1]),
+                    mb(m[2]),
+                    mb(m[3])
+                )
+            })
+            .collect();
+        tracing::info!(
+            "the relay's copy-back per frame: {card_ms:.1} ms with copies in the card's memory ({:.1} of it waiting for \
+             the fetch; VICTORY_RELAY_WIDE={} threads merge), {pc_ms:.1} ms with copies in the PC's memory; of the card \
+             copies: {:.1} pieces fetched, {:.2} MB, {:.2} MB of them written to title memory (first to last byte that \
+             differs), {:.2} MB the card changed, in {:.0} stretches of 4 KiB (VICTORY_CARD_HASH_WIDE={}); by title \
+             buffer, fetched/written/changed: {}",
+            r[3] / 1000.0,
+            crate::shadow::relay_wide(),
+            sums[0] as f64 / frames,
+            mb(sums[1]),
+            mb(sums[2]),
+            mb(sums[3]),
+            sums[4] as f64 / frames,
+            card_hash_wide_mode(),
+            copies.join(", ")
         );
         if inflight_fetch() {
             let i: Vec<f64> = INFLIGHT_STATS.iter().map(|i| i.swap(0, Ordering::Relaxed) as f64 / frames).collect();
@@ -5106,7 +5147,9 @@ impl Host {
                 let plans: Vec<(u64, &CardPlan)> = flights.iter().filter_map(|f| f.card.as_ref().map(|card| (f.number, card))).collect();
                 let behind = flights.iter().map(|f| f.fence).max().unwrap_or(0);
                 let landed = flights.iter().map(|f| f.number).max().unwrap_or(0);
+                let timed = std::time::Instant::now();
                 self.relay_card_back(&plans, fetch, behind, landed);
+                RELAY_SPLIT[0].fetch_add(timed.elapsed().as_micros() as u64, Ordering::Relaxed);
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
                     for (shadow, ranges) in &flight.back {
@@ -5122,7 +5165,9 @@ impl Host {
                         }
                     }
                 }
+                let timed = std::time::Instant::now();
                 relay_hand_back(&back);
+                RELAY_SPLIT[1].fetch_add(timed.elapsed().as_micros() as u64, Ordering::Relaxed);
                 // Only now, and flight by flight: a range another flight
                 // in the air declared too stays closed to refreshes.
                 for flight in &flights {

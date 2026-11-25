@@ -113,6 +113,11 @@ struct Card {
     /// threads hold blocks of one copy side by side; without it every block
     /// takes the first, one lock a copy as before.
     sides: [Mutex<()>; SIDES],
+    /// Since the frame line took them ([`card_merged_take`]), of the relay's
+    /// merges ([`Shadow::card_merge_relay`]): pieces, their bytes fetched,
+    /// bytes written to title memory (each piece's first to last byte that
+    /// differs), bytes the card changed, and the 4 KiB stretches of those.
+    merged: [AtomicU64; 5],
 }
 
 /// [`Card::sides`].
@@ -921,15 +926,29 @@ impl Flights {
 /// read, could undo that write. (The merge of a waited-for submission
 /// stores every byte of a differing stretch back into the copy.)
 fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
-    let mut differs = 0u8;
-    for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-        let wrote = if *n != *h { 0xffu8 } else { 0 };
-        let merged = (*t & !wrote) | (*n & wrote);
-        differs |= merged ^ *t;
-        *t = merged;
-        *h = (*h & !wrote) | (*n & wrote);
+    merge_piece_counted(now, held, title).0
+}
+
+/// [`merge_piece`], and what the card changed: its bytes, and the 4 KiB
+/// stretches (from the first byte given) that hold one or more of them.
+fn merge_piece_counted(now: &[u8], held: &mut [u8], title: &mut [u8]) -> (bool, usize, usize) {
+    const STRETCH: usize = 4 << 10;
+    let (mut changed, mut bytes, mut stretches) = (false, 0usize, 0usize);
+    for ((now, held), title) in now.chunks(STRETCH).zip(held.chunks_mut(STRETCH)).zip(title.chunks_mut(STRETCH)) {
+        let (mut differs, mut wrote_here) = (0u8, 0u32);
+        for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+            let wrote = if *n != *h { 0xffu8 } else { 0 };
+            let merged = (*t & !wrote) | (*n & wrote);
+            differs |= merged ^ *t;
+            *t = merged;
+            *h = (*h & !wrote) | (*n & wrote);
+            wrote_here += u32::from(wrote & 1);
+        }
+        changed |= differs != 0;
+        bytes += wrote_here as usize;
+        stretches += usize::from(wrote_here != 0);
     }
-    differs != 0
+    (changed, bytes, stretches)
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -1106,7 +1125,7 @@ fn merge_race(read: Option<&[u8]>, copy: (u64, u64), address: usize, merged: &[u
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{Flights, changed_runs, merge_piece, outside};
+    use super::{Flights, changed_runs, merge_piece, merge_piece_counted, outside};
 
     /// A range two flights declared is free only when both are done, in
     /// either order; a submission that declares it many times counts once.
@@ -1163,6 +1182,26 @@ mod relay_tests {
         let (title1, held1) = (title.clone(), held.clone());
         assert!(!merge_piece(&now, &mut held, &mut title));
         assert_eq!((title, held), (title1, held1));
+    }
+
+    /// The counted merge reports the bytes the card changed and the 4 KiB
+    /// stretches that hold them, and merges as the plain one.
+    #[test]
+    fn the_counted_merge_counts_the_cards_bytes_by_stretch() {
+        const N: usize = 5 * 4096 + 100;
+        let held0: Vec<u8> = (0..N).map(|i| (i * 7 + 3) as u8).collect();
+        let mut now = held0.clone();
+        // Stretches 0 (two bytes), 2 (one) and 5 (the short last one).
+        for at in [10usize, 4095, 2 * 4096 + 7, 5 * 4096 + 99] {
+            now[at] ^= 0x81;
+        }
+        let title0: Vec<u8> = held0.iter().map(|b| b ^ 1).collect();
+        let (mut held, mut title) = (held0.clone(), title0.clone());
+        let (mut held_plain, mut title_plain) = (held0.clone(), title0.clone());
+        assert_eq!(merge_piece_counted(&now, &mut held, &mut title), (true, 4, 3));
+        assert!(merge_piece(&now, &mut held_plain, &mut title_plain));
+        assert!(held == held_plain && title == title_plain);
+        assert_eq!(merge_piece_counted(&now, &mut held, &mut title), (false, 0, 0));
     }
 
     #[test]
@@ -4239,21 +4278,32 @@ impl Shadow {
     /// as [`Shadow::merge_under_writes`]. `title` is scratch memory. Returns
     /// the bytes written to title memory.
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
-        let start = self.start as usize;
         let Some(card) = &self.card else {
             return 0;
         };
         if at + gpu.len() > self.len as usize {
             return 0;
         }
+        let (written, bytes, stretches) = self.card_merge_relay_in(card, at, gpu, fetched_after, title);
+        for (counter, n) in card.merged.iter().zip([1, gpu.len(), written, bytes, stretches]) {
+            counter.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        written
+    }
+
+    /// [`Shadow::card_merge_relay`] of a piece inside the copy: the bytes
+    /// written to title memory, and what the card changed ([`merge_piece_counted`]).
+    fn card_merge_relay_in(&self, card: &Card, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> (usize, usize, usize) {
+        let start = self.start as usize;
         let _side = card.side(start + at, start + at + gpu.len());
-        // SAFETY: inside the mapping (checked above). The offsets are in a
-        // range declared and not done with, which no refresh writes; what
-        // does write it (the title's bytes put in under shader writes, the
-        // merge of another piece of the block) holds the lock held here.
+        // SAFETY: inside the mapping (checked by the caller). The offsets
+        // are in a range declared and not done with, which no refresh
+        // writes; what does write it (the title's bytes put in under shader
+        // writes, the merge of another piece of the block) holds the lock
+        // held here.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, held) else {
-            return 0;
+            return (0, 0, 0);
         };
         let last = last_difference(gpu, held).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
@@ -4274,25 +4324,55 @@ impl Shadow {
         // The stretch as read: what the card did not change is the
         // title's, and may have been written again since.
         let as_read = (mapped && merge_race_on()).then(|| title.clone());
-        let mut changed = false;
+        let (mut changed, mut bytes, mut stretches) = (false, 0, 0);
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            let (c, by, st) = merge_piece_counted(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            (changed, bytes, stretches) = (changed | c, bytes + by, stretches + st);
         }
         if !mapped || !changed {
-            return 0;
+            return (0, bytes, stretches);
         }
         crate::host::shaders_write(start + at, &title[..]);
         if self.put_back_own(start + at, &title[..]) {
-            return n;
+            return (n, bytes, stretches);
         }
         crate::watch::writing(start + at, n);
         merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card relay");
         crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        (n, bytes, stretches)
     }
+}
+
+/// Of the relay's merges of copies in the card's memory since the last
+/// call ([`Card::merged`], taken): the sums (pieces, bytes fetched, bytes
+/// written to title memory, bytes the card changed, 4 KiB stretches of
+/// those), and the `most` copies whose card changed the most bytes, as
+/// (title address, length, the same five), most first.
+pub(crate) fn card_merged_take(most: usize) -> ([u64; 5], Vec<(u64, u64, [u64; 5])>) {
+    let mut sums = [0u64; 5];
+    let mut copies: Vec<(u64, u64, [u64; 5])> = Vec::new();
+    for weak in CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        let Some(shadow) = weak.upgrade() else {
+            continue;
+        };
+        let Some(card) = &shadow.card else {
+            continue;
+        };
+        let taken = card.merged.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+        if taken[0] == 0 {
+            continue;
+        }
+        for (sum, n) in sums.iter_mut().zip(taken) {
+            *sum += n;
+        }
+        copies.push((shadow.start, shadow.len, taken));
+    }
+    copies.sort_unstable_by_key(|c| std::cmp::Reverse(c.2[3]));
+    copies.truncate(most);
+    (sums, copies)
 }
 
 struct Entry {
@@ -4691,6 +4771,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     sent: Mutex::default(),
                     size,
                     sides: Default::default(),
+                    merged: Default::default(),
                 };
                 (on_card, Some(card))
             }
@@ -4927,6 +5008,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 sent: Mutex::default(),
                 size: len,
                 sides: Default::default(),
+                merged: Default::default(),
             };
             (on_card, Some(card))
         }
@@ -5229,6 +5311,7 @@ mod card_merge_tests {
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
                 sides: Default::default(),
+                merged: Default::default(),
             });
             // As `card_dirty` with the mark set by the old-way fetch.
             if let Some(card) = &shadow.card {
@@ -5273,6 +5356,7 @@ mod card_merge_tests {
             // 0: no card bytes counted (`Drop` takes them off again).
             size: 0,
             sides: Default::default(),
+            merged: Default::default(),
         };
         // What the card holds after its shaders ran: of copy A, some bytes
         // of every piece; of copy B, other bytes of piece 9.

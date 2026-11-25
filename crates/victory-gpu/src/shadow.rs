@@ -3836,20 +3836,186 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Changes of [`BUFFERS`] that may change what [`lookup`] finds there (a
+/// buffer registered or unregistered, a copy taken out), counted under its
+/// lock. From 1: 0 marks an empty entry of [`Found`].
+static BUFFERS_CHANGES: AtomicU64 = AtomicU64::new(1);
+
+/// [`BUFFERS`] changed, under its lock (`_map`).
+fn buffers_changed(_map: &BTreeMap<(u64, usize), Entry>) {
+    BUFFERS_CHANGES.fetch_add(1, Ordering::Release);
+}
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let mut map = buffers();
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    buffers_changed(&map);
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let mut map = buffers();
+    if map.remove(&(start, resource)).is_some() {
+        buffers_changed(&map);
+    }
+}
+
+/// Whether [`lookup`] remembers, per thread, what it found among the title
+/// buffers ([`Found`]). On by default; `VICTORY_LOOKUP_CACHE=0`: every ask
+/// searches them under their lock, as before.
+fn lookup_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOKUP_CACHE").is_none_or(|v| v != "0"))
+}
+
+/// Asks a thread remembers ([`Found`]).
+const FOUND: usize = 256;
+
+/// What [`lookup`] found among the title buffers lately, on one thread: per
+/// ask (address, end), the copy of the buffer that holds it, or that none
+/// does (the ask goes to the windows outside buffers), as [`BUFFERS`] was
+/// at its change [`BUFFERS_CHANGES`]. While that count stays, the search
+/// would find the same again: which buffer holds an ask depends on the
+/// buffers alone, and a buffer's copy stays until it is taken out (a
+/// change). Asked again by the next draws (a buffer view's whole buffer,
+/// a root view's address), the search under the lock was 16 ms a frame of
+/// the recording threads in run P's gameplay, and 7 ms more of waiting for
+/// one another. A copy is held weakly: what nothing else holds goes.
+struct Found<T> {
+    entries: [FoundEntry<T>; FOUND],
+}
+
+struct FoundEntry<T> {
+    address: u64,
+    end: u64,
+    /// [`BUFFERS_CHANGES`] when it was found; 0: empty.
+    changes: u64,
+    /// `None`: in no buffer.
+    holder: Option<std::sync::Weak<T>>,
+}
+
+impl<T> Found<T> {
+    const fn new() -> Self {
+        Found {
+            entries: [const {
+                FoundEntry {
+                    address: 0,
+                    end: 0,
+                    changes: 0,
+                    holder: None,
+                }
+            }; FOUND],
+        }
+    }
+
+    /// The entry an ask goes to.
+    fn way(address: u64, end: u64) -> usize {
+        ((address ^ end.rotate_left(29)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 56) as usize % FOUND
+    }
+
+    /// What was found for the ask `[address, end)` while the buffers were
+    /// at change `changes`: `Some(None)` if no buffer holds it; `None` if
+    /// nothing is known (another ask, or the buffers changed since).
+    fn get(&self, address: u64, end: u64, changes: u64) -> Option<Option<Arc<T>>> {
+        let e = &self.entries[Self::way(address, end)];
+        if e.changes != changes || e.address != address || e.end != end {
+            return None;
+        }
+        match &e.holder {
+            None => Some(None),
+            Some(weak) => weak.upgrade().map(Some),
+        }
+    }
+
+    /// The ask `[address, end)` found `holder` (`None`: no buffer holds
+    /// it) while the buffers were at change `changes`.
+    fn put(&mut self, address: u64, end: u64, changes: u64, holder: Option<&Arc<T>>) {
+        self.entries[Self::way(address, end)] = FoundEntry {
+            address,
+            end,
+            changes,
+            holder: holder.map(Arc::downgrade),
+        };
+    }
+}
+
+thread_local! {
+    static FOUND_HERE: std::cell::RefCell<Found<Shadow>> = const { std::cell::RefCell::new(Found::new()) };
+}
+
+#[cfg(test)]
+mod found_tests {
+    use super::*;
+
+    /// An ask is answered as found while the buffers stay as they were:
+    /// a copy, or no buffer; not after a change, not for another ask, and
+    /// not once nothing else holds the copy. An ask for the same entry
+    /// takes its place.
+    #[test]
+    fn asks_are_answered_while_the_buffers_stay() {
+        let mut found = Found::<u32>::new();
+        let copy = Arc::new(7u32);
+        assert!(found.get(0x1000, 0x1100, 5).is_none());
+        found.put(0x1000, 0x1100, 5, Some(&copy));
+        assert_eq!(found.get(0x1000, 0x1100, 5), Some(Some(copy.clone())));
+        assert!(found.get(0x1000, 0x1100, 6).is_none());
+        assert!(found.get(0x1000, 0x1101, 5).is_none());
+        assert!(found.get(0x1001, 0x1100, 5).is_none());
+        found.put(0x9000, 0x9100, 5, None);
+        assert_eq!(found.get(0x9000, 0x9100, 5), Some(None));
+        // Held weakly.
+        assert_eq!(Arc::weak_count(&copy), 1);
+        drop(copy);
+        assert!(found.get(0x1000, 0x1100, 5).is_none());
+        // Another ask that goes to the same entry.
+        let way = Found::<u32>::way(0x9000, 0x9100);
+        let other = (1..u64::MAX).map(|i| 0x9000 + i * 16).find(|&a| Found::<u32>::way(a, a + 0x100) == way).unwrap();
+        found.put(other, other + 0x100, 5, None);
+        assert!(found.get(0x9000, 0x9100, 5).is_none());
+        assert_eq!(found.get(other, other + 0x100, 5), Some(None));
+    }
+
+    /// The same ask finds the same copy; a buffer registered or
+    /// unregistered since is seen by the next ask.
+    #[test]
+    fn a_buffer_registered_or_unregistered_is_seen_by_the_next_ask() {
+        if host().is_none() || !lookup_cache() {
+            return; // no host GPU
+        }
+        // Addresses no title and no other test uses; nothing is read there.
+        let start = 0x7fe1_2340_0000u64;
+        let (a, b) = (0x51_5100usize, 0x51_5200usize);
+        register(a, start, 0x10000);
+        let Some(first) = find(start + 0x100, 0x40) else {
+            unregister(a, start);
+            return;
+        };
+        assert!(Arc::ptr_eq(&first, &find(start + 0x100, 0x40).unwrap()));
+        // A smaller buffer inside it is the innermost for asks there.
+        register(b, start + 0x80, 0x1000);
+        let inner = find(start + 0x100, 0x40).unwrap();
+        assert!(!Arc::ptr_eq(&first, &inner));
+        assert_eq!(inner.start, start + 0x80);
+        // It goes: the outer one again.
+        unregister(b, start + 0x80);
+        assert!(Arc::ptr_eq(&first, &find(start + 0x100, 0x40).unwrap()));
+        unregister(a, start);
+        drop(first);
+        drop(inner);
+        // Asked on another thread meanwhile, as here: the same answers.
+        register(a, start, 0x10000);
+        let here = find(start + 0x100, 0x40).unwrap();
+        let there = std::thread::scope(|s| s.spawn(|| find(start + 0x100, 0x40)).join().unwrap()).unwrap();
+        assert!(Arc::ptr_eq(&here, &there));
+        unregister(a, start);
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -3883,10 +4049,14 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
+        let before = gone.len();
         for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
             if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
                 gone.extend(entry.shadow.take());
             }
+        }
+        if gone.len() > before {
+            buffers_changed(&map);
         }
     }
     let n = gone.len() as u64;
@@ -3963,7 +4133,23 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    let cache = lookup_cache();
+    if cache {
+        let changes = BUFFERS_CHANGES.load(Ordering::Acquire);
+        match FOUND_HERE.try_with(|found| found.borrow().get(address, end, changes)) {
+            Ok(Some(Some(shadow))) => return Some(shadow),
+            Ok(Some(None)) => return loose(address, end, len <= 1, any),
+            _ => {}
+        }
+    }
+    let remember = |changes: u64, holder: Option<&Arc<Shadow>>| {
+        if cache {
+            let _ = FOUND_HERE.try_with(|found| found.borrow_mut().put(address, end, changes, holder));
+        }
+    };
     let mut map = buffers();
+    // Read under the lock: the count of the buffers as searched here.
+    let changes = BUFFERS_CHANGES.load(Ordering::Relaxed);
     let key = map
         .range(..=(address, usize::MAX))
         .rev()
@@ -3972,6 +4158,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         .map(|(k, _)| *k);
     let Some(key) = key else {
         drop(map);
+        remember(changes, None);
         return loose(address, end, len <= 1, any);
     };
     let entry = map.get_mut(&key)?;
@@ -4035,7 +4222,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         entry.shadow = Some(shadow);
     }
-    entry.shadow.clone()
+    let shadow = entry.shadow.clone();
+    drop(map);
+    if let Some(shadow) = &shadow {
+        remember(changes, Some(shadow));
+    }
+    shadow
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (

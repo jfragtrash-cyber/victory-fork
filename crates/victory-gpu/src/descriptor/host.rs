@@ -2355,24 +2355,30 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     if len == 0 {
         return None;
     }
+    let extent = buffer_extent(view);
+    // The copy of the whole buffer, looked for once for both questions
+    // below: each looked for it, two searches of the title buffers for
+    // nearly every buffer view a draw reads (`readable`).
+    let mut whole: Option<Option<std::sync::Arc<crate::shadow::Shadow>>> = None;
+    let mut whole_copy = |(base, width): (u64, u64)| whole.get_or_insert_with(|| crate::shadow::find(base, width)).clone();
     // A view off its buffer's elements is made on a copy of its own bytes
     // (`own_bytes`): the same question `buffer_srv` and `buffer_uav` ask,
     // of the copy they find, so that the copy brought up to date is the
     // one the slot shows.
-    if let Some((base, width)) = buffer_extent(view)
+    if let Some((base, width)) = extent
         && let Some((first, count, element, stride, unknown)) = buffer_fields(view)
-        && let Some(whole) = crate::shadow::find(base, width)
+        && let Some(whole) = whole_copy((base, width))
         && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
         && let Some(own) = crate::shadow::exact(start, bytes)
     {
         return Some((own, start, bytes));
     }
     if view_extent()
-        && let Some((base, width)) = buffer_extent(view)
+        && let Some((base, width)) = extent
         // (The console is lax: a view may begin past its buffer's end.)
         && address >= base
         && address - base < width.max(1)
-        && let Some(shadow) = crate::shadow::find(base, width)
+        && let Some(shadow) = whole_copy((base, width))
     {
         return Some((shadow, address, len));
     }

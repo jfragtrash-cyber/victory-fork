@@ -4810,6 +4810,7 @@ mod spread_tests {
     fn copies_left_for_the_end_of_a_spreading_are_made_then() {
         use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
         const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        const MEM_TOP_DOWN: u32 = 0x10_0000;
         const LEN: usize = 3 << 20;
         if !spread_copies() {
             return;
@@ -4819,8 +4820,11 @@ mod spread_tests {
         };
         let titles: Vec<usize> = (0..2)
             .map(|k| {
-                // SAFETY: a fresh write-watched allocation, freed at the end.
-                let p = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+                // SAFETY: a fresh write-watched allocation, freed at the end;
+                // from the top, where the other tests' (which expect the
+                // journal to know nothing of their pages) do not come after.
+                let kind = MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH | MEM_TOP_DOWN;
+                let p = unsafe { VirtualAlloc(std::ptr::null(), LEN, kind, PAGE_READWRITE) } as usize;
                 assert_ne!(p, 0);
                 // SAFETY: the allocation's bytes.
                 let bytes = unsafe { std::slice::from_raw_parts_mut(p as *mut u8, LEN) };

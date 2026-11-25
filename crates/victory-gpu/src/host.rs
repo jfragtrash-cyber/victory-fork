@@ -96,7 +96,19 @@ pub(crate) fn now_ms() -> u64 {
 /// second since the start. Host copies of title memory, staging buffers and
 /// host textures note when they were last used with it.
 pub(crate) fn moment() -> u64 {
-    (crate::frame::current() << 32) | ((now_ms() / 100) & 0xffff_ffff)
+    (crate::frame::current() << 32) | (tenths() & 0xffff_ffff)
+}
+
+/// Tenths of a second since the first call, from the system's tick count
+/// (a read of memory the kernel keeps, some 16 ms fine). [`now_ms`] reads
+/// the performance counter, and [`moment`] is asked with every use of a
+/// texture or a host copy: 3 ms a frame of the recording threads in run
+/// P's gameplay.
+fn tenths() -> u64 {
+    static START: OnceLock<u64> = OnceLock::new();
+    // SAFETY: a plain query.
+    let now = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+    now.saturating_sub(*START.get_or_init(|| now)) / 100
 }
 
 /// Whether `moment` lies at least `ms` milliseconds and `frames` frames
@@ -7849,6 +7861,7 @@ impl Meter {
             );
         }
         crate::shadow::exact_line(frames);
+        crate::shadow::lookup_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);

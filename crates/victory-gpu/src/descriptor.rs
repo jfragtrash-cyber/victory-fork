@@ -876,6 +876,7 @@ pub(crate) fn forget(resource: usize) {
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
+    let mut freed = false;
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
@@ -889,22 +890,105 @@ pub(crate) fn forget(resource: usize) {
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+        freed = true;
     }
+    if freed {
+        FORGOTTEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Calls of [`forget`] that freed entries of the table, counted under its
+/// write lock: a view a thread remembers by a table entry's record words
+/// ([`Seen`]) is still that entry's while the count stays. (Entries are
+/// only ever made anew under a later generation.)
+static FORGOTTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether threads remember the views they looked up by record words
+/// ([`Seen`]). On by default; `VICTORY_VIEWS_SEEN=0`: every look takes the
+/// table's read lock, as before.
+fn views_seen() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEWS_SEEN").is_none_or(|v| v != "0"))
+}
+
+/// Views a thread remembers ([`Seen`]).
+const SEEN: usize = 128;
+
+/// The views a thread looked up lately by record words ([`view_at`]). A
+/// view of placed memory is its words' for good (its shape never changes);
+/// a table entry's until [`forget`] frees an entry ([`FORGOTTEN`]). Every
+/// draw looks up the view of each slot its tables hold, on six recording
+/// threads at once, each look under the table's read lock, whose count all
+/// of them change: once looks at slots made from their record no longer
+/// took the lock of the host heap (`host::HostHeap::made`), they would all
+/// have met there instead.
+struct Seen {
+    entries: [Option<(u64, u64, View)>; SEEN],
+}
+
+impl Seen {
+    const fn new() -> Self {
+        Seen {
+            entries: [const { None }; SEEN],
+        }
+    }
+
+    /// The entry the record words `words` go to.
+    fn way(words: u64) -> usize {
+        (words.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 57) as usize % SEEN
+    }
+
+    /// The view remembered for `words`, if it is still theirs while
+    /// [`forget`] has freed entries `forgotten` times.
+    fn get(&self, words: u64, forgotten: u64) -> Option<View> {
+        let (seen, when, view) = self.entries[Self::way(words)].as_ref()?;
+        let placed = (words >> 32) as u32 >> KIND_SHIFT == PLACED;
+        (*seen == words && (placed || *when == forgotten)).then(|| view.clone())
+    }
+
+    /// `words` named `view` while [`forget`] had freed entries `forgotten`
+    /// times.
+    fn put(&mut self, words: u64, forgotten: u64, view: &View) {
+        self.entries[Self::way(words)] = Some((words, forgotten, view.clone()));
+    }
+}
+
+thread_local! {
+    static SEEN_HERE: std::cell::RefCell<Seen> = const { std::cell::RefCell::new(Seen::new()) };
 }
 
 /// The view the record words `i` and `generation` name: the one they hold
 /// whole, or the view of entry `i` if `generation` is still its own.
 fn view_at(i: u32, generation: u32) -> Option<View> {
-    match generation >> KIND_SHIFT {
-        0 => {
-            let views = views_read();
-            let (view, current) = views.list.get(i as usize)?;
-            (*current == generation).then(|| view.clone())
-        }
-        CONSTANT => Some(constant_of(i, generation)),
-        PLACED => views_read().placed_of(i, generation),
-        _ => None,
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
+    let kind = generation >> KIND_SHIFT;
+    match kind {
+        0 | PLACED => {}
+        CONSTANT => return Some(constant_of(i, generation)),
+        _ => return None,
     }
+    let words = u64::from(generation) << 32 | u64::from(i);
+    let seen = views_seen();
+    if seen && let Ok(Some(view)) = SEEN_HERE.try_with(|s| s.borrow().get(words, FORGOTTEN.load(Acquire))) {
+        return Some(view);
+    }
+    let views = views_read();
+    // Read under the lock: the count of the table as looked at here.
+    let forgotten = FORGOTTEN.load(Relaxed);
+    let view = if kind == PLACED {
+        views.placed_of(i, generation)?
+    } else {
+        let (view, current) = views.list.get(i as usize)?;
+        if *current != generation {
+            return None;
+        }
+        view.clone()
+    };
+    drop(views);
+    if seen {
+        let _ = SEEN_HERE.try_with(|s| s.borrow_mut().put(words, forgotten, &view));
+    }
+    Some(view)
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).
@@ -1414,6 +1498,38 @@ mod tests {
         // SAFETY: both slots are in `slots`.
         let (old, new) = unsafe { (*(a as *const [u32; 3]), *(b as *const [u32; 3])) };
         assert_ne!(old, new, "a new generation");
+    }
+
+    /// A thread remembers the views it looked up: a table entry's until an
+    /// entry is freed, a view of placed memory for good; another view in
+    /// the same place takes it over.
+    #[test]
+    fn views_are_remembered_until_an_entry_is_freed() {
+        let entry = View::Shader(0x7778_0000, None);
+        let words = 3u64 << 32 | 9;
+        let placed_words = u64::from(PLACED << KIND_SHIFT | 5) << 32 | 0x1000;
+        let mut seen = Seen::new();
+        assert_eq!(seen.get(words, 4), None);
+        seen.put(words, 4, &entry);
+        assert_eq!(seen.get(words, 4), Some(entry.clone()));
+        assert_eq!(seen.get(words, 5), None, "an entry was freed since");
+        seen.put(placed_words, 4, &View::Constant(1, 2));
+        assert_eq!(seen.get(placed_words, 9), Some(View::Constant(1, 2)));
+        // Other words in the same place.
+        let way = Seen::way(words);
+        let other = (1..u64::MAX).map(|i| words + (i << 32)).find(|&w| Seen::way(w) == way).unwrap();
+        seen.put(other, 4, &View::Constant(3, 4));
+        assert_eq!(seen.get(words, 4), None);
+        assert_eq!(seen.get(other, 4), Some(View::Constant(3, 4)));
+        // Through `view`: a view looked up twice, then its resource released.
+        let null = std::ptr::null();
+        let slot = [0u64; 4];
+        let a = slot.as_ptr() as u64;
+        create_srv(null, 0x7778_0000usize as This, std::ptr::null(), a);
+        assert_eq!(view(a), Some(entry.clone()));
+        assert_eq!(view(a), Some(entry));
+        forget(0x7778_0000);
+        assert_eq!(view(a), None, "stale after release");
     }
 
     /// The title places its shader-visible heap in its own memory

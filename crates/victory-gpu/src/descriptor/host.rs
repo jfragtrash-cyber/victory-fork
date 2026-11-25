@@ -50,6 +50,13 @@ pub(crate) struct HostHeap {
     /// made again in between has another count by then, and stays as that
     /// draw made it, as if the draw had come after the write.
     changes: Vec<std::sync::atomic::AtomicU32>,
+    /// Per title slot: noted as holding no view ([`HostHeap::note_buffer`]
+    /// without one), and not noted since. Such a slot is out of the queue of
+    /// textures, the spans, the set of buffer views and the table of
+    /// strides, and only a note puts it back in any of them: a draw that
+    /// reads it through a table with nothing made there has nothing to do,
+    /// and takes no lock. (Every such read noted it again, under four.)
+    clean: Vec<std::sync::atomic::AtomicBool>,
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
     /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
@@ -1059,6 +1066,7 @@ impl HostHeap {
             slot_locks: (0..SLOT_LOCKS).map(|_| SlotLock::default()).collect(),
             staling: Mutex::new(()),
             changes: (0..count).map(|_| std::sync::atomic::AtomicU32::new(0)).collect(),
+            clean: (0..count).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
             copied: Mutex::new(Vec::new()),
             kept: KeptSlots::new((count + extra) as usize),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
@@ -1687,6 +1695,12 @@ impl HostHeap {
             return Vec::new();
         }
         let change = self.count_change(index);
+        let clean = self.clean.get(index as usize);
+        if view.is_some()
+            && let Some(clean) = clean
+        {
+            clean.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         // Measured for the texture side of the same gap (textures a shader
         // picks by a computed index are neither made, if placed, nor
         // uploaded): slots written with a placed texture view, and with a
@@ -1770,6 +1784,12 @@ impl HostHeap {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(index);
+        }
+        drop(buffers);
+        if view.is_none()
+            && let Some(clean) = clean
+        {
+            clean.store(true, std::sync::atomic::Ordering::Release);
         }
         stale
     }
@@ -2114,6 +2134,16 @@ impl HostHeap {
             return Some(view);
         }
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        // Nothing there, nothing made, nothing noted since it was last
+        // noted so ([`HostHeap::clean`]): as below, with no lock.
+        if view.is_none()
+            && for_draw
+            && slot_locks()
+            && (self.sampler || self.clean[index as usize].load(Acquire))
+            && made.load(Acquire) == 0
+        {
+            return None;
+        }
         // A placed texture view the title wrote may make the views of
         // other slots stale (`Spans::note`): their locks are taken too,
         // under `staling`. No other change of a slot takes a second lock.
@@ -3806,6 +3836,41 @@ mod tests {
         record[0] = 0;
         assert_eq!(heap.mirror(3, record.as_ptr() as u64, true), None);
         assert!(!heap.made(3));
+    }
+
+    /// A slot noted as holding nothing is read by a draw without its lock
+    /// until a view is noted there.
+    #[test]
+    fn a_slot_noted_empty_is_read_without_its_lock() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        if !slot_locks() {
+            return;
+        }
+        let record = [0u32; 8];
+        let empty = record.as_ptr() as u64;
+        // Never noted: under the lock, which notes it.
+        assert!(!heap.clean[5].load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(heap.mirror(5, empty, true), None);
+        assert!(heap.clean[5].load(std::sync::atomic::Ordering::Acquire));
+        let held = heap.lock_slot(5);
+        let (sent, seen) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| sent.send(heap.mirror(5, empty, true)).unwrap());
+            let seen = seen.recv_timeout(std::time::Duration::from_secs(20));
+            drop(held);
+            assert_eq!(seen, Ok(None), "the look waited for the slot's lock");
+        });
+        // A view noted there: not clean any more, until nothing is again.
+        let view = View::Shader(0, None);
+        let [i, generation] = super::super::words_for(view.clone());
+        let written = [VIEW_TAG, i, generation, 0, 0, 0, 0, 0];
+        assert_eq!(heap.mirror(5, written.as_ptr() as u64, true), Some(view));
+        assert!(!heap.clean[5].load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(heap.mirror(5, empty, true), None);
+        assert!(!heap.made(5));
+        assert!(heap.clean[5].load(std::sync::atomic::Ordering::Acquire));
     }
 
     /// A slot made stale by a change of another is made null under its own

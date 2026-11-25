@@ -2220,10 +2220,10 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
     const HIGH: u64 = !LOW;
     let n = now.len().min(was.len());
-    let mut runs = Vec::new();
+    let mut runs = Vec::with_capacity(16);
     // Where the run being walked began.
     let mut open: Option<usize> = None;
-    let mut byte = |at: usize, differs: bool, runs: &mut Vec<(usize, usize)>| {
+    let mut byte = |at: usize, differs: bool, runs: &mut Vec<(usize, usize)>, open: &mut Option<usize>| {
         if differs {
             open.get_or_insert(at);
         } else if let Some(first) = open.take() {
@@ -2232,25 +2232,37 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     };
     let mut i = 0;
     while i + 8 <= n {
+        // Outside a run, stretches of 64 equal bytes at once (the compare
+        // of two slices is the library's vector loop): most of a page the
+        // title rewrote holds its old bytes (run AB: 13 ms a frame in the
+        // merge under shader-written ranges).
+        if open.is_none() {
+            while i + 64 <= n && now[i..i + 64] == was[i..i + 64] {
+                i += 64;
+            }
+            if i + 8 > n {
+                break;
+            }
+        }
         let word = |s: &[u8]| u64::from_le_bytes(s[i..i + 8].try_into().unwrap_or_default());
         let x = word(now) ^ word(was);
         // The top bit of each byte that differs (no carry crosses a byte:
         // seven bits and 0x7f make at most 0xfe).
         let differ = ((x & LOW).wrapping_add(LOW) | x) & HIGH;
         if differ == 0 || differ == HIGH {
-            byte(i, differ != 0, &mut runs);
+            byte(i, differ != 0, &mut runs, &mut open);
         } else {
             for k in 0..8 {
-                byte(i + k, differ >> (8 * k + 7) & 1 != 0, &mut runs);
+                byte(i + k, differ >> (8 * k + 7) & 1 != 0, &mut runs, &mut open);
             }
         }
         i += 8;
     }
     while i < n {
-        byte(i, now[i] != was[i], &mut runs);
+        byte(i, now[i] != was[i], &mut runs, &mut open);
         i += 1;
     }
-    byte(n, false, &mut runs);
+    byte(n, false, &mut runs, &mut open);
     runs
 }
 

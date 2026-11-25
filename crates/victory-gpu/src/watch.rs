@@ -956,9 +956,13 @@ fn uncommitted_end(block: usize) -> (usize, bool) {
 }
 
 /// How long Windows' word that blocks are wholly uncommitted is taken
-/// without asking again, in milliseconds (`VICTORY_ABSENT_KEEP`; 100 by
-/// default, `0` asks at every check as before). Never past the frame it
-/// was said in.
+/// without asking again, in milliseconds (`VICTORY_ABSENT_KEEP`; 1,000 by
+/// default, `0` asks at every check as before), across frames.
+///
+/// (100 ms and never past the frame it was said in, first: run AB's play
+/// still asked about 4,700 runs a frame, each once a frame, 8.3 ms a frame
+/// of `VirtualQuery`, for holes the runtime's remappings, which forget them
+/// at once, change a few times a frame at most.)
 ///
 /// A copy of view memory whose range holds blocks that are not mapped
 /// (placeholders between the title's views, free memory beside them) asked
@@ -979,7 +983,7 @@ fn hole_keep() -> u64 {
         std::env::var("VICTORY_ABSENT_KEEP")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(100)
+            .unwrap_or(1000)
     })
 }
 
@@ -990,7 +994,8 @@ const HOLES_MOST: usize = 1 << 16;
 /// Whether `hole` may still be taken at frame `now_frame` and millisecond
 /// `now_ms`, kept `keep` ms.
 fn fresh(hole: &Hole, now_frame: u64, now_ms: u64, keep: u64) -> bool {
-    keep > 0 && hole.frame == now_frame && now_ms.saturating_sub(hole.ms) < keep
+    let _ = (hole.frame, now_frame);
+    keep > 0 && now_ms.saturating_sub(hole.ms) < keep
 }
 
 /// The run of blocks from `block` on that [`Guards::holes`] holds, if what
@@ -1769,12 +1774,12 @@ mod tests {
         assert_eq!(known_hole(&g, 33), Some((36, true)));
         note_hole(&mut g, 11, 11, false);
         assert_eq!(spans(&g), [(10, 11), (14, 16), (16, 36), (36, 40)]);
-        assert_eq!(known_hole_at(&g, 33, 8, 1001, 100), None, "a frame later");
-        // Freshness: the same frame and less than `keep` ms.
+        assert_eq!(known_hole_at(&g, 33, 8, 1001, 100), Some((36, true)), "a frame later, still fresh");
+        // Freshness: less than `keep` ms, whatever the frame.
         let hole = Hole { end: 1, mapped: false, frame: 7, ms: 1000 };
         assert!(fresh(&hole, 7, 1099, 100));
         assert!(!fresh(&hole, 7, 1100, 100));
-        assert!(!fresh(&hole, 8, 1001, 100), "a frame later");
+        assert!(fresh(&hole, 8, 1001, 100), "a frame later");
         assert!(!fresh(&hole, 7, 1000, 0), "kept for no time at all");
     }
 

@@ -138,9 +138,10 @@ pub(crate) enum C {
     /// answer instead.
     HolesAsked,
     HolesKnown,
-    /// Flushes of refreshes whose copies were spread over the kept threads
-    /// (`shadow::Spreading`), their pieces of work and bytes, and the
-    /// microseconds of every flush's copies left for its end.
+    /// Flushes of refreshes that handed copies to the kept threads
+    /// (`shadow::Spreading`), the pieces and bytes handed over, and the
+    /// microseconds every flush's end took (the rest copied, the wait for
+    /// the pieces).
     SpreadFlushes,
     SpreadJobs,
     SpreadBytes,
@@ -1300,12 +1301,15 @@ pub(crate) fn log(frames: f64) {
         crate::watch::AHEAD_VIEWS.swap(0, Relaxed) as f64 / frames,
     );
     tracing::info!(
-        "  runs of unmapped blocks in guarded ranges per frame: {:.0} asked of Windows, {:.0} passed over on a          recent answer (VICTORY_ABSENT_KEEP=0 asks every time)",
+        "  runs of unmapped blocks in guarded ranges per frame: {:.0} asked of Windows, {:.0} passed over on a \
+         recent answer (VICTORY_ABSENT_KEEP=0 asks every time)",
         c[C::HolesAsked as usize],
         c[C::HolesKnown as usize],
     );
     tracing::info!(
-        "  refresh copies made together at the end of their flush, per frame: {:.2} ms; spread over the kept threads:          {:.1} flushes, {:.0} pieces, {:.1} MB (VICTORY_SPREAD_COPIES=0 copies each where it is found)",
+        "  refresh copies per frame: {:.2} ms at the ends of their flushes (the rest copied, the wait for the kept \
+         threads); handed to the kept threads while the flushes went on: {:.1} flushes, {:.0} pieces, {:.1} MB \
+         (VICTORY_SPREAD_COPIES=0 copies each where it is found)",
         ms(c[C::SpreadUs as usize]),
         c[C::SpreadFlushes as usize],
         c[C::SpreadJobs as usize],

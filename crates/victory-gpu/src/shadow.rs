@@ -104,6 +104,66 @@ struct Card {
     sent: Mutex<Vec<(usize, usize, u64)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// The locks of the CPU side where shaders may be writing, between the
+    /// relay's merge of what the card wrote ([`Shadow::card_merge_relay`])
+    /// and the title's bytes put in beside it ([`Shadow::merge_under_writes`]):
+    /// each holds one 64 KiB block of title memory at a time, from its read
+    /// of title memory until its bytes are in. With [`relay_wide`] a block
+    /// takes the lock of its number, in turn, so that the merges of several
+    /// threads hold blocks of one copy side by side; without it every block
+    /// takes the first, one lock a copy as before.
+    sides: [Mutex<()>; SIDES],
+}
+
+/// [`Card::sides`].
+const SIDES: usize = 16;
+
+impl Card {
+    /// [`Card::sides`] for title memory `[from, to)`: the locks of its
+    /// blocks, in the order of their places (one block, every caller's
+    /// case, is one lock).
+    fn side(&self, from: usize, to: usize) -> Vec<std::sync::MutexGuard<'_, ()>> {
+        let wide = relay_wide() > 1;
+        let mut places: Vec<usize> =
+            (from / PIECE..=to.saturating_sub(1).max(from) / PIECE).map(|b| if wide { b % SIDES } else { 0 }).collect();
+        places.sort_unstable();
+        places.dedup();
+        places.into_iter().map(|i| self.sides[i].lock().unwrap_or_else(|e| e.into_inner())).collect()
+    }
+}
+
+/// How many threads merge what the card wrote into title memory when the
+/// relay lands flights (`VICTORY_RELAY_WIDE`: unset or 0, one, as before;
+/// 1, four; 2 to 8, that many). The thread that lands flights is one of
+/// them; the others are kept for it alone, so the submitting thread's work
+/// on the wide threads ([`wide`]) never waits behind a landing's.
+///
+/// Why: the landing merged the pieces the card's compare flagged one after
+/// the other: run X, about 1,200 pieces (75-81 MB) a frame, each read
+/// against the copy's CPU side, title memory read, merged and written back
+/// (through our own view with `VICTORY_BACK_OWN_VIEW=1`); 46-56 ms a frame
+/// of "copying back" on that thread, of which 6-8 ms waiting for the fetch.
+/// Fence signals and bottom-of-pipe writes behind a flight wait for its
+/// landing, and so do the presents and other points that settle.
+///
+/// A piece is one 64 KiB block of title memory. Pieces of one block (of
+/// any copy, at any address that shows the same physical page) are merged
+/// by one thread in the landing's order; pieces of different blocks touch
+/// different bytes of title memory and of the copies' CPU sides. The title's
+/// bytes put in under shader writes wait for the block, not the copy
+/// ([`Card::sides`]).
+///
+/// Expected: the merge part of "copying back" (~40 ms a frame) to about a
+/// quarter with four threads, so each landing, and the fence signals behind
+/// it, ~4 ms sooner. Measured by the relay line ("landing in all") and the
+/// frame line's "copying back".
+pub(crate) fn relay_wide() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("VICTORY_RELAY_WIDE").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        None | Some(0) => 1,
+        Some(1) => 4,
+        Some(n) => n.min(8),
+    })
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -1453,35 +1513,62 @@ fn workers() -> &'static Workers {
         let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
-                let workers = WORKERS.get().expect("made above");
-                loop {
-                    let job = {
-                        let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
-                        loop {
-                            if let Some(job) = jobs.pop_front() {
-                                break job;
-                            }
-                            jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
-                        }
-                    };
-                    job();
-                }
+                serve(WORKERS.get().expect("made above"));
             });
         }
     });
     workers
 }
 
+/// A kept thread's life: the jobs of `workers`, one after the other.
+fn serve(workers: &Workers) -> ! {
+    loop {
+        let job = {
+            let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if let Some(job) = jobs.pop_front() {
+                    break job;
+                }
+                jobs = workers.more.wait(jobs).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        job();
+    }
+}
+
+/// The threads kept for the relay's merge: `threads` (at the first call,
+/// [`relay_wide`]'s) less the one that lands flights.
+fn relay_workers(threads: usize) -> &'static Workers {
+    static WORKERS: Workers = Workers {
+        jobs: Mutex::new(std::collections::VecDeque::new()),
+        more: std::sync::Condvar::new(),
+    };
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        for i in 0..threads.saturating_sub(1) {
+            let _ = std::thread::Builder::new().name(format!("victory-relay-merge-{i}")).spawn(|| {
+                crate::framelog::keep_on_fast_cores("victory-relay-merge");
+                serve(&WORKERS)
+            });
+        }
+    });
+    &WORKERS
+}
+
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
 fn wide(jobs: Vec<Job>) {
+    wide_on(workers(), jobs);
+}
+
+/// [`wide`] on the threads of `workers`.
+fn wide_on(workers: &Workers, jobs: Vec<Job>) {
     if jobs.len() < 2 {
         for job in jobs {
             job();
         }
         return;
     }
-    let workers = workers();
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1515,6 +1602,84 @@ fn wide(jobs: Vec<Job>) {
 /// refreshes, the merge of what shaders wrote to card copies).
 pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
+}
+
+/// A piece the relay fetched from a copy in the card's memory: the copy,
+/// the piece's offsets in it, and where its bytes came down (an address).
+pub(crate) type FetchedPiece = (Arc<Shadow>, usize, usize, usize);
+
+/// The relay's merge of `pieces`, fetched after send `fetched_after`
+/// ([`Shadow::card_merge_relay`] for each): on [`relay_wide`] threads, the
+/// pieces of one 64 KiB block of title memory on one of them in the order
+/// given, those of other blocks beside it. A block is known by the lowest
+/// address that shows its physical page (`crate::inplace::pages_of`), so
+/// two copies of the same bytes at two addresses are one block. The bytes
+/// written to title memory.
+///
+/// # Safety
+/// Each piece's bytes, `hi - lo` of them at its address, stay readable
+/// until this returns.
+pub(crate) unsafe fn card_merge_relay_all(pieces: &[FetchedPiece], fetched_after: u64) -> usize {
+    // SAFETY: the caller's.
+    unsafe { card_merge_relay_on(pieces, fetched_after, relay_wide()) }
+}
+
+/// [`card_merge_relay_all`] on `threads` threads.
+///
+/// # Safety
+/// As [`card_merge_relay_all`].
+unsafe fn card_merge_relay_on(pieces: &[FetchedPiece], fetched_after: u64, threads: usize) -> usize {
+    let merge = move |piece: &FetchedPiece, title: &mut Vec<u8>| {
+        let (shadow, lo, hi, at) = piece;
+        // SAFETY: the caller's.
+        let gpu = unsafe { std::slice::from_raw_parts(*at as *const u8, hi - lo) };
+        let merged = shadow.card_merge_relay(*lo, gpu, fetched_after, title);
+        shadow.walls_merged(gpu.len(), merged);
+        merged
+    };
+    if threads < 2 || pieces.len() < 8 {
+        let mut title = Vec::new();
+        return pieces.iter().map(|p| merge(p, &mut title)).sum();
+    }
+    let groups = Arc::new(relay_blocks(pieces, |address| {
+        let block = address - address % PIECE;
+        crate::inplace::pages_of(block).into_iter().min().unwrap_or(block)
+    }));
+    let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let written = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let jobs: Vec<Job> = (0..threads)
+        .map(|_| {
+            let (groups, next, written) = (groups.clone(), next.clone(), written.clone());
+            Box::new(move || {
+                let mut title = Vec::new();
+                while let Some(group) = groups.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    for piece in group {
+                        written.fetch_add(merge(piece, &mut title), Ordering::Relaxed);
+                    }
+                }
+            }) as Job
+        })
+        .collect();
+    wide_on(relay_workers(threads), jobs);
+    written.load(Ordering::Relaxed)
+}
+
+/// [`card_merge_relay_all`]'s groups: the pieces by the block `block_of`
+/// names for the title address of each one's first byte, each group in the
+/// order the pieces were given, the groups in the order of their first
+/// piece.
+fn relay_blocks(pieces: &[FetchedPiece], block_of: impl Fn(usize) -> usize) -> Vec<Vec<FetchedPiece>> {
+    let mut at: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut groups: Vec<Vec<FetchedPiece>> = Vec::new();
+    for piece in pieces {
+        let block = block_of(piece.0.start as usize + piece.1);
+        let i = *at.entry(block).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[i].push(piece.clone());
+    }
+    groups
 }
 
 /// Whether the copies of title memory a flush of a submission's refreshes
@@ -3543,8 +3708,10 @@ impl Shadow {
                 // puts what the card wrote into title memory and into the
                 // reference under the same lock, and a page read before
                 // such a merge and compared after it would take the card's
-                // bytes for the title's.
-                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                // bytes for the title's. (A copy in the card's memory: the
+                // lock of the page's block, `Card::sides`.)
+                let side = self.card.as_ref().map(|card| card.side(lo, hi));
+                let mut before = side.is_none().then(|| self.before.lock().unwrap_or_else(|e| e.into_inner()));
                 // A page that is not there is left as it is, and looked at
                 // again next time.
                 if !crate::host::read_into(lo as *const u8, title) {
@@ -3568,7 +3735,7 @@ impl Shadow {
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                     }
                 } else {
-                    let Some(snapshot) = before.as_mut() else {
+                    let Some(snapshot) = before.as_mut().and_then(|b| b.as_mut()) else {
                         return true;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
@@ -3586,6 +3753,7 @@ impl Shadow {
                     }
                 }
                 drop(before);
+                drop(side);
                 // Taken, if the range holds all of the page that is in the
                 // copy; else the rest of it is the refresh's, which notes
                 // only whole pages, and the page is looked at again.
@@ -4067,10 +4235,9 @@ impl Shadow {
     /// had not received when the fetch ran, those still to go up and those
     /// that went up with a later send. There the card's side is the older
     /// one, and taking it for a shader's write would put it over what the
-    /// title wrote. Under the CPU side's lock (the snapshot's, which such
-    /// a copy has no other use for), as [`Shadow::merge_under_writes`].
-    /// `title` is scratch memory. Returns the bytes written to title
-    /// memory.
+    /// title wrote. Under the CPU side's lock of the block ([`Card::sides`]),
+    /// as [`Shadow::merge_under_writes`]. `title` is scratch memory. Returns
+    /// the bytes written to title memory.
     pub(crate) fn card_merge_relay(&self, at: usize, gpu: &[u8], fetched_after: u64, title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         let Some(card) = &self.card else {
@@ -4079,11 +4246,11 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
-        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let _side = card.side(start + at, start + at + gpu.len());
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
-        // does write it (the title's bytes put in under shader writes)
-        // holds the lock held here.
+        // does write it (the title's bytes put in under shader writes, the
+        // merge of another piece of the block) holds the lock held here.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, held) else {
             return 0;
@@ -4523,6 +4690,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     size,
+                    sides: Default::default(),
                 };
                 (on_card, Some(card))
             }
@@ -4758,6 +4926,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 size: len,
+                sides: Default::default(),
             };
             (on_card, Some(card))
         }
@@ -5059,6 +5228,7 @@ mod card_merge_tests {
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
+                sides: Default::default(),
             });
             // As `card_dirty` with the mark set by the old-way fetch.
             if let Some(card) = &shadow.card {
@@ -5079,6 +5249,101 @@ mod card_merge_tests {
         // older card byte is taken for a shader's write.
         let before = land(7);
         assert_eq!(before[title_byte], content[title_byte]);
+    }
+
+    /// The relay's merge on several threads (`card_merge_relay_on`) leaves
+    /// title memory and the copies' CPU sides as one thread leaves them:
+    /// pieces of many blocks; one block twice (two flights' ranges cut it
+    /// differently); and a second copy of the same title memory whose card
+    /// wrote other bytes of one of those blocks, merged after the first.
+    #[test]
+    fn the_relay_merges_on_several_threads_as_on_one() {
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        const PIECE: usize = 64 << 10;
+        const PIECES: usize = 24;
+        const LEN: usize = PIECES * PIECE;
+        let content: Vec<u8> = (0..LEN).map(|i| (i * 13 + 5) as u8).collect();
+        let card = || Card {
+            staging: staging.clone(),
+            before: Mutex::new(None),
+            dirty: Mutex::default(),
+            sent: Mutex::default(),
+            // 0: no card bytes counted (`Drop` takes them off again).
+            size: 0,
+            sides: Default::default(),
+        };
+        // What the card holds after its shaders ran: of copy A, some bytes
+        // of every piece; of copy B, other bytes of piece 9.
+        let mut card_a = content.clone();
+        for p in 0..PIECES {
+            for k in 0..=p % 5 {
+                card_a[p * PIECE + 97 * k + 31 * p] ^= 0xa5;
+            }
+        }
+        let mut card_b = content.clone();
+        card_b[9 * PIECE + 40_000] ^= 0x3c;
+        card_b[9 * PIECE + 50_000] ^= 0x3c;
+        let land = |threads: usize| -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+            // Title memory on a 64 KiB line, as the pieces are cut.
+            let mut memory = vec![0u8; LEN + PIECE];
+            let skip = memory.as_ptr().align_offset(PIECE);
+            let title = &mut memory[skip..skip + LEN];
+            title.copy_from_slice(&content);
+            let (mut side_a, mut side_b) = (content.clone(), content.clone());
+            let mut a = Shadow::new(buffer.clone(), side_a.as_mut_ptr(), 0, title.as_ptr() as u64, LEN as u64);
+            a.card = Some(card());
+            let mut b = Shadow::new(buffer.clone(), side_b.as_mut_ptr(), 0, title.as_ptr() as u64, LEN as u64);
+            b.card = Some(card());
+            let (a, b) = (std::sync::Arc::new(a), std::sync::Arc::new(b));
+            let at = |bytes: &Vec<u8>, lo: usize| bytes.as_ptr() as usize + lo;
+            let mut pieces: Vec<super::FetchedPiece> =
+                (0..PIECES).map(|p| (a.clone(), p * PIECE, (p + 1) * PIECE, at(&card_a, p * PIECE))).collect();
+            // Piece 5 again, cut by a later flight's range; then B's piece 9.
+            pieces.push((a.clone(), 5 * PIECE + 1000, 6 * PIECE, at(&card_a, 5 * PIECE + 1000)));
+            pieces.push((b.clone(), 9 * PIECE, 10 * PIECE, at(&card_b, 9 * PIECE)));
+            // SAFETY: the card's bytes live through the call.
+            let written = unsafe { super::card_merge_relay_on(&pieces, 0, threads) };
+            assert!(written > 0);
+            drop(pieces);
+            drop((a, b));
+            (title.to_vec(), side_a, side_b)
+        };
+        let one = land(1);
+        let four = land(4);
+        // Every byte the cards changed is in title memory, and nothing else.
+        let mut wanted = card_a.clone();
+        for i in [9 * PIECE + 40_000, 9 * PIECE + 50_000] {
+            wanted[i] = card_b[i];
+        }
+        assert!(one.0 == wanted, "one thread: title memory is not what the cards wrote");
+        assert!(four.0 == one.0, "four threads: title memory differs from one thread's");
+        assert!(four.1 == one.1 && four.1 == card_a, "four threads: copy A's CPU side differs");
+        assert!(four.2 == one.2 && four.2 == card_b, "four threads: copy B's CPU side differs");
+    }
+
+    /// Pieces go to groups by their block, the groups in the order of their
+    /// first piece and each in the order given; two addresses of one
+    /// physical page are one block.
+    #[test]
+    fn the_relay_groups_pieces_by_block() {
+        let Some(buffer) = warp_buffer() else {
+            return;
+        };
+        const PIECE: usize = 64 << 10;
+        let mut side = vec![0u8; 8 * PIECE];
+        let start = 0x10_0000_0000usize;
+        let shadow = std::sync::Arc::new(Shadow::new(buffer, side.as_mut_ptr(), 0, start as u64, side.len() as u64));
+        let piece = |lo: usize, tag: usize| (shadow.clone(), lo, lo + 16, tag);
+        let pieces = vec![piece(3 * PIECE, 0), piece(PIECE, 1), piece(3 * PIECE + 100, 2), piece(6 * PIECE, 3), piece(PIECE + 9, 4)];
+        // Block 6 is the same page as block 1, shown at another address.
+        let groups = super::relay_blocks(&pieces, |address| {
+            let block = address - address % PIECE;
+            if block == start + 6 * PIECE { start + PIECE } else { block }
+        });
+        let tags: Vec<Vec<usize>> = groups.iter().map(|g| g.iter().map(|p| p.3).collect()).collect();
+        assert_eq!(tags, [vec![0, 2], vec![1, 3, 4]]);
     }
 }
 

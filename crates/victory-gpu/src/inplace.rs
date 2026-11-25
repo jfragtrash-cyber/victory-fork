@@ -860,9 +860,15 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
         }
         view.committed[block / 64] |= 1u64 << (block % 64);
     }
-    // SAFETY: committed bytes inside our own view; the source is the
-    // caller's slice.
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (view.base + offset as usize) as *mut u8, bytes.len()) };
+    // The bytes go in outside the lock: the merges of several threads
+    // (`crate::shadow::relay_wide`) each store a page of their own, and
+    // under it they stored one after the other.
+    let into = view.base + offset as usize;
+    drop(own);
+    // SAFETY: committed bytes inside our own view, which is never unmapped
+    // (one forgotten stays mapped, `title_memory_section`); the source is
+    // the caller's slice.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), into as *mut u8, bytes.len()) };
     Some(shown)
 }
 

@@ -4906,16 +4906,12 @@ impl Host {
             CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
             CARD_STATS[6].fetch_add(us, Ordering::Relaxed);
         }
-        let mut title = Vec::new();
-        let mut written = 0;
-        for (shadow, lo, hi, at) in &pieces {
-            // SAFETY: the mapping of the fetched bytes, `total` of them;
-            // the copy into it has run.
-            let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
-            shadow.walls_merged(gpu.len(), merged);
-            written += merged;
-        }
+        // On several threads with `crate::shadow::relay_wide`, else here.
+        let fetched: Vec<crate::shadow::FetchedPiece> =
+            pieces.iter().map(|(shadow, lo, hi, at)| (shadow.clone(), *lo, *hi, data + *at as usize)).collect();
+        // SAFETY: the mapping of the fetched bytes, `total` of them, which
+        // this thread keeps; the copy into it has run.
+        let written = unsafe { crate::shadow::card_merge_relay_all(&fetched, after) };
         copy_back(1, written as u64);
         // Sends up to `after` are of no use to any later merge; with the
         // fetch inside flights only those up to these plans' are

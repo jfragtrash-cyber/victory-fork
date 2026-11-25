@@ -142,16 +142,64 @@ pub(crate) fn cards() -> bool {
 /// The smallest title buffer whose copy goes to the card's memory, and the
 /// most bytes of such copies (their "before" twins not counted: a copy
 /// shaders write takes its size twice), both in bytes:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (16) and `VICTORY_CARD_BUFFERS_MB` (512).
+/// `VICTORY_CARD_BUFFERS_MIN_MB` and `VICTORY_CARD_BUFFERS_MB` (16 and 512
+/// on a card under 16 GiB).
 /// Run 69's gameplay has ten title buffers of 16 MiB or more, 494 MB, and
 /// 1,650 MB of the card's budget free.
+///
+/// Unset, both follow the card ([`card_room`]).
 fn card_limits() -> (u64, u64) {
-    static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
-    *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
-            std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
-        };
-        (mb("VICTORY_CARD_BUFFERS_MIN_MB", 16).max(1 << 20), mb("VICTORY_CARD_BUFFERS_MB", 512))
+    let [least, most, _] = card_switches();
+    let room = card_room();
+    (least.unwrap_or(room.0).max(1 << 20), most.unwrap_or(room.1))
+}
+
+/// `VICTORY_CARD_BUFFERS_MIN_MB`, `VICTORY_CARD_BUFFERS_MB` and
+/// `VICTORY_CARD_WINDOWS_MB`, in bytes, where set.
+fn card_switches() -> [Option<u64>; 3] {
+    static SET: std::sync::OnceLock<[Option<u64>; 3]> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| {
+        ["VICTORY_CARD_BUFFERS_MIN_MB", "VICTORY_CARD_BUFFERS_MB", "VICTORY_CARD_WINDOWS_MB"]
+            .map(|name| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).map(|v| v << 20))
+    })
+}
+
+/// The card's room for copies when no switch says: the smallest title
+/// buffer whose copy goes there, the most bytes of such copies, and the
+/// most bytes of windows outside buffers there. On a card whose budget
+/// (what the system gives us of its memory) is 16 GiB or more: buffers
+/// from 1 MiB on and windows, each up to a sixth of the budget. On a
+/// smaller card, as before: 16 MiB, 512 MB, no windows. `card_for` and
+/// `window_card_for` still leave a fifth of the budget free, so textures
+/// keep their room.
+///
+/// Measured on an RTX 3090 (24 GB, MOONSHOT.md, world runs 3 to 5, the
+/// same scenes): frames went from 974 to 703 ms in the opening cutscene and
+/// from 521 to 342 ms in play, the card's time from 269 to 215 ms and from
+/// 147 to 120 ms. The card reads scattered data from its own memory 28
+/// times faster than from the PC's (MOONSHOT.md, shader reads timed per
+/// kind of memory).
+/// Not measured on a smaller card, hence the line at 16 GiB.
+fn card_room() -> (u64, u64, u64) {
+    static ROOM: std::sync::OnceLock<(u64, u64, u64)> = std::sync::OnceLock::new();
+    const BEFORE: (u64, u64, u64) = (16 << 20, 512 << 20, 0);
+    if let Some(room) = ROOM.get() {
+        return *room;
+    }
+    // Asked before the card is known: today's numbers, not kept.
+    let Some([budget, ..]) = host().and_then(|h| h.video_memory()) else {
+        return BEFORE;
+    };
+    *ROOM.get_or_init(|| {
+        let room = if budget >= 16 << 30 { (1 << 20, budget / 6, budget / 6) } else { BEFORE };
+        tracing::info!(
+            budget_mb = budget >> 20,
+            buffers_from_mb = room.0 >> 20,
+            buffers_mb = room.1 >> 20,
+            windows_mb = room.2 >> 20,
+            "room for copies in the card's memory"
+        );
+        room
     })
 }
 
@@ -225,7 +273,8 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 }
 
 /// The most bytes of windows outside buffers whose copies go to the card's
-/// memory (`VICTORY_CARD_WINDOWS_MB`; 0, the default, none).
+/// memory (`VICTORY_CARD_WINDOWS_MB`; unset, [`card_room`]'s: none on a
+/// card under 16 GiB).
 ///
 /// Windows are two thirds of the PC memory the card shares (run 104: 861
 /// windows, 3,552 MB of 5,400), and every draw that takes vertices, indices
@@ -243,10 +292,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 /// memory, so the memory shared with the card does not shrink by this
 /// alone; what moves is what shaders read.
 fn window_card_most() -> u64 {
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
-    })
+    card_switches()[2].unwrap_or_else(|| card_room().2)
 }
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).

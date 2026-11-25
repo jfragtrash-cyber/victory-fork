@@ -7589,8 +7589,16 @@ fn direct_writes() -> bool {
 }
 
 /// Copies host memory into title memory after a submission (what shaders
-/// wrote), leaving pages that are not mapped alone.
+/// wrote), leaving pages that are not mapped alone; the pieces of it in
+/// copies of physical pages reach their source pages too
+/// (`crate::alias::push`).
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    write_mapped_plain(dst, src, len);
+    crate::alias::push(dst as usize, len);
+}
+
+/// [`write_mapped`] without the copies' sources.
+pub(crate) fn write_mapped_plain(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let direct = direct_writes();

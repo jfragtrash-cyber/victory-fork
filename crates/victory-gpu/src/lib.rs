@@ -42,6 +42,8 @@ pub mod frame;
 #[cfg(windows)]
 pub mod framelog;
 #[cfg(windows)]
+mod alias;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
@@ -80,6 +82,8 @@ mod texture;
 #[cfg(windows)]
 mod watch;
 
+#[cfg(windows)]
+pub use alias::{title_memory_copied, title_memory_copies};
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]

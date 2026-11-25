@@ -1087,6 +1087,15 @@ fn alias_copies() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_COPY").is_some_and(|v| v == "1"))
 }
 
+/// Where the title shows the page the copy at `page` holds, if a view of
+/// its does (`victory_gpu::title_memory_copies`): the GPU side keeps the
+/// copy in step with it.
+fn copy_source(page: usize) -> Option<usize> {
+    let physical = physical();
+    let slice = physical.copied.get(&page)?.as_ref()?;
+    physical.shown.get(&slice.key(0))?.first().copied()
+}
+
 /// Makes the placeholder page at `page` memory of ours, committed and
 /// write-watched ([`alias_copies`]). False if the host refuses.
 fn make_copy_page(page: usize) -> bool {
@@ -1161,6 +1170,7 @@ fn map_alias_copy(physical: &mut Physical, to: usize, from: usize, len: usize) -
                 // SAFETY: a page of ours, committed.
                 unsafe { std::ptr::write_bytes(page as *mut u8, 0, PAGE) };
                 physical.copied.insert(page, None);
+                victory_gpu::title_memory_copied(page, false);
             }
             Some(slice) => {
                 if !physical.copied.contains_key(&page) && !make_copy_page(page) {
@@ -1176,6 +1186,8 @@ fn map_alias_copy(physical: &mut Physical, to: usize, from: usize, len: usize) -
                 unsafe { std::ptr::copy_nonoverlapping((from + k * PAGE) as *const u8, page as *mut u8, PAGE) };
                 physical.copies.entry(slice.key(0)).or_default().push(page);
                 physical.copied.insert(page, Some(slice.clone()));
+                victory_gpu::title_memory_copies(copy_source);
+                victory_gpu::title_memory_copied(page, true);
             }
         }
         victory_gpu::title_memory_remapped(page, PAGE);
@@ -1431,6 +1443,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             }
             // SAFETY: a page of ours made from a placeholder.
             unsafe { VirtualFree(page as *mut c_void, PAGE, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
+            victory_gpu::title_memory_copied(page, false);
             victory_gpu::title_memory_remapped(page, PAGE);
             run = match run {
                 Some((from, n)) if from + n * PAGE == page => Some((from, n + 1)),

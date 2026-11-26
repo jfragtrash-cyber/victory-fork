@@ -8557,6 +8557,7 @@ impl Meter {
         crate::shadow::lookup_line(frames);
         crate::descriptor::sync_line(frames);
         crate::watch::shared_line(frames);
+        crate::watch::rest_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);

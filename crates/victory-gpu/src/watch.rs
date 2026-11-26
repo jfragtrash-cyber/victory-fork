@@ -23,7 +23,7 @@
 //! [`MANY_VIEWS`] views). A
 //! system call writing into a guarded block fails (none is known to).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Mutex, RwLock};
 
@@ -148,9 +148,14 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     // failed, was asked again by halves down to single ranges, failing
     // each time, and the range then went to `writes` all the same (after
     // triippywhale d0581a55). `VICTORY_VIEW_ASK=1` asks as before.
+    // (The guards looked at once for all the pieces, not once a piece:
+    // run AM, 0.3 ms a frame taking their lock.)
     #[cfg(feature = "diagnostics")]
     let all = pieces.len();
-    pieces.retain(|&(first, _)| !known_view(first * PAGE));
+    if !views_asked() {
+        let g = guards_shared();
+        pieces.retain(|&(first, _)| !known_view_in(&g, first * PAGE));
+    }
     #[cfg(feature = "diagnostics")]
     AHEAD_VIEWS.fetch_add((all - pieces.len()) as u64, std::sync::atomic::Ordering::Relaxed);
     j.ahead_asked = j.next_asking();
@@ -612,28 +617,44 @@ fn unchanged(g: &Guards, first: usize, last: usize) -> bool {
 
 /// [`unchanged`], with `hole` what is known of the hole at a block.
 fn unchanged_with(g: &Guards, first: usize, last: usize, hole: impl Fn(&Guards, usize) -> Option<(usize, bool)>) -> bool {
-    let mut clean = g.clean.range(first..last).copied().peekable();
     // As `guard`'s walk: the end of the hole the last absent block lay in.
     let mut hole_until = first;
-    for block in first..last {
-        if clean.next_if_eq(&block).is_some() {
-            continue;
+    let mut at = first;
+    loop {
+        // Clean blocks pass, and absent ones inside that hole.
+        let block = next_open(g, at, hole_until, last);
+        if block == last {
+            return true;
         }
         // Not clean and not absent: `guard` takes it for written.
-        if !g.absent.contains(&block) {
+        if !g.absent.contains(block) {
             return false;
         }
-        if block >= hole_until {
-            // Not known lately: `guard` asks Windows (and notes the answer).
-            let Some((end, _)) = hole(g, block) else {
-                return false;
-            };
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::HolesKnown, 1);
-            hole_until = end;
-        }
+        // Absent past the hole (`next_open` passed over those inside it).
+        // Not known lately: `guard` asks Windows (and notes the answer).
+        let Some((end, _)) = hole(g, block) else {
+            return false;
+        };
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::HolesKnown, 1);
+        hole_until = end;
+        at = block + 1;
     }
-    true
+}
+
+/// The first block of `[at, last)` that [`guard`]'s walk must look at:
+/// not clean, nor absent before `hole_until` (inside the hole the walk
+/// last found). Read a word of 64 blocks at a time.
+fn next_open(g: &Guards, at: usize, hole_until: usize, last: usize) -> usize {
+    let inside = hole_until.min(last);
+    if at < inside {
+        let block = Blocks::first_in_none(&g.clean, Some(&g.absent), at, inside);
+        if block < inside {
+            return block;
+        }
+        return g.clean.first_unset(inside, last);
+    }
+    g.clean.first_unset(at, last)
 }
 
 /// Diagnostics: one in 2,048 of the askings the kernel's write watch
@@ -654,7 +675,7 @@ fn failed_asking(start: usize, end: usize) {
     let (protected, clean, absent, viewed, aliased) = {
         let g = guards_shared();
         let b = start / BLOCK;
-        (g.protected.contains(&b), g.clean.contains(&b), g.absent.contains(&b), g.viewed.contains(&b), g.aliased.contains(&b))
+        (g.protected.contains(b), g.clean.contains(b), g.absent.contains(b), g.viewed.contains(b), g.aliased.contains(b))
     };
     tracing::info!(
         "a failed write-watch asking (one in 2048): {start:#x}+{:#x}; Windows says (answered {n}): base {:#x} region {:#x} state {:#x} type {:#x} protect {:#x} allocation protect {:#x}; \
@@ -716,7 +737,7 @@ const BLOCK: usize = PAGE;
 /// Whether the guarded block holding `at` is clean: guarded and not
 /// written since (a look at the guards' set, nothing asked of Windows).
 pub(crate) fn block_clean(at: usize) -> bool {
-    guards_shared().clean.contains(&(at / BLOCK))
+    guards_shared().clean.contains(at / BLOCK)
 }
 
 fn known_view(start: usize) -> bool {
@@ -737,29 +758,280 @@ fn views_asked() -> bool {
 /// [`known_view`]'s look at the guards `g`, the switches aside.
 fn known_view_in(g: &Guards, start: usize) -> bool {
     let first = start / BLOCK;
-    g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
+    g.protected.contains(first) || g.absent.contains(first) || (view_known() && g.viewed.contains(first))
+}
+
+/// Blocks to a chunk of [`Blocks`]: 2 GiB of title memory, 4 KiB of bits.
+const CHUNK_SHIFT: u32 = 15;
+const CHUNK: usize = 1 << CHUNK_SHIFT;
+const CHUNK_WORDS: usize = CHUNK / 64;
+
+/// A set of block numbers held as bits, in chunks of [`CHUNK`] blocks made
+/// when a block of theirs is first set (and kept), in chunk order: what a
+/// range holds is read 64 blocks to a word.
+///
+/// The guards' sets were `BTreeSet`s. Run AM's profile of the submitting
+/// thread has 2.3 ms a frame of B-tree walks under [`guard`] (each check
+/// read the range's clean blocks off the set into a vector, and looked up
+/// the others one by one), 2.0 ms more in its loop over the blocks, and
+/// 1.6 ms of lookups in [`known_view`]: a frame checks some 150,000 blocks,
+/// nearly all clean.
+struct Blocks {
+    chunks: Vec<Chunk>,
+    /// Blocks set, in all chunks.
+    len: usize,
+}
+
+struct Chunk {
+    /// Its number: blocks `[at * CHUNK, (at + 1) * CHUNK)`.
+    at: usize,
+    /// How many of them are set.
+    set: usize,
+    bits: Box<[u64; CHUNK_WORDS]>,
+}
+
+/// The bits `[lo, hi)` of a word (`lo < hi <= 64`).
+fn word_mask(lo: usize, hi: usize) -> u64 {
+    (u64::MAX >> (64 - (hi - lo))) << lo
+}
+
+/// The words holding blocks `[lo, hi)` of a chunk (`lo < hi <= CHUNK`), each
+/// with the mask of those blocks in it.
+fn chunk_words(lo: usize, hi: usize) -> impl Iterator<Item = (usize, u64)> {
+    (lo / 64..hi.div_ceil(64)).map(move |w| (w, word_mask(lo.max(w * 64) - w * 64, hi.min(w * 64 + 64) - w * 64)))
+}
+
+/// The set bits of a word, lowest first.
+struct Ones(u64);
+
+impl Iterator for Ones {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        let bit = (self.0 != 0).then(|| self.0.trailing_zeros() as usize);
+        self.0 &= self.0.wrapping_sub(1);
+        bit
+    }
+}
+
+impl Blocks {
+    const fn new() -> Blocks {
+        Blocks { chunks: Vec::new(), len: 0 }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn chunk(&self, at: usize) -> Option<&Chunk> {
+        let i = self.chunks.binary_search_by_key(&at, |c| c.at).ok()?;
+        Some(&self.chunks[i])
+    }
+
+    /// The chunk numbered `at`, made if there is none.
+    fn chunk_made(chunks: &mut Vec<Chunk>, at: usize) -> &mut Chunk {
+        let i = match chunks.binary_search_by_key(&at, |c| c.at) {
+            Ok(i) => i,
+            Err(i) => {
+                chunks.insert(i, Chunk { at, set: 0, bits: Box::new([0; CHUNK_WORDS]) });
+                i
+            }
+        };
+        &mut chunks[i]
+    }
+
+    /// The chunks that hold blocks of `[from, to)`.
+    fn chunks_in(&self, from: usize, to: usize) -> &[Chunk] {
+        if from >= to {
+            return &[];
+        }
+        let (first, last) = (from >> CHUNK_SHIFT, (to - 1) >> CHUNK_SHIFT);
+        let start = self.chunks.partition_point(|c| c.at < first);
+        let end = start + self.chunks[start..].partition_point(|c| c.at <= last);
+        &self.chunks[start..end]
+    }
+
+    /// The blocks of `[from, to)` that lie in chunk `c`, as its own (`lo..hi`).
+    fn local(c: usize, from: usize, to: usize) -> (usize, usize) {
+        let base = c << CHUNK_SHIFT;
+        (from.max(base) - base, to.min(base + CHUNK) - base)
+    }
+
+    fn contains(&self, block: usize) -> bool {
+        let o = block & (CHUNK - 1);
+        self.chunk(block >> CHUNK_SHIFT).is_some_and(|c| (c.bits[o / 64] >> (o % 64)) & 1 != 0)
+    }
+
+    /// Sets `block`; true if it was not set.
+    fn insert(&mut self, block: usize) -> bool {
+        let c = Self::chunk_made(&mut self.chunks, block >> CHUNK_SHIFT);
+        let (o, bit) = (block & (CHUNK - 1), 1 << (block % 64));
+        let new = c.bits[o / 64] & bit == 0;
+        c.bits[o / 64] |= bit;
+        c.set += usize::from(new);
+        self.len += usize::from(new);
+        new
+    }
+
+    /// Clears `block`; true if it was set.
+    fn remove(&mut self, block: usize) -> bool {
+        let Ok(i) = self.chunks.binary_search_by_key(&(block >> CHUNK_SHIFT), |c| c.at) else {
+            return false;
+        };
+        let c = &mut self.chunks[i];
+        let (o, bit) = (block & (CHUNK - 1), 1 << (block % 64));
+        let was = c.bits[o / 64] & bit != 0;
+        c.bits[o / 64] &= !bit;
+        c.set -= usize::from(was);
+        self.len -= usize::from(was);
+        was
+    }
+
+    /// Sets blocks `[from, to)`.
+    fn insert_range(&mut self, from: usize, to: usize) {
+        let mut at = from;
+        while at < to {
+            let n = at >> CHUNK_SHIFT;
+            let (lo, hi) = Self::local(n, at, to);
+            let c = Self::chunk_made(&mut self.chunks, n);
+            let mut added = 0;
+            for (w, mask) in chunk_words(lo, hi) {
+                added += (mask & !c.bits[w]).count_ones() as usize;
+                c.bits[w] |= mask;
+            }
+            c.set += added;
+            self.len += added;
+            at = (n + 1) << CHUNK_SHIFT;
+        }
+    }
+
+    /// Clears blocks `[from, to)`.
+    fn remove_range(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let (first, last) = (from >> CHUNK_SHIFT, (to - 1) >> CHUNK_SHIFT);
+        let start = self.chunks.partition_point(|c| c.at < first);
+        for c in self.chunks[start..].iter_mut().take_while(|c| c.at <= last) {
+            if c.set == 0 {
+                continue;
+            }
+            let (lo, hi) = Self::local(c.at, from, to);
+            let mut gone = 0;
+            for (w, mask) in chunk_words(lo, hi) {
+                gone += (c.bits[w] & mask).count_ones() as usize;
+                c.bits[w] &= !mask;
+            }
+            c.set -= gone;
+            self.len -= gone;
+        }
+    }
+
+    /// How many blocks of `[from, to)` are set.
+    fn count_in(&self, from: usize, to: usize) -> usize {
+        self.chunks_in(from, to)
+            .iter()
+            .filter(|c| c.set != 0)
+            .map(|c| match Self::local(c.at, from, to) {
+                (0, CHUNK) => c.set,
+                (lo, hi) => chunk_words(lo, hi).map(|(w, mask)| (c.bits[w] & mask).count_ones() as usize).sum(),
+            })
+            .sum()
+    }
+
+    /// The set blocks of `[from, to)`, lowest first.
+    fn iter_in(&self, from: usize, to: usize) -> impl Iterator<Item = usize> + '_ {
+        self.chunks_in(from, to).iter().filter(|c| c.set != 0).flat_map(move |c| {
+            let (lo, hi) = Self::local(c.at, from, to);
+            let base = c.at << CHUNK_SHIFT;
+            chunk_words(lo, hi).flat_map(move |(w, mask)| Ones(c.bits[w] & mask).map(move |o| base + w * 64 + o))
+        })
+    }
+
+    /// Whether every block of `[from, to)` is set.
+    fn all_in(&self, from: usize, to: usize) -> bool {
+        from >= to || self.first_unset(from, to) == to
+    }
+
+    /// The first block of `[from, to)` not set; `to` if all are.
+    fn first_unset(&self, from: usize, to: usize) -> usize {
+        Self::first_in_none(self, None, from, to)
+    }
+
+    /// The first block of `[from, to)` set neither in `a` nor in `b`; `to`
+    /// if there is none.
+    fn first_in_none(a: &Blocks, b: Option<&Blocks>, from: usize, to: usize) -> usize {
+        let mut at = from;
+        while at < to {
+            let n = at >> CHUNK_SHIFT;
+            let (ca, cb) = (a.chunk(n), b.and_then(|b| b.chunk(n)));
+            if ca.is_none() && cb.is_none() {
+                return at;
+            }
+            if !ca.is_some_and(|c| c.set == CHUNK) && !cb.is_some_and(|c| c.set == CHUNK) {
+                let (lo, hi) = Self::local(n, at, to);
+                for (w, mask) in chunk_words(lo, hi) {
+                    let free = !(ca.map_or(0, |c| c.bits[w]) | cb.map_or(0, |c| c.bits[w])) & mask;
+                    if free != 0 {
+                        return (n << CHUNK_SHIFT) + w * 64 + free.trailing_zeros() as usize;
+                    }
+                }
+            }
+            at = (n + 1) << CHUNK_SHIFT;
+        }
+        to
+    }
+}
+
+#[cfg(test)]
+impl FromIterator<usize> for Blocks {
+    fn from_iter<I: IntoIterator<Item = usize>>(blocks: I) -> Blocks {
+        let mut set = Blocks::new();
+        for block in blocks {
+            set.insert(block);
+        }
+        set
+    }
 }
 
 struct Guards {
     /// Blocks we made read-only.
-    protected: BTreeSet<usize>,
-    /// Of those, the ones not written since a copy took them.
-    clean: BTreeSet<usize>,
+    protected: Blocks,
+    /// Of those, the ones not written since a copy took them (always some
+    /// of `protected`: what leaves that set leaves this one).
+    clean: Blocks,
     /// Blocks already copied as zeros. While they remain wholly uncommitted,
     /// the copy can skip hundreds of MB of failing kernel reads per world frame.
-    absent: BTreeSet<usize>,
+    absent: Blocks,
     /// Blocks whose physical page was guarded together with its other views
     /// (those views' blocks are in it too): a write to one opens them all.
     /// A write range can be huge (`fread`), so only these are looked up.
-    aliased: BTreeSet<usize>,
+    aliased: Blocks,
     /// With [`view_known`]: blocks made read-only at least once since the
     /// runtime last mapped or unmapped them. They are view memory whether
     /// their guard stands now or a write has opened it.
-    viewed: BTreeSet<usize>,
+    viewed: Blocks,
     /// Runs of blocks Windows lately said are wholly uncommitted, by first
     /// block: the end block, whether the memory is a mapped view, and when
     /// it was said ([`hole_end`]). They do not overlap.
     holes: BTreeMap<usize, Hole>,
+    /// Changes of `holes`, counted: what [`guard`]'s walk read of them
+    /// ([`HolesAhead`]) stands while the count does.
+    holes_changed: u64,
+}
+
+impl Guards {
+    const fn new() -> Guards {
+        Guards {
+            protected: Blocks::new(),
+            clean: Blocks::new(),
+            absent: Blocks::new(),
+            aliased: Blocks::new(),
+            viewed: Blocks::new(),
+            holes: BTreeMap::new(),
+            holes_changed: 0,
+        }
+    }
 }
 
 /// What [`Guards::holes`] keeps of one answer of Windows.
@@ -817,14 +1089,7 @@ fn view_known() -> bool {
 /// Behind a lock that askings which change nothing share ([`writes_shared`])
 /// and plain looks at the sets ([`guards_shared`]); everything that changes
 /// the guards holds it alone ([`guards`]), as when it was a mutex.
-static GUARDS: RwLock<Guards> = RwLock::new(Guards {
-    protected: BTreeSet::new(),
-    clean: BTreeSet::new(),
-    absent: BTreeSet::new(),
-    aliased: BTreeSet::new(),
-    viewed: BTreeSet::new(),
-    holes: BTreeMap::new(),
-});
+static GUARDS: RwLock<Guards> = RwLock::new(Guards::new());
 
 fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
     GUARDS.write().unwrap_or_else(|e| e.into_inner())
@@ -838,7 +1103,7 @@ fn guards_shared() -> std::sync::RwLockReadGuard<'static, Guards> {
 /// Whether the block `page` is read-only by our hand and unwritten since a
 /// copy took it (diagnostics of `VICTORY_BACK_OWN_CHECK`).
 pub(crate) fn clean(page: usize) -> bool {
-    guards_shared().clean.contains(&page)
+    guards_shared().clean.contains(page)
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -853,60 +1118,74 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // of the 68 ms a frame of "guards" (run 58).
     // `VICTORY_GUARD_ASK=1` asks every time, as before.
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"))
-        && known_view_in(&guards_shared(), start);
-    if !known && !is_view(start, end) {
-        return None;
+    let ask = *ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1"));
+    // Looked at under the lock the walk holds: one taking of it, not two
+    // (run AM: 0.2 ms a frame waiting for the shared one).
+    let mut g = guards();
+    if ask || !known_view_in(&g, start) {
+        drop(g);
+        if !is_view(start, end) {
+            return None;
+        }
+        g = guards();
     }
     install();
-    let mut g = guards();
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    // The range's clean blocks, in order: read off the set in one pass,
-    // not looked up one block at a time. A frame asks about some 10 GB of
-    // view memory, 150,000 blocks, nearly all clean: the lookups were most
-    // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
-    // the set meanwhile is the block it stands at or ones before it.
-    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
-    if clean.len() == last - first {
+    // A frame asks about some 10 GB of view memory, 150,000 blocks, nearly
+    // all clean: looked up one block at a time they were most of the 60-90
+    // ms a frame of "guards" (run 54); read off a `BTreeSet` into a vector
+    // at each check, and walked block by block, still 4.3 ms a frame (run
+    // AM). The clean blocks are bits now, read 64 to a word, with nothing
+    // gathered (`bench_tests`: 2,000 checks of 75 clean blocks 1.6-2.1 ms,
+    // now 0.03-0.06 ms). What the walk adds to them meanwhile is the block
+    // it stands at or ones before it.
+    if g.clean.all_in(first, last) {
         // Nothing written, mapped or new since the range was last taken.
         return Some(written);
     }
-    let mut next_clean = 0;
     let mut uncommitted_until = first;
-    for block in first..=last {
-        while next_clean < clean.len() && clean[next_clean] < block {
-            next_clean += 1;
+    let mut holes = HolesAhead::new(last);
+    let mut at = first;
+    loop {
+        // Blocks `[at, block)` are clean, or absent inside the hole the
+        // walk last found: nothing to do there but end the run before them.
+        let block = next_open(&g, at, uncommitted_until, last);
+        if block > at {
+            end_run(&mut g, &mut run, at, &mut holes);
         }
-        let is_clean = next_clean < clean.len() && clean[next_clean] == block;
-        let mut open = block < last && !is_clean;
-        if open && g.absent.contains(&block) {
+        if block == last {
+            break;
+        }
+        let mut open = true;
+        if g.absent.contains(block) {
             // Ordinary commits need no runtime mapping notification. Reuse
             // this asking's query for the following blocks in the same region
             // (and a recent asking's: [`hole_end`]).
             if block >= uncommitted_until {
-                uncommitted_until = hole_end(&mut g, block);
+                uncommitted_until = hole_end_ahead(&mut g, block, &mut holes);
             }
             open = block >= uncommitted_until;
             if open {
-                g.absent.remove(&block);
+                g.absent.remove(block);
             }
         }
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-            if g.protected.contains(&block) {
+            if g.protected.contains(block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
+                end_run(&mut g, &mut run, block, &mut holes);
             } else {
                 run.get_or_insert(block);
-                continue;
             }
+        } else {
+            end_run(&mut g, &mut run, block, &mut holes);
         }
-        if let Some(from) = run.take() {
-            protect(&mut g, from, block);
-        }
+        at = block + 1;
     }
+    end_run(&mut g, &mut run, last, &mut holes);
     Some(written)
 }
 
@@ -1045,7 +1324,7 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// its copies took them, `open` would have opened it.
 fn protect_alias(g: &mut Guards, block: usize) {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
-    if g.protected.contains(&block) {
+    if g.protected.contains(block) {
         return;
     }
     let mut old = 0;
@@ -1074,10 +1353,10 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
         }
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
-        g.protected.extend(from..to);
-        g.clean.extend(from..to);
+        g.protected.insert_range(from, to);
+        g.clean.insert_range(from, to);
         if view_known() {
-            g.viewed.extend(from..to);
+            g.viewed.insert_range(from, to);
         }
     };
     if set(from, to) {
@@ -1196,11 +1475,110 @@ fn hole_end(g: &mut Guards, block: usize) -> usize {
         crate::copystat::add(crate::copystat::C::HolesKnown, 1);
         return end;
     }
+    hole_end_asked(g, block)
+}
+
+/// [`hole_end`] where [`Guards::holes`] says nothing fresh: Windows is
+/// asked, and its answer kept.
+fn hole_end_asked(g: &mut Guards, block: usize) -> usize {
     let (end, mapped) = uncommitted_end(block);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::HolesAsked, 1);
     note_hole(g, block, end, mapped);
     end
+}
+
+/// What [`guard`]'s walk keeps of [`Guards::holes`] between its lookups
+/// ([`hole_end_ahead`]): the hole at or before the block it looks up and
+/// the next [`HOLES_AHEAD`] after it in the range, read off the map in one
+/// pass and standing until the map changes (`Guards::holes_changed`); and
+/// the clock, read once until the walk next asks Windows anything. Run AM's
+/// frame passed over some 10,500 absent blocks on a recent answer: 1.0 ms
+/// a frame searching the map, 0.3 ms reading the clock (34 ns a reading).
+struct HolesAhead {
+    /// Holes by first block, as the map has them.
+    holes: Vec<(usize, Hole)>,
+    /// Of those, the last that begins at or before the block last looked up.
+    at: usize,
+    /// Whether `holes` ends where the map does (before `last`).
+    whole: bool,
+    /// The map's count of changes when it was read; `None` before.
+    read: Option<u64>,
+    /// The end of the walk's range: no block there or past it is looked up.
+    last: usize,
+    /// The frame and millisecond whose answers are fresh ([`fresh`]), read
+    /// at the first look since the walk began or last asked Windows (a
+    /// guard or a question of its own): between those the walk takes some
+    /// microseconds, not the milliseconds an answer is kept.
+    now: Option<(u64, u64)>,
+}
+
+/// Holes [`HolesAhead`] reads at once past the one at the block looked up.
+const HOLES_AHEAD: usize = 32;
+
+impl HolesAhead {
+    fn new(last: usize) -> HolesAhead {
+        HolesAhead { holes: Vec::new(), at: 0, whole: false, read: None, last, now: None }
+    }
+
+    /// The walk asked Windows something, which takes time: the clock is read
+    /// again at the next look.
+    fn asked(&mut self) {
+        self.now = None;
+    }
+
+    /// [`known_hole`] of `block`, as the map says now. Blocks are looked up
+    /// in order: none lower than the one before.
+    fn known(&mut self, g: &Guards, block: usize) -> Option<(usize, bool)> {
+        let keep = hole_keep();
+        if keep == 0 || g.holes.is_empty() {
+            return None;
+        }
+        if self.read == Some(g.holes_changed) {
+            while self.holes.get(self.at + 1).is_some_and(|&(start, _)| start <= block) {
+                self.at += 1;
+            }
+            // Holes past those read may begin at or before `block`.
+            if self.at + 1 == self.holes.len() && !self.whole {
+                self.read = None;
+            }
+        }
+        if self.read != Some(g.holes_changed) {
+            self.holes.clear();
+            self.holes.extend(g.holes.range(..=block).next_back().map(|(&start, &hole)| (start, hole)));
+            let before = self.holes.len();
+            let ahead = g.holes.range(block + 1..self.last.max(block + 1)).take(HOLES_AHEAD);
+            self.holes.extend(ahead.map(|(&start, &hole)| (start, hole)));
+            self.whole = self.holes.len() - before < HOLES_AHEAD;
+            self.at = 0;
+            self.read = Some(g.holes_changed);
+        }
+        let &(start, hole) = self.holes.get(self.at)?;
+        if start > block || hole.end <= block {
+            return None;
+        }
+        let (frame, ms) = *self.now.get_or_insert_with(|| (crate::frame::current(), crate::host::now_ms()));
+        fresh(&hole, frame, ms, keep).then_some((hole.end, hole.mapped))
+    }
+}
+
+/// [`hole_end`] for [`guard`]'s walk, looking in what it read of the map.
+fn hole_end_ahead(g: &mut Guards, block: usize, ahead: &mut HolesAhead) -> usize {
+    if let Some((end, _)) = ahead.known(g, block) {
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::HolesKnown, 1);
+        return end;
+    }
+    ahead.asked();
+    hole_end_asked(g, block)
+}
+
+/// Ends the walk's run of blocks to guard again at `to` ([`protect`]).
+fn end_run(g: &mut Guards, run: &mut Option<usize>, to: usize, holes: &mut HolesAhead) {
+    if let Some(from) = run.take() {
+        protect(g, from, to);
+        holes.asked();
+    }
 }
 
 /// Windows said blocks `[block, end)` are wholly uncommitted (nothing if
@@ -1211,6 +1589,7 @@ fn note_hole(g: &mut Guards, block: usize, end: usize, mapped: bool) {
     if keep == 0 {
         return;
     }
+    g.holes_changed += 1;
     forget_holes(g, block, end.max(block + 1));
     if end > block {
         if g.holes.len() >= HOLES_MOST {
@@ -1227,6 +1606,7 @@ fn forget_holes(g: &mut Guards, from: usize, to: usize) {
     if g.holes.is_empty() || from >= to {
         return;
     }
+    g.holes_changed += 1;
     let before = g.holes.range(..from).next_back().filter(|(_, h)| h.end > from).map(|(&s, _)| s);
     let met: Vec<usize> = before.into_iter().chain(g.holes.range(from..to).map(|(&s, _)| s)).collect();
     for start in met {
@@ -1254,10 +1634,7 @@ pub fn title_memory_committed(at: usize, len: usize) {
     let g = &mut *g;
     let (from, to) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
     forget_holes(g, from, to);
-    let absent: Vec<usize> = g.absent.range(from..to).copied().collect();
-    for block in absent {
-        g.absent.remove(&block);
-    }
+    g.absent.remove_range(from, to);
 }
 
 /// Gives write access back to the guarded blocks of `[start, end)` and
@@ -1270,15 +1647,15 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     if start >= end || g.aliased.is_empty() {
         return any;
     }
-    let aliased: Vec<usize> = g.aliased.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+    let aliased: Vec<usize> = g.aliased.iter_in(start / BLOCK, end.div_ceil(BLOCK)).collect();
     for block in aliased {
-        g.aliased.remove(&block);
+        g.aliased.remove(block);
         for alias in crate::inplace::pages_of(block * BLOCK) {
             if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
                 #[cfg(feature = "diagnostics")]
                 ALIASES[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            g.aliased.remove(&(alias / BLOCK));
+            g.aliased.remove(alias / BLOCK);
         }
     }
     any
@@ -1287,14 +1664,10 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// [`open`] for one range, without the other views of its pages.
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
-        .protected
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
+    let blocks: Vec<usize> = g.protected.iter_in(start / BLOCK, end.div_ceil(BLOCK)).collect();
     for &block in &blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
+        g.protected.remove(block);
+        g.clean.remove(block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
@@ -1379,7 +1752,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     }
     {
         let mut g = guards();
-        let guarded = g.protected.range(at / BLOCK..end.div_ceil(BLOCK)).count() as u64;
+        let guarded = g.protected.count_in(at / BLOCK, end.div_ceil(BLOCK)) as u64;
         if pages {
             WRITTEN[2].fetch_add(guarded, Relaxed);
         }
@@ -1629,21 +2002,13 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
     let mut g = guards();
-    let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
-    let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
-    for block in absent {
-        g.absent.remove(&block);
-    }
-    forget_holes(&mut g, range.start, range.end);
-    let blocks: Vec<usize> = g.protected.range(range).copied().collect();
-    for block in blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
-    }
-    let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
-    for block in aliased {
-        g.aliased.remove(&block);
-    }
+    let (from, to) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    g.absent.remove_range(from, to);
+    forget_holes(&mut g, from, to);
+    // (Clean blocks are some of the protected ones.)
+    g.protected.remove_range(from, to);
+    g.clean.remove_range(from, to);
+    g.aliased.remove_range(from, to);
     if view_known() {
         // The runtime calls this for two things only (`xmem`: `map` and
         // `unmap`): a range it has just mapped a section's pages into,
@@ -1655,14 +2020,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         // that the next asking about each range went to the kernel twice
         // (run 235: 266 to 565 failed askings a frame with the blocks
         // remembered from their guards alone, no fewer than without).
-        g.viewed.extend(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK));
+        g.viewed.insert_range(from, to);
         return;
     }
     // What the range shows is new: no longer known to be a view.
-    let viewed: Vec<usize> = g.viewed.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
-    for block in viewed {
-        g.viewed.remove(&block);
-    }
+    g.viewed.remove_range(from, to);
 }
 
 /// The runtime's changes of what title memory shows, in order
@@ -1931,14 +2293,7 @@ mod tests {
     /// answer, and taken only while it is fresh.
     #[test]
     fn holes_are_kept_trimmed_and_expire() {
-        let mut g = Guards {
-            protected: BTreeSet::new(),
-            clean: BTreeSet::new(),
-            absent: BTreeSet::new(),
-            aliased: BTreeSet::new(),
-            viewed: BTreeSet::new(),
-            holes: BTreeMap::new(),
-        };
+        let mut g = Guards::new();
         let spans = |g: &Guards| g.holes.iter().map(|(&s, h)| (s, h.end)).collect::<Vec<_>>();
         // Said at frame 7, millisecond 1000, and looked up a millisecond
         // later (the frame counter and the clock are the process's).
@@ -2420,9 +2775,7 @@ mod shared_tests {
             protected: clean.iter().copied().collect(),
             clean: clean.iter().copied().collect(),
             absent: absent.iter().copied().collect(),
-            aliased: BTreeSet::new(),
-            viewed: BTreeSet::new(),
-            holes: BTreeMap::new(),
+            ..Guards::new()
         }
     }
 
@@ -2533,6 +2886,306 @@ mod shared_tests {
                 let wrong = copy.iter().zip(&bytes).position(|(a, b)| a != b);
                 assert!(wrong.is_none(), "a copy missed a write at {wrong:?} (side by side: {shared})");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod blocks_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// A few blocks either side of the boundary between chunks 1 and 2.
+    const EDGE: usize = 2 * CHUNK;
+
+    #[test]
+    fn ranges_across_a_chunk_boundary() {
+        let mut set = Blocks::new();
+        set.insert_range(EDGE - 3, EDGE + 5);
+        assert_eq!(set.len, 8);
+        assert_eq!(set.chunks.len(), 2);
+        assert!(set.all_in(EDGE - 3, EDGE + 5));
+        assert!(!set.all_in(EDGE - 4, EDGE + 5));
+        assert!(!set.all_in(EDGE - 3, EDGE + 6));
+        assert!(set.all_in(EDGE, EDGE), "an empty range");
+        assert_eq!(set.count_in(0, usize::MAX >> 16), 8);
+        assert_eq!(set.count_in(EDGE - 1, EDGE + 1), 2);
+        assert_eq!(set.iter_in(EDGE - 10, EDGE + 10).collect::<Vec<_>>(), (EDGE - 3..EDGE + 5).collect::<Vec<_>>());
+        assert_eq!(set.iter_in(EDGE - 1, EDGE + 2).collect::<Vec<_>>(), [EDGE - 1, EDGE, EDGE + 1]);
+        assert_eq!(set.first_unset(EDGE - 3, EDGE + 10), EDGE + 5);
+        assert_eq!(set.first_unset(EDGE - 10, EDGE + 10), EDGE - 10);
+        assert_eq!(set.first_unset(EDGE - 3, EDGE + 5), EDGE + 5, "all set: the range's end");
+        // Inserting what is there already counts nothing twice.
+        set.insert_range(EDGE - 1, EDGE + 1);
+        assert!(!set.insert(EDGE));
+        assert_eq!(set.len, 8);
+        // Clearing across the boundary.
+        set.remove_range(EDGE - 1, EDGE + 2);
+        assert_eq!(set.iter_in(0, EDGE + CHUNK).collect::<Vec<_>>(), [EDGE - 3, EDGE - 2, EDGE + 2, EDGE + 3, EDGE + 4]);
+        assert_eq!(set.len, 5);
+        assert_eq!(set.first_unset(EDGE - 3, EDGE + 5), EDGE - 1);
+    }
+
+    #[test]
+    fn empty_and_full_chunks() {
+        let mut set = Blocks::new();
+        assert!(set.is_empty());
+        assert!(!set.contains(0) && !set.contains(usize::MAX >> 16));
+        assert!(!set.all_in(5, 6));
+        assert_eq!(set.first_unset(5, 9), 5);
+        assert_eq!(set.count_in(0, usize::MAX >> 16), 0);
+        // A whole chunk set, and the first block of the next.
+        set.insert_range(CHUNK, 2 * CHUNK + 1);
+        assert_eq!(set.count_in(0, 3 * CHUNK), CHUNK + 1);
+        assert!(set.all_in(CHUNK, 2 * CHUNK + 1));
+        assert_eq!(set.first_unset(CHUNK + 7, 3 * CHUNK), 2 * CHUNK + 1);
+        // Emptied: its chunks stay, nothing in them is set.
+        set.remove_range(0, usize::MAX >> 16);
+        assert!(set.is_empty());
+        assert_eq!(set.chunks.len(), 2);
+        assert!(!set.contains(CHUNK) && !set.all_in(CHUNK, CHUNK + 1));
+        assert_eq!(set.first_unset(CHUNK, 2 * CHUNK), CHUNK);
+        assert_eq!(set.iter_in(0, usize::MAX >> 16).count(), 0);
+        assert!(set.insert(CHUNK + 64));
+        assert_eq!(set.iter_in(0, usize::MAX >> 16).collect::<Vec<_>>(), [CHUNK + 64]);
+    }
+
+    #[test]
+    fn single_blocks_and_removal() {
+        let mut set: Blocks = [3, 64, 65, 127, 128, CHUNK - 1, CHUNK].into_iter().collect();
+        assert_eq!(set.len, 7);
+        assert!(set.contains(64) && set.contains(CHUNK - 1) && !set.contains(66));
+        assert!(set.remove(64));
+        assert!(!set.remove(64), "removed already");
+        assert!(!set.remove(5 * CHUNK), "a chunk never made");
+        assert_eq!(set.iter_in(0, 2 * CHUNK).collect::<Vec<_>>(), [3, 65, 127, 128, CHUNK - 1, CHUNK]);
+        assert_eq!(set.count_in(65, 128), 2);
+        assert!(set.all_in(127, 129));
+        set.remove_range(100, CHUNK);
+        assert_eq!(set.iter_in(0, 2 * CHUNK).collect::<Vec<_>>(), [3, 65, CHUNK]);
+        // Blocks at the top of the address space.
+        let top = usize::MAX.div_ceil(BLOCK) - 1;
+        assert!(set.insert(top));
+        assert!(set.all_in(top, top + 1) && set.count_in(top, top + 1) == 1);
+        set.remove_range(top, usize::MAX.div_ceil(BLOCK));
+        assert!(!set.contains(top));
+        assert_eq!(set.len, 3);
+    }
+
+    /// A small generator of numbers for the tests below.
+    fn next(state: &mut u64) -> usize {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state as usize
+    }
+
+    /// Random changes and questions, answered as a `BTreeSet` answers them,
+    /// over blocks near chunk boundaries and far apart.
+    #[test]
+    fn answers_as_a_btree_set() {
+        let mut state = 0x9e37_79b9_7f4a_7c15;
+        let bases = [0, CHUNK - 200, 7 * CHUNK - 100, (1 << 33) - 300];
+        let block = |state: &mut u64| bases[next(state) % bases.len()] + next(state) % 600;
+        let (mut set, mut reference) = (Blocks::new(), BTreeSet::new());
+        for round in 0..20_000 {
+            let (a, b) = (block(&mut state), block(&mut state));
+            let (from, to) = (a.min(b), a.max(b) + 1);
+            match next(&mut state) % 6 {
+                0 => assert_eq!(set.insert(a), reference.insert(a)),
+                1 => assert_eq!(set.remove(a), reference.remove(&a)),
+                2 if to - from < 2_000 => {
+                    set.insert_range(from, to);
+                    reference.extend(from..to);
+                }
+                3 => {
+                    set.remove_range(from, to);
+                    reference.retain(|x| !(from..to).contains(x));
+                }
+                _ => {}
+            }
+            assert_eq!(set.len, reference.len(), "round {round}");
+            assert_eq!(set.contains(b), reference.contains(&b));
+            let within: Vec<usize> = reference.range(from..to).copied().collect();
+            assert_eq!(set.iter_in(from, to).collect::<Vec<_>>(), within, "round {round}");
+            assert_eq!(set.count_in(from, to), within.len());
+            assert_eq!(set.all_in(from, to), within.len() == to - from);
+            let unset = (from..to).find(|x| !reference.contains(x)).unwrap_or(to);
+            assert_eq!(set.first_unset(from, to), unset, "round {round}: [{from}, {to})");
+        }
+    }
+
+    /// `next_open` finds the block `guard`'s walk looked at block by block:
+    /// the first neither clean nor absent inside the hole.
+    #[test]
+    fn the_walk_stops_where_it_did_block_by_block() {
+        let mut state = 0x2545_f491_4f6c_dd1d;
+        for _ in 0..2_000 {
+            let base = CHUNK - 150 + next(&mut state) % 100;
+            let mut g = Guards::new();
+            for block in base..base + 300 {
+                match next(&mut state) % 8 {
+                    0..4 => {
+                        g.clean.insert(block);
+                    }
+                    4..6 => {
+                        g.absent.insert(block);
+                    }
+                    _ => {}
+                }
+            }
+            let at = base + next(&mut state) % 300;
+            let last = at + next(&mut state) % (base + 301 - at);
+            let hole_until = base + next(&mut state) % 320;
+            let expected = (at..last)
+                .find(|&b| !g.clean.contains(b) && !(g.absent.contains(b) && b < hole_until))
+                .unwrap_or(last);
+            assert_eq!(next_open(&g, at, hole_until, last), expected, "[{at}, {last}) hole to {hole_until}");
+        }
+    }
+
+    /// What the walk reads ahead of the holes answers as the map does, past
+    /// the holes read at once and across changes of the map.
+    #[test]
+    fn holes_read_ahead_answer_as_the_map() {
+        let mut state = 0x6c07_8965_9e37_79b9;
+        for _ in 0..300 {
+            let mut g = Guards::new();
+            let (base, last) = (1_000, 3_000);
+            let mut b = base;
+            while b < last {
+                let len = 1 + next(&mut state) % 4;
+                if !next(&mut state).is_multiple_of(3) {
+                    note_hole(&mut g, b, b + len, next(&mut state).is_multiple_of(2));
+                }
+                b += len + next(&mut state) % 5;
+            }
+            let mut ahead = HolesAhead::new(last);
+            let mut block = base - 5 + next(&mut state) % 10;
+            while block < last {
+                // A new answer of Windows meanwhile (or a block found committed).
+                if next(&mut state).is_multiple_of(40) {
+                    let at = block + next(&mut state) % 100;
+                    note_hole(&mut g, at, at + next(&mut state) % 3, false);
+                    ahead.asked();
+                }
+                assert_eq!(ahead.known(&g, block), known_hole(&g, block), "block {block}");
+                block += 1 + next(&mut state) % 6;
+            }
+        }
+    }
+}
+
+/// The time of a frame's checks of guarded view memory with nothing written
+/// ([`guard`]): run AM's frame asks about some 150,000 blocks in some 2,000
+/// checks, nearly all clean. A timing, run by hand with optimized code:
+/// `cargo test --profile diag -p victory-gpu --lib --features diagnostics
+/// watch::bench_tests -- --ignored --nocapture --test-threads=1`.
+#[cfg(test)]
+mod bench_tests {
+    use super::*;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_WRITE, MEM_PRESERVE_PLACEHOLDER, MEM_RELEASE, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE,
+        MEM_RESERVE_PLACEHOLDER, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, MapViewOfFile3, PAGE_NOACCESS, PAGE_READWRITE,
+        UnmapViewOfFile, UnmapViewOfFile2, VirtualAlloc2, VirtualFree,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    /// `rounds` frames of 2,000 checks of `len` blocks each, spread over the
+    /// `blocks` blocks at `at`: the time of one frame.
+    fn frame_of_checks(at: usize, blocks: usize, len: usize, rounds: u32) -> std::time::Duration {
+        let started = std::time::Instant::now();
+        for _ in 0..rounds {
+            for k in 0..2000 {
+                let first = (k * 37) % (blocks - len + 1);
+                let written = guard(at + first * BLOCK, at + (first + len) * BLOCK).expect("view memory");
+                assert!(written.is_empty(), "nothing written");
+            }
+        }
+        started.elapsed() / rounds
+    }
+
+    #[test]
+    #[ignore = "a timing, run by hand"]
+    fn a_frame_of_checks_of_clean_blocks() {
+        // One view of 2,048 blocks (128 MiB), guarded whole.
+        const BLOCKS: usize = 2048;
+        let size = BLOCKS * BLOCK;
+        // SAFETY: a new pagefile section, mapped whole.
+        let (section, view) = unsafe {
+            let section = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, size as u32, std::ptr::null());
+            assert!(!section.is_null());
+            (section, MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, size).Value as usize)
+        };
+        assert_ne!(view, 0);
+        assert!(guard(view, view + size).is_some());
+        let clean = frame_of_checks(view, BLOCKS, 75, 50);
+        let whole = frame_of_checks(view, BLOCKS, 2000, 2);
+
+        // A placeholder of 512 blocks with every other block mapped: the
+        // others are noted absent, each a hole of its own.
+        const HOLEY: usize = 512;
+        // SAFETY: a fresh placeholder and a pagefile section of its size.
+        let (p, holey_section) = unsafe {
+            let p = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                HOLEY * BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(p, 0);
+            let s = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, (HOLEY * BLOCK) as u32, std::ptr::null());
+            assert!(!s.is_null());
+            (p, s)
+        };
+        let views: Vec<MEMORY_MAPPED_VIEW_ADDRESS> = (0..HOLEY)
+            .step_by(2)
+            .map(|block| {
+                // SAFETY: splits the placeholder at the block and maps the
+                // section's block there.
+                let view = unsafe {
+                    VirtualFree((p + block * BLOCK) as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                    MapViewOfFile3(
+                        holey_section,
+                        GetCurrentProcess(),
+                        (p + block * BLOCK) as *const _,
+                        (block * BLOCK) as u64,
+                        BLOCK,
+                        MEM_REPLACE_PLACEHOLDER,
+                        PAGE_READWRITE,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                assert_eq!(view.Value as usize, p + block * BLOCK);
+                view
+            })
+            .collect();
+        assert!(guard(p, p + HOLEY * BLOCK).is_some());
+        assert_eq!(guard(p, p + HOLEY * BLOCK), Some(Vec::new()));
+        let holey = frame_of_checks(p, HOLEY, 75, 10);
+        println!(
+            "a frame of checks with nothing written: 2,000 of 75 clean blocks {clean:?}; 2,000 of 2,000 clean blocks {whole:?}; \
+             2,000 of 75 blocks every other one unmapped {holey:?}"
+        );
+
+        title_memory_remapped(view, size);
+        title_memory_remapped(p, HOLEY * BLOCK);
+        // SAFETY: our views, placeholders and sections.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ });
+            CloseHandle(section);
+            for view in views {
+                UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
+            }
+            for block in 0..HOLEY {
+                VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+            CloseHandle(holey_section);
         }
     }
 }

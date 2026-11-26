@@ -886,6 +886,9 @@ pub(crate) struct HostList {
     /// The records its draws read from slots that its prelude fills
     /// (`crate::indirect::gather`).
     gather: Mutex<Gather>,
+    /// The constants its draws read from slots the card fills ahead of the
+    /// submission ([`gather_fills`]).
+    constants: Mutex<Constants>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -2127,6 +2130,13 @@ struct Deferred {
     /// ([`HostList::stored_since`]).
     stored: Vec<(usize, usize)>,
     raw_stores: u32,
+    /// Whether the recording has a step that writes title memory on the
+    /// CPU at submission (`Step::Copy`, `Step::Run`): constants gathered
+    /// after it ([`gather_fills`]) are brought up to date in its order too.
+    title_writes: bool,
+    /// The place in `copies` of the refresh for gathered constants recorded
+    /// since the last such step, which the next ones join.
+    constants_refresh: Option<usize>,
 }
 
 impl Deferred {
@@ -3185,21 +3195,28 @@ mod fill_check {
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
-fn stale_under_flights(runs: &[&HostList]) -> bool {
+fn stale_under_flights(runs: &[&HostList], gathered: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)]) -> bool {
     use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
-    // up to date at most).
+    // up to date at most), the gathered constants' spans among them
+    // ([`gather_fills`]).
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    let mut add = |shadow: &Arc<crate::shadow::Shadow>, from: usize, to: usize| match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
+        Some(s) => (s.1, s.2) = (s.1.min(from), s.2.max(to)),
+        None => spans.push((shadow.clone(), from, to)),
+    };
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step
                 && shadow.writes_pending()
             {
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                    None => spans.push((shadow.clone(), *address, *address + *len)),
-                }
+                add(shadow, *address, *address + *len);
             }
+        }
+    }
+    for (shadow, from, to) in gathered {
+        if shadow.writes_pending() {
+            add(shadow, *from, *to);
         }
     }
     if late_exact() {
@@ -4125,6 +4142,7 @@ impl Host {
                 meter: AtomicU32::new(u32::MAX),
                 pipeline_meter: AtomicU32::new(u32::MAX),
                 gather: Mutex::default(),
+                constants: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -4354,6 +4372,90 @@ impl Host {
                 None
             }
         }
+    }
+
+    /// A list of ours that fills the slots of `runs`' gathered constants
+    /// ([`gather_fills`]) from the copies that hold them, to run ahead of
+    /// `runs`, which run before the host's fence reaches `value`. None if
+    /// they gathered nothing.
+    ///
+    /// One pass per set of entries; the slot chunks writable around them,
+    /// then readable as constants until the next gather into them (states
+    /// tracked with the chunks, in the order the card runs the lists). The
+    /// first barrier waits for earlier shader writes as well: the copies'
+    /// bytes from lists that ran before (none of them should be constants,
+    /// see [`gather_fills`]).
+    fn gather_constants(&self, runs: &[&HostList], value: u64) -> Option<ID3D12CommandList> {
+        // Each list once, its constants held until the passes are recorded.
+        let mut held: Vec<std::sync::MutexGuard<'_, Constants>> = Vec::new();
+        let mut seen: Vec<usize> = Vec::new();
+        for list in runs {
+            let key = std::ptr::from_ref(*list) as usize;
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.push(key);
+            let constants = list.constants();
+            if constants.sets.iter().any(|s| s.entries > 0) {
+                held.push(constants);
+            }
+        }
+        if held.is_empty() {
+            return None;
+        }
+        let mut into = vec![uav_barrier_all()];
+        let mut out = Vec::new();
+        let mut passes = Vec::new();
+        const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+        for constants in &mut held {
+            for (chunk, _) in &mut constants.chunks {
+                let before = if chunk.read { READ } else { D3D12_RESOURCE_STATE_COMMON };
+                into.push(transition(&chunk.buffer, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
+                out.push(transition(&chunk.buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, READ));
+                chunk.read = true;
+            }
+            for set in constants.sets.iter().filter(|s| s.entries > 0) {
+                passes.push((set.source_gpu, set.table_gpu, constants.chunks[set.chunk].0.gpu, set.entries));
+            }
+        }
+        // SAFETY: a plain query.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        let free = {
+            let mut lists = CONSTANT_LISTS.lock().unwrap_or_else(|e| e.into_inner());
+            lists.0.iter().position(|(at, _)| *at <= completed).map(|i| lists.0.swap_remove(i).1)
+        };
+        let Some((allocator, list)) = free.or_else(|| self.make_prelude()) else {
+            fail(format_args!("no host list to gather constants on the card (VICTORY_GATHER_FILLS)"));
+        };
+        // SAFETY: the list's last run finished (the fence passed its value);
+        // live buffers; the passes' own root signature.
+        let recorded = unsafe {
+            (|| -> windows::core::Result<bool> {
+                allocator.Reset()?;
+                list.Reset(&allocator, None)?;
+                let timed = crate::cardmeter::begin(&list, crate::cardmeter::Kind::Sync);
+                list.ResourceBarrier(&into);
+                let mut all = true;
+                for &(source, table, slots, entries) in &passes {
+                    all &= crate::indirect::record_constants(&list, source, table, slots, entries);
+                }
+                list.ResourceBarrier(&out);
+                crate::cardmeter::end(&list, timed);
+                list.Close()?;
+                Ok(all)
+            })()
+        };
+        match recorded {
+            Ok(true) => {}
+            Ok(false) => fail(format_args!("constants gathered on the card could not be recorded: their slots would be left unfilled (VICTORY_GATHER_FILLS)")),
+            Err(e) => fail(format_args!("the list that gathers constants on the card did not record ({e}; VICTORY_GATHER_FILLS)")),
+        }
+        drop(held);
+        GATHERED[4].fetch_add(passes.len() as u64, Ordering::Relaxed);
+        GATHERED[5].fetch_add(1, Ordering::Relaxed);
+        let run = list.cast::<ID3D12CommandList>().ok();
+        CONSTANT_LISTS.lock().unwrap_or_else(|e| e.into_inner()).0.push((value, (allocator, list)));
+        run
     }
 
     /// Before a submission's lists run, for copies in the card's memory
@@ -5789,21 +5891,28 @@ impl Host {
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
+        // The spans of copies the lists' gathered constants read
+        // ([`gather_fills`]): refreshed with the rest.
+        let gathered = gathered_spans(runs);
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+            let mut add = |shadow: &std::sync::Arc<crate::shadow::Shadow>, from: usize, to: usize| {
+                if !shadow.unwatched() {
+                    let span = spans.entry(std::sync::Arc::as_ptr(shadow) as usize).or_insert((from, to));
+                    *span = (span.0.min(from), span.1.max(to));
+                }
+            };
             for list in runs {
                 for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+                    if let Step::Refresh(shadow, address, len) = step {
+                        add(shadow, *address, *address + *len);
                     }
                 }
+            }
+            for (shadow, from, to) in &gathered {
+                add(shadow, *from, *to);
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             crate::watch::ask_once(&ranges);
@@ -5811,19 +5920,35 @@ impl Host {
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            if behind && stale_under_flights(runs, &gathered) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(runs) {
+        } else if behind && stale_under_flights(runs, &gathered) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        // Gathered constants are taken at the head of the submission: their
+        // spans are brought up to date before anything of it runs, ahead of
+        // the ranges its own lists declare written there (a copy's pending
+        // refresh is done before its first declared write, `Batch::flush_one`).
+        for (shadow, from, to) in &gathered {
+            batch.add(shadow, *from, *to - *from);
+        }
+        // Again after a list that wrote title memory on the CPU (a title
+        // buffer copy, a memory copy), for the lists after it.
+        let mut written = false;
         for list in runs {
+            if written {
+                for (shadow, from, to) in &list.constants().spans {
+                    batch.add(shadow, *from, *to - *from);
+                }
+            }
             list.run_deferred(&mut batch);
+            written |= list.deferred().title_writes;
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -5855,6 +5980,15 @@ impl Host {
         let card = self.card_before(runs, flown, *submitted);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
+        }
+        // The gathered constants ([`gather_fills`]), ahead of every list of
+        // the submission and behind what went up to the copies before them
+        // (`card_before` sent that already). Timed with the first list.
+        if let Some(gather) = self.gather_constants(runs, *submitted + 1) {
+            lists.insert(0, Some(gather));
+            for first in firsts.iter_mut().skip(1) {
+                *first += 1;
+            }
         }
         // The pass over the heaps, if it ran beside: done before the lists
         // read the slots, and the slots it left waiting made after it.
@@ -6417,6 +6551,9 @@ impl HostList {
                 }
             }
         }
+        // Its gathered constants' slots, for the next list to take (every
+        // submission of the list has run); their tables are scratch.
+        *self.constants() = Constants::default();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -7009,6 +7146,7 @@ impl HostList {
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
         deferred.gpu_written.clear();
+        (deferred.title_writes, deferred.constants_refresh) = (true, None);
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -7017,6 +7155,137 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
+    }
+
+    fn constants(&self) -> std::sync::MutexGuard<'_, Constants> {
+        self.constants.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The host GPU address of `len` bytes of title memory at `address`
+    /// that a constant view reads: a slot the card fills from the copy that
+    /// holds them, before the list runs ([`gather_fills`]), or the list's
+    /// upload memory, which the CPU fills at submission, as before.
+    /// `holder`: the copy, if the caller has found it. None if no memory
+    /// could be had for them.
+    pub(crate) fn fill_constants(&self, holder: Option<&std::sync::Arc<crate::shadow::Shadow>>, address: u64, len: u64) -> Option<u64> {
+        if gather_fills() {
+            let found;
+            let holder = match holder {
+                Some(holder) => Some(holder),
+                None => {
+                    found = crate::shadow::holding(address, len);
+                    found.as_ref()
+                }
+            };
+            match holder {
+                Some(shadow) => {
+                    if let Some(gpu) = self.gather_constant(shadow, address, len) {
+                        return Some(gpu);
+                    }
+                }
+                None => gathered(2, 1),
+            }
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, address as *const u8, len as usize);
+        Some(gpu)
+    }
+
+    /// [`HostList::fill_constants`] from `shadow`'s copy, which holds
+    /// `[address, address + len)`: a slot and an entry of the list's
+    /// ([`Constants`]), and the copy's span noted to be brought up to date.
+    /// None if the copy or the bytes do not fit the pass (the caller fills
+    /// them as before).
+    fn gather_constant(&self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: u64, len: u64) -> Option<u64> {
+        let unfit = || {
+            gathered(3, 1);
+            None
+        };
+        // (Memory that is not write-watched is copied whole at every
+        // refresh: a span over a list's constants there could cost more
+        // than their fills.)
+        if shadow.in_place() || shadow.is_window() || shadow.unwatched() || len == 0 || len > 1 << 16 || !crate::indirect::constants_ready() {
+            return unfit();
+        }
+        let Some(host) = host() else {
+            return unfit();
+        };
+        // SAFETY: a live buffer.
+        let base = unsafe { shadow.buffer.GetGPUVirtualAddress() };
+        let Some(at) = shadow.gpu(address).checked_sub(base) else {
+            return unfit();
+        };
+        let words = len.next_multiple_of(4);
+        let mut c = self.constants();
+        if !at.is_multiple_of(4) || at + words > c.source_bytes(shadow, base).min(u64::from(u32::MAX)) {
+            drop(c);
+            return unfit();
+        }
+        let Some((chunk, slot)) = c.slot(host, len.next_multiple_of(256)) else {
+            drop(c);
+            return unfit();
+        };
+        let set = match c.sets.iter().rposition(|s| s.source_gpu == base && s.chunk == chunk && s.entries < crate::indirect::CONSTANTS_MOST) {
+            Some(set) => set,
+            None => {
+                let source_bytes = c.source_bytes(shadow, base);
+                let Some((table_gpu, table)) = self.scratch(16 * u64::from(crate::indirect::CONSTANTS_MOST)) else {
+                    drop(c);
+                    return unfit();
+                };
+                c.sets.push(ConstantSet {
+                    source_gpu: base,
+                    source_bytes,
+                    chunk,
+                    table_gpu,
+                    table: table as usize,
+                    entries: 0,
+                });
+                c.sets.len() - 1
+            }
+        };
+        let set = &mut c.sets[set];
+        // SAFETY: the table holds `CONSTANTS_MOST` entries of 16 bytes, of
+        // the list's upload memory; the card reads it once the list is
+        // submitted.
+        unsafe {
+            let entry = (set.table as *mut u32).add(4 * set.entries as usize);
+            for (k, word) in [at as u32, slot as u32, len as u32, 0].into_iter().enumerate() {
+                entry.add(k).write(word);
+            }
+        }
+        set.entries += 1;
+        let (from, to) = (address as usize, (address + len) as usize);
+        match c.spans.iter_mut().find(|s| std::sync::Arc::ptr_eq(&s.0, shadow)) {
+            Some(s) => (s.1, s.2) = (s.1.min(from), s.2.max(to)),
+            None => c.spans.push((shadow.clone(), from, to)),
+        }
+        let gpu = c.chunks[chunk].0.gpu + slot;
+        drop(c);
+        // After a step of the list's own that writes title memory at
+        // submission, in the list's order too.
+        let mut d = self.deferred();
+        if d.title_writes {
+            let joined = d.constants_refresh.and_then(|i| match d.copies.get(i) {
+                Some(Step::Refresh(s, a, n)) if std::sync::Arc::ptr_eq(s, shadow) => span_join((*a, *a + *n), from, to).map(|j| (i, j)),
+                _ => None,
+            });
+            match joined {
+                Some((i, (a, e))) => {
+                    if let Some(Step::Refresh(_, at, n)) = d.copies.get_mut(i) {
+                        (*at, *n) = (a, e - a);
+                    }
+                }
+                None => {
+                    d.constants_refresh = Some(d.copies.len());
+                    d.copies.push(Step::Refresh(shadow.clone(), from, to - from));
+                }
+            }
+        }
+        drop(d);
+        gathered(0, 1);
+        gathered(1, len);
+        Some(gpu)
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -7366,6 +7635,7 @@ impl HostList {
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.refreshed.clear();
         deferred.gpu_written.clear();
+        (deferred.title_writes, deferred.constants_refresh) = (true, None);
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -7526,6 +7796,359 @@ fn wide_fills() -> bool {
                 );
             }
             on
+        }
+    }
+}
+
+/// Whether the constants a list's draws read from title memory (constant
+/// views in tables; root constant views off the host's 256-byte line) are
+/// gathered by the card from the host copy that holds them, into slots of
+/// the list's in the card's memory, instead of copied by the CPU into the
+/// list's upload memory at submission (`VICTORY_GATHER_FILLS=1`; `alt`:
+/// twenty seconds each way in turn, each change said in the log; off by
+/// default).
+///
+/// Run BA's gameplay profile: some 16,000 such fills a frame (8.5 MB, 535
+/// bytes on average) took 6-7 ms of the submitting thread, which bounds
+/// the frame: `copy_mapped` 3.7 ms (the bytes themselves 1.1 of it), the
+/// clock read around each step ~1.5, the counters and the flights' checks
+/// of each fill (`fill_ahead`, `fill_check`) the rest. Made side by side
+/// on the kept threads they gained nothing (`VICTORY_SPREAD_FILLS`,
+/// `VICTORY_WIDE_FILLS`: runs BC, BD, BH). The title's per-draw constants
+/// lie in its 174 MB buffer, whose copy is in the card's memory and is
+/// brought up to date at every submission anyway (12 times a frame in run
+/// BJ, through the merges under the flights' writes where shaders may
+/// write it): the CPU read those bytes twice.
+///
+/// With the switch, a fill whose bytes a title buffer's copy holds
+/// (`crate::shadow::holding`) gets a slot (256-byte lines, as a constant
+/// view needs) and an entry (offset in the copy, slot, bytes) in a table of
+/// the list's, written while the title records; nothing is left for the
+/// submitting thread but the copy's span to bring up to date, which the
+/// submission does as for any refresh, ahead of the writes its own lists
+/// declare there; and one pass of ours at the head of the submission moves
+/// every entry of its lists on the card ([`Host::gather_constants`]).
+///
+/// What it assumes: nothing the submission's own lists run on the card
+/// writes those constants before the draw that reads them, since they are
+/// taken at the submission's head, where a fill read title memory at its
+/// step. Run BJ's checks (`fill_ahead`): of ~9,000 fills a frame that read
+/// memory flights may write, none read bytes a flight then changed. Title
+/// memory the submission itself writes on the CPU before such a fill (a
+/// title buffer copy or a memory copy, `Step::Copy` and `Step::Run`) is
+/// brought up to date again after it.
+///
+/// Expected: the submitting thread 5-6 ms a frame shorter (the frame log's
+/// "preparing", the profile's `copy_mapped` under `Host::submit`); the
+/// card one pass and two barrier groups more per submission (~9 a frame),
+/// some 8.5 MB moved inside its own memory.
+fn gather_fills() -> bool {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_GATHER_FILLS").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = (now_us() / 20_000_000) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "fills of upload memory from now (VICTORY_GATHER_FILLS=alt): {}",
+                    if on { "GATHERED by the card from the copies that hold them" } else { "the CPU's, as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Since the frame line, of [`gather_fills`]: constants given a slot the
+/// card fills, their bytes; fills left to the CPU because no copy holds
+/// their bytes, or because the copy or the bytes do not fit the pass (in
+/// place, a window, off a 4-byte line, over 64 KiB, no pass); passes
+/// recorded; submissions they went ahead of.
+static GATHERED: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Adds `n` to [`GATHERED`]'s place `i` by way of the thread's tally, added
+/// to the shared counters every 256 calls: the recording threads ask for
+/// some 16,000 constants a frame between them (the same counters added
+/// from every thread at every copy cost 1.1 ms a frame in run P,
+/// `crate::plaincopy`).
+fn gathered(i: usize, n: u64) {
+    thread_local! {
+        static TALLY: ([std::cell::Cell<u64>; 4], std::cell::Cell<u32>) = const {
+            ([const { std::cell::Cell::new(0) }; 4], std::cell::Cell::new(0))
+        };
+    }
+    let _ = TALLY.try_with(|(tally, calls)| {
+        tally[i].set(tally[i].get() + n);
+        calls.set(calls.get() + 1);
+        if calls.get() >= 256 {
+            calls.set(0);
+            for (k, t) in tally.iter().enumerate() {
+                let v = t.replace(0);
+                if v != 0 {
+                    GATHERED[k].fetch_add(v, Ordering::Relaxed);
+                }
+            }
+        }
+    });
+}
+
+/// A chunk of the card's memory that gathered constants' slots are cut
+/// from ([`gather_fills`]): the buffer, its host GPU address, and whether a
+/// gather left it readable as constants (else it is common, as made).
+struct SlotChunk {
+    buffer: ID3D12Resource,
+    gpu: u64,
+    read: bool,
+}
+
+// SAFETY: a D3D12 resource (free-threaded); its state is tracked under the
+// lock of the list that holds it.
+unsafe impl Send for SlotChunk {}
+
+/// A list's first chunk of slots, then the others: most lists name a few
+/// constant buffers.
+const SLOT_FIRST: u64 = 256 << 10;
+const SLOT_CHUNK: u64 = 2 << 20;
+/// The most bytes of slot chunks kept while no list holds them.
+const SLOT_SPARE_MOST: u64 = 256 << 20;
+/// Slot chunks no list holds.
+static SLOT_SPARE: Mutex<Spare<SlotChunk>> = Mutex::new(Spare::new());
+
+/// Where a slot of `bytes` (a multiple of 256) goes: at `Ok(offset)` of the
+/// last chunk (`last`: its size, and the bytes used of it), or at the head
+/// of a new chunk of `Err(size)` bytes.
+fn slot_place(last: Option<(u64, u64)>, bytes: u64) -> Result<u64, u64> {
+    match last {
+        Some((size, used)) if used + bytes <= size => Ok(used),
+        Some(_) => Err(SLOT_CHUNK.max(bytes.next_multiple_of(64 << 10))),
+        None => Err(if bytes <= SLOT_FIRST { SLOT_FIRST } else { SLOT_CHUNK.max(bytes.next_multiple_of(64 << 10)) }),
+    }
+}
+
+/// The span `[from, to)` of title memory a copy is brought up to date over
+/// for gathered constants, with `[at, end)` joined if they lie this close.
+const SPAN_GAP: usize = 1 << 20;
+
+/// `[from, to)` and `[at, end)` as one span if they lie [`SPAN_GAP`] or
+/// closer, else none.
+fn span_join((from, to): (usize, usize), at: usize, end: usize) -> Option<(usize, usize)> {
+    (at <= to.saturating_add(SPAN_GAP) && from <= end.saturating_add(SPAN_GAP)).then_some((from.min(at), to.max(end)))
+}
+
+/// The constants of one copy a list's draws read from one chunk of slots,
+/// gathered in one pass ([`Host::gather_constants`]).
+struct ConstantSet {
+    /// The host GPU address of the copy's buffer, and its bytes (the copy
+    /// is held by its span, [`Constants::spans`]).
+    source_gpu: u64,
+    source_bytes: u64,
+    /// Its place in [`Constants::chunks`].
+    chunk: usize,
+    /// The table of entries (16 bytes each, [`crate::indirect::CONSTANTS_MOST`]
+    /// of them): the list's upload memory, its host GPU address and mapping.
+    table_gpu: u64,
+    table: usize,
+    entries: u32,
+}
+
+/// What a list's draws read from slots the card fills ([`gather_fills`]):
+/// the chunks of slots (each with its bytes) and the bytes used of the
+/// last, the sets of entries, and per copy the span of title memory they
+/// read, which the submission brings up to date.
+#[derive(Default)]
+struct Constants {
+    chunks: Vec<(SlotChunk, u64)>,
+    used: u64,
+    sets: Vec<ConstantSet>,
+    spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+}
+
+// SAFETY: as [`SlotChunk`]; the tables are the list's own upload memory,
+// written under the list's lock before the list is submitted.
+unsafe impl Send for Constants {}
+
+impl Constants {
+    /// A slot of `bytes` (a multiple of 256): its chunk and offset, taking
+    /// a chunk (a kept one, [`SLOT_SPARE`], or a new one) if the last is
+    /// full.
+    fn slot(&mut self, host: &Host, bytes: u64) -> Option<(usize, u64)> {
+        let last = self.chunks.last().map(|c| (c.1, self.used));
+        match slot_place(last, bytes) {
+            Ok(at) => {
+                self.used = at + bytes;
+                Some((self.chunks.len() - 1, at))
+            }
+            Err(size) => {
+                let kept = SLOT_SPARE.lock().unwrap_or_else(|e| e.into_inner()).take(size);
+                let chunk = match kept {
+                    Some(chunk) => chunk,
+                    None => {
+                        let buffer = host.uav_buffer(size)?;
+                        name(&buffer, || "constants gathered by the card".into());
+                        // SAFETY: a live buffer.
+                        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                        SlotChunk { buffer, gpu, read: false }
+                    }
+                };
+                self.chunks.push((chunk, size));
+                self.used = bytes;
+                Some((self.chunks.len() - 1, 0))
+            }
+        }
+    }
+
+    /// The bytes of the copy's buffer whose host GPU address is `gpu`.
+    fn source_bytes(&self, shadow: &crate::shadow::Shadow, gpu: u64) -> u64 {
+        match self.sets.iter().rev().find(|s| s.source_gpu == gpu) {
+            Some(set) => set.source_bytes,
+            // SAFETY: a live buffer.
+            None => unsafe { shadow.buffer.GetDesc() }.Width,
+        }
+    }
+}
+
+impl Drop for Constants {
+    fn drop(&mut self) {
+        if self.chunks.is_empty() {
+            return;
+        }
+        let mut spare = SLOT_SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        for (chunk, size) in self.chunks.drain(..) {
+            // Past the most kept, the chunk goes.
+            let _ = spare.give(chunk, size, SLOT_SPARE_MOST);
+        }
+    }
+}
+
+/// Lists of ours that gather constants ahead of a submission's lists
+/// ([`Host::gather_constants`]), each with the value of the host's fence
+/// after which it has run and may be recorded again.
+struct ConstantLists(Vec<(u64, Prelude)>);
+
+// SAFETY: D3D12 objects are free-threaded; a list is recorded only by the
+// submission that took it out.
+unsafe impl Send for ConstantLists {}
+
+static CONSTANT_LISTS: Mutex<ConstantLists> = Mutex::new(ConstantLists(Vec::new()));
+
+/// The spans of title memory the gathered constants of `runs` read, per
+/// copy ([`gather_fills`]): what the submission brings up to date for them.
+fn gathered_spans(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    let mut spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    for list in runs {
+        for (shadow, from, to) in &list.constants().spans {
+            match spans.iter_mut().find(|s| std::sync::Arc::ptr_eq(&s.0, shadow)) {
+                Some(s) => (s.1, s.2) = (s.1.min(*from), s.2.max(*to)),
+                None => spans.push((shadow.clone(), *from, *to)),
+            }
+        }
+    }
+    spans
+}
+
+#[cfg(test)]
+mod gather_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+
+    /// Slots are cut front to back from a list's chunks: a small first
+    /// chunk, then bigger ones, a new one when the last is full.
+    #[test]
+    fn slots_fill_their_chunks_front_to_back() {
+        assert_eq!(slot_place(None, 256), Err(SLOT_FIRST));
+        assert_eq!(slot_place(None, SLOT_FIRST), Err(SLOT_FIRST));
+        assert_eq!(slot_place(None, SLOT_FIRST + 256), Err(SLOT_CHUNK));
+        assert_eq!(slot_place(Some((SLOT_FIRST, 0)), 512), Ok(0));
+        assert_eq!(slot_place(Some((SLOT_FIRST, 768)), 512), Ok(768));
+        assert_eq!(slot_place(Some((SLOT_FIRST, SLOT_FIRST - 512)), 512), Ok(SLOT_FIRST - 512));
+        assert_eq!(slot_place(Some((SLOT_FIRST, SLOT_FIRST - 256)), 512), Err(SLOT_CHUNK));
+        assert_eq!(slot_place(Some((SLOT_CHUNK, SLOT_CHUNK)), 64 << 10), Err(SLOT_CHUNK));
+        // Never cut smaller than the slot.
+        assert_eq!(slot_place(Some((SLOT_CHUNK, 0)), 3 * SLOT_CHUNK), Err(3 * SLOT_CHUNK));
+    }
+
+    /// Spans join where they overlap, touch or lie no more than
+    /// [`SPAN_GAP`] apart, either way.
+    #[test]
+    fn spans_join_when_close() {
+        let span = (0x40_0000, 0x40_0200);
+        assert_eq!(span_join(span, 0x40_0100, 0x40_0300), Some((0x40_0000, 0x40_0300)));
+        assert_eq!(span_join(span, 0x40_0200, 0x40_0400), Some((0x40_0000, 0x40_0400)));
+        assert_eq!(span_join(span, 0x40_0200 + SPAN_GAP, 0x40_0210 + SPAN_GAP), Some((0x40_0000, 0x40_0210 + SPAN_GAP)));
+        assert_eq!(span_join(span, 0x40_0201 + SPAN_GAP, 0x40_0300 + SPAN_GAP), None);
+        assert_eq!(span_join(span, 0x3f_0000, 0x3f_0010), Some((0x3f_0000, 0x40_0200)));
+        assert_eq!(span_join(span, 0x40_0000 - SPAN_GAP, 0x40_0000 - SPAN_GAP + 16), Some((0x40_0000 - SPAN_GAP, 0x40_0200)));
+        assert_eq!(span_join(span, 0, 0x40_0000 - SPAN_GAP - 1), None);
+    }
+
+    /// The whole way on the host's device: constants given a slot while a
+    /// list records, of a title buffer whose copy is in the PC's memory
+    /// and of one whose copy may be in the card's, land in their slots with
+    /// the bytes title memory held when the list was SUBMITTED (written
+    /// after the recording, before it), through the submission's refresh
+    /// and the pass ahead of its lists.
+    #[test]
+    fn gathered_constants_hold_title_memory_as_submitted() {
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        assert!(crate::indirect::constants_ready(), "the pass that gathers constants compiles");
+        for (k, len) in [(0usize, 256usize << 10), (1, 2 << 20)] {
+            // SAFETY: a fresh write-watched allocation, freed at the end.
+            let title = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+            assert!(title != 0);
+            // SAFETY: our allocation.
+            let memory = unsafe { std::slice::from_raw_parts_mut(title as *mut u8, len) };
+            for (i, b) in memory.iter_mut().enumerate() {
+                *b = (i * 13 + 5) as u8;
+            }
+            let resource = 0x53_5100 + k;
+            crate::shadow::register(resource, title as u64, len as u64);
+            let shadow = crate::shadow::find(title as u64, 16).expect("the copy");
+            let list = host.new_list().expect("a host list");
+            // (offset in title memory, bytes): rows, a tail, one word.
+            let asks = [(0x1230usize, 0x220u64), (0x2_0010, 36), (len - 0x40, 4)];
+            let slots: Vec<u64> = asks.iter().map(|&(at, n)| list.gather_constant(&shadow, (title + at) as u64, n).expect("a slot")).collect();
+            // Written after the recording: the submission must take these.
+            for (i, b) in memory.iter_mut().enumerate() {
+                *b = ((i * 7 + 11) as u8) ^ 0xA5;
+            }
+            let (chunk, chunk_gpu) = {
+                let c = list.constants();
+                assert_eq!(c.chunks.len(), 1);
+                (c.chunks[0].0.buffer.clone(), c.chunks[0].0.gpu)
+            };
+            let (readback, readback_data) = host.shared_buffer(SLOT_FIRST).expect("a read-back");
+            // SAFETY: an open list; live buffers; the chunk is readable as
+            // constants when the list runs (the gather leaves it so).
+            unsafe {
+                list.list.ResourceBarrier(&[transition(&chunk, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.list.CopyBufferRegion(&readback, 0, &chunk, 0, SLOT_FIRST);
+                list.list.ResourceBarrier(&[transition(&chunk, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER)]);
+            }
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: the work is done; a mapped buffer.
+            let out = unsafe { std::slice::from_raw_parts(readback_data.cast_const(), SLOT_FIRST as usize) };
+            for (&(at, n), &gpu) in asks.iter().zip(&slots) {
+                let slot = (gpu - chunk_gpu) as usize;
+                assert_eq!(&out[slot..slot + n as usize], &memory[at..at + n as usize], "copy {k}: the constants at {at:#x}");
+            }
+            assert_eq!(list.constants().spans.len(), 1, "one span for the copy");
+            drop(list);
+            drop(shadow);
+            crate::shadow::unregister(resource, title as u64);
+            crate::watch::forget_written(title, title + len);
+            crate::watch::title_memory_remapped(title, len);
+            // SAFETY: our allocation, its copy let go.
+            unsafe { VirtualFree(title as *mut _, 0, MEM_RELEASE) };
         }
     }
 }
@@ -8626,6 +9249,17 @@ impl Meter {
                 );
             }
         }
+        {
+            let [fills, bytes, no_copy, unfit, passes, submissions] = [0, 1, 2, 3, 4, 5].map(|i| GATHERED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if fills + no_copy + unfit > 0.0 {
+                tracing::info!(
+                    "constants gathered by the card per frame (VICTORY_GATHER_FILLS): {fills:.0} fills, {:.2} MB, in {passes:.1} passes \
+                     ahead of {submissions:.1} submissions; left to the CPU: {no_copy:.0} that no title buffer's copy holds, {unfit:.0} \
+                     that do not fit the pass",
+                    bytes / 1e6
+                );
+            }
+        }
         // Title-filled textures read past their guards, by why.
         {
             let [written, turn, aliased, unguarded, partial] =
@@ -9378,6 +10012,19 @@ fn in_flight(history: &[D3D12_AUTO_BREADCRUMB_OP], markers: &[(u32, String)], do
         text.push_str(&format!("; command {i} (op {}): {marker}", op.0));
     }
     text
+}
+
+/// A wait for every earlier shader write, of any resource.
+fn uav_barrier_all() -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: std::mem::ManuallyDrop::new(None),
+            }),
+        },
+    }
 }
 
 pub(crate) fn transition(

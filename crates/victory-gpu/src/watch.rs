@@ -2449,6 +2449,60 @@ mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
+    /// `writes_after` lists what `writes` lists, less the pages last written
+    /// at or before its asking: "nothing after the asking" is an empty list
+    /// exactly where every write `writes` gives is that old (as the texture
+    /// and page-copy checks ask it), for write-watched memory and for view
+    /// memory the guards answer.
+    #[test]
+    fn writes_after_leaves_out_only_older_writes() {
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile};
+        const PAGES: usize = 4;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let watched = unsafe { VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(watched, 0);
+        // SAFETY: a new pagefile section, mapped whole; the view holds its
+        // own reference once the handle is closed.
+        let view = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (PAGES * PAGE) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGES * PAGE).Value as usize;
+            windows_sys::Win32::Foundation::CloseHandle(section);
+            view
+        };
+        assert_ne!(view, 0);
+        for (at, guarded) in [(watched, false), (view, true)] {
+            let range = (at, at + PAGES * PAGE);
+            let (first, _) = writes(range.0, range.1, guarded).expect("watched or guarded");
+            // Pages 1 and 3 written, each after an asking of its own.
+            let mut askings = vec![first];
+            for page in [1, 3] {
+                // SAFETY: a byte of our memory (a guarded block faults and opens).
+                unsafe { ((at + page * PAGE + 8) as *mut u8).write_volatile(1) };
+                askings.push(writes(range.0, range.1, guarded).unwrap().0);
+            }
+            let (now, all) = writes(range.0, range.1, guarded).unwrap();
+            // (A view's first check reports all its pages, at `first`.)
+            let later: Vec<usize> = all.iter().filter(|w| w.1 > first).map(|w| w.0 - at / PAGE).collect();
+            assert_eq!(later, [1, 3]);
+            askings.push(now);
+            for since in askings {
+                let (_, after) = writes_after(range.0, range.1, guarded, since).unwrap();
+                let older: Vec<(usize, u64)> = all.iter().copied().filter(|&(_, w)| w > since).collect();
+                assert_eq!(after, older, "after asking {since} (guarded: {guarded})");
+                assert_eq!(after.is_empty(), all.iter().all(|&(_, w)| w <= since));
+            }
+        }
+        forget_written(watched, watched + PAGES * PAGE);
+        forget_written(view, view + PAGES * PAGE);
+        title_memory_remapped(view, PAGES * PAGE);
+        // SAFETY: our view and allocation.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ });
+            VirtualFree(watched as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
     /// A kernel read into a guarded view block fails; opened first, it
     /// lands and the block counts as written.
     #[test]

@@ -233,10 +233,11 @@ pub(crate) fn pull(start: usize, end: usize) {
         if asked != 0 && crate::watch::block_clean(from) {
             continue;
         }
-        let Some((now, written)) = crate::watch::writes(from, from + PAGE, true) else {
+        // Only the pages written after the copy's last look are listed.
+        let Some((now, written)) = crate::watch::writes_after(from, from + PAGE, true, asked) else {
             continue;
         };
-        if asked != 0 && written.iter().all(|&(_, w)| w <= asked) {
+        if asked != 0 && written.is_empty() {
             let mut copies = COPIES.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(c) = copies.get_mut(&page) {
                 c.asked = now;

@@ -1061,8 +1061,10 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+        // Only the pages written after the last look are listed
+        // (`crate::watch::writes_after`): with none, nothing changed.
+        if let Some((now, written)) = waited(1, || crate::watch::writes_after(start, start + size, false, last.asked)) {
+            if last.asked != 0 && written.is_empty() {
                 return 0;
             }
             last.asked = now;
@@ -1090,10 +1092,10 @@ impl Staging {
         // Diagnostics: why the texture is read below ([`TEX_WHY`]).
         let mut why = 3;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+            && let Some((now, written)) = waited(1, || crate::watch::writes_after(start, start + size, true, last.asked))
         {
             const HASH_EVERY: u64 = 8;
-            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+            let unwritten = last.asked != 0 && written.is_empty();
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
             // Pages shown at another address too, where the guards do not

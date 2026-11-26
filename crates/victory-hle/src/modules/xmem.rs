@@ -911,6 +911,10 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    // Page-mapping batches of the GPU's not applied yet over this memory,
+    // or mapping from it, go first (`VICTORY_ASYNC_PAGE_MAPPINGS`): the
+    // mappings change in the order the title asked for them.
+    victory_gpu::title_memory_mapping(address as usize, n.saturating_mul(PAGE));
     let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
@@ -983,6 +987,12 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 ) -> BOOL {
     if addresses.is_null() {
         return 0;
+    }
+    // As in `XMemMapPhysicalPages`: the GPU's batches over these pages, or
+    // mapping from them, go first.
+    for i in 0..n {
+        // SAFETY: the title passes `n` addresses.
+        victory_gpu::title_memory_mapping(unsafe { *addresses.add(i) } as usize, PAGE);
     }
     // The physical pages' lock once for all the pages; the remapping lock
     // once a page, for the memory that page's change touches: it waits

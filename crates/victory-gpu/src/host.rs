@@ -3305,6 +3305,27 @@ pub(crate) fn late_met_known(wait: &crate::list::ValueWait) -> bool {
     false
 }
 
+/// Before a page-mapping batch of the title's changes what title memory
+/// `ranges` (`[from, to)`) shows (`crate::pagemap`, off the title's thread,
+/// [`late`]): flights in the air whose shaders may write there land first,
+/// so that what they wrote goes to the pages they were prepared against.
+/// With the relay only those are waited for; without it everything is
+/// settled, if one may. Nothing to do while none may.
+pub(crate) fn land_writes_in(ranges: &[(usize, usize)]) {
+    if !late() {
+        return;
+    }
+    let meets = |line: &Line| ranges.iter().any(|&(from, to)| touches(&line.written, from, to));
+    if !meets(&line()) {
+        return;
+    }
+    if relay() {
+        relay_wait(WHY_STALE, |line| !meets(line));
+    } else {
+        settle_now(WHY_STALE);
+    }
+}
+
 /// Settles the flights in the air, if any ([`Host::settle`]), for reason
 /// `why` (one of the `WHY_` places). Not from inside a submission.
 pub(crate) fn settle_now(why: usize) {

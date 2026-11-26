@@ -53,6 +53,8 @@ pub mod list;
 #[cfg(windows)]
 mod loop_report;
 pub mod object;
+#[cfg(windows)]
+mod pagemap;
 pub mod pipeline;
 #[cfg(windows)]
 mod plaincopy;
@@ -88,6 +90,8 @@ pub use alias::{title_memory_copied, title_memory_copies};
 pub use host::on_failure;
 #[cfg(windows)]
 pub use inplace::{in_place_wanted, title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
+pub use pagemap::title_memory_mapping;
 #[cfg(windows)]
 pub use watch::{
     title_memory_committed, title_memory_reading, title_memory_reading_all, title_memory_remapped, title_memory_remapping,

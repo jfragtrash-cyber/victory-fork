@@ -62,6 +62,24 @@ enum Held {
     /// what the queue holds before it: the host texture shown, the state
     /// the title's lists leave it in, and the frame's number.
     Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64),
+    /// With `crate::pagemap::on`: a page-mapping batch of the title's
+    /// ([`copy_page_mappings`]). When the line gets to it, it is handed to
+    /// the thread that applies batches and stays at the head until done:
+    /// what is behind it waits.
+    Map(std::sync::Arc<crate::pagemap::Batch>),
+}
+
+/// A queue let go with page-mapping batches in its line: they are applied
+/// all the same (whatever waits for one would otherwise wait for ever).
+#[cfg(windows)]
+impl Drop for Queue {
+    fn drop(&mut self) {
+        for held in self.held.get_mut().unwrap_or_else(|e| e.into_inner()).iter() {
+            if let Held::Map(batch) = held {
+                crate::pagemap::hand(batch);
+            }
+        }
+    }
 }
 
 /// Presents that are in a queue's line and have not run ([`Held::Present`]).
@@ -523,6 +541,17 @@ fn wake() {
     WORK.1.notify_one();
 }
 
+/// A page-mapping batch is done (`crate::pagemap`): what its line holds
+/// behind it may run. With [`behind`] only, whose thread runs the lines;
+/// never runs them here (the batch may have been applied from inside a
+/// line being run).
+#[cfg(windows)]
+pub(crate) fn mapped() {
+    if behind() {
+        wake();
+    }
+}
+
 /// The thread of [`behind`]: runs what queues hold as far as it is free
 /// to run, each time something was added or a fence moved.
 #[cfg(windows)]
@@ -805,6 +834,25 @@ fn release_held_now(all: bool) {
                     // The frame is shown behind the parts taken: they are
                     // sent first.
                     Some(Held::Present(..)) if !joined.is_empty() => break,
+                    // A page-mapping batch: once every submission before
+                    // it is prepared (none of this queue's is among the
+                    // parts taken), it goes to the thread that applies
+                    // batches, with the batches right behind it; the line
+                    // stands here until it is done. Lines forced at a
+                    // present stand here too, unless a submission or a
+                    // present is behind it (part of what is shown, maybe):
+                    // then it is applied here, in its place.
+                    Some(Held::Map(batch)) if !batch.done() && !(all && forced_in_place(&held, base)) => {
+                        if base == 0 {
+                            for item in held.iter() {
+                                let Held::Map(batch) = item else {
+                                    break;
+                                };
+                                crate::pagemap::hand(batch);
+                            }
+                        }
+                        break;
+                    }
                     Some(_) => {}
                 }
                 match held.remove(base) {
@@ -929,6 +977,20 @@ fn release_held_now(all: bool) {
                         }
                         PRESENTS_HELD.fetch_sub(1, Ordering::Relaxed);
                     }
+                    // Done; or the lines are forced with submissions
+                    // behind it, and it is applied here, in its place, with
+                    // the line open meanwhile.
+                    Held::Map(batch) => {
+                        if !batch.done() {
+                            held.insert(0, Held::Running);
+                            drop(held);
+                            crate::pagemap::force(&batch);
+                            held = lock(line);
+                            if matches!(held.first(), Some(Held::Running)) {
+                                held.remove(0);
+                            }
+                        }
+                    }
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
                     Held::Signal(fence, value) => {
@@ -955,6 +1017,16 @@ fn release_held_now(all: bool) {
             send_joined(&mut joined);
         }
     }
+}
+
+/// Whether lines forced at a present apply the page-mapping batch at `at`
+/// in `held` in its place, on the present's thread: a submission or a
+/// present is behind it in its line, part of what is shown, maybe.
+/// Otherwise the line stands at it as when not forced, and goes on when
+/// our thread has applied it.
+#[cfg(windows)]
+fn forced_in_place(held: &[Held], at: usize) -> bool {
+    held.iter().skip(at + 1).any(|h| matches!(h, Held::Run(..) | Held::Present(..)))
 }
 
 /// Whether a queue may pass `wait`: memory holds the value, or, with
@@ -1491,10 +1563,11 @@ const PAGE: u64 = 64 << 10;
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. The title streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once: every earlier
-/// submission has run.
+/// one constant page or of unmapped pages). Done at once, on the title's
+/// thread; with `crate::pagemap::on`, behind the queue's line by a thread
+/// of ours (how and why there).
 extern "system" fn copy_page_mappings(
-    _: This,
+    this: This,
     count: u32,
     batches: *const PageBatch,
     pool: u64,
@@ -1507,12 +1580,43 @@ extern "system" fn copy_page_mappings(
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
-    let batches = (count > 0).then(|| {
+    #[cfg(windows)]
+    let called = std::time::Instant::now();
+    let batches = if count > 0 {
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
-    });
+    } else {
+        &[]
+    };
+    let (ops, mut ok) = page_ops(batches, pool, pool_pages);
+    #[cfg(windows)]
+    let ops = if !this.is_null() && !ops.is_empty() && crate::pagemap::on() {
+        map_behind(this, ops);
+        Vec::new()
+    } else {
+        ops
+    };
+    #[cfg(not(windows))]
+    let _ = this;
+    for (to, from, len) in ops {
+        ok &= map(to, from, len);
+    }
+    if !ok {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+    }
+    #[cfg(windows)]
+    crate::pagemap::called(called.elapsed().as_micros() as u64);
+    S_OK
+}
+
+/// The page mapper's calls `batches` ask for, in order (`(to, from, len)`,
+/// `from` 0 unmapping), and whether every range was one it knows (a range
+/// past the pool's pages, or of a kind not known, maps nothing).
+fn page_ops(batches: &[PageBatch], pool: u64, pool_pages: u32) -> (Vec<(u64, u64, u64)>, bool) {
+    let mut ops = Vec::new();
     let mut ok = true;
-    for b in batches.into_iter().flatten() {
+    for b in batches {
         if b.ranges.is_null() {
             continue;
         }
@@ -1523,21 +1627,53 @@ extern "system" fn copy_page_mappings(
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
-            ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
-                2 => map(at, 0, len),
-                3 => true,
-                _ => false,
-            };
+            match r.kind {
+                0 if inside(r.count) => ops.push((at, source, len)),
+                1 if inside(1) => ops.extend((0..u64::from(r.count)).map(|k| (at + k * PAGE, source, PAGE))),
+                2 => ops.push((at, 0, len)),
+                3 => {}
+                _ => ok = false,
+            }
             at += len;
         }
     }
-    if !ok {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+    (ops, ok)
+}
+
+/// With `crate::pagemap::on`: the batch goes behind what the queue `this`
+/// holds. A line that holds nothing has prepared and sent every submission
+/// before it: the batch is handed to the thread that applies batches at
+/// once.
+#[cfg(windows)]
+fn map_behind(this: This, ops: Vec<(u64, u64, u64)>) {
+    let batch = crate::pagemap::batch(ops);
+    let first = {
+        let mut held = lock(&queue(this).held);
+        let first = held.is_empty();
+        held.push(Held::Map(batch.clone()));
+        first
+    };
+    {
+        let mut waiting = lock(&WAITING);
+        if !waiting.contains(&(this as usize)) {
+            waiting.push(this as usize);
+        }
     }
-    S_OK
+    // Which queues carry them (a batch holds only its own queue's line).
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
+        tracing::info!(
+            kind = queue(this).kind,
+            queue = format_args!("{:#x}", this as usize),
+            handed_at_once = first,
+            "a page-mapping batch goes behind its queue's line (VICTORY_ASYNC_PAGE_MAPPINGS=1)"
+        );
+    }
+    if first {
+        crate::pagemap::hand(&batch);
+    } else {
+        wake();
+    }
 }
 
 extern "system" fn desc(this: This, out: *mut QueueDesc) {
@@ -1678,6 +1814,162 @@ mod tests {
         assert_eq!(old[14], new[16]); // signal 0x70 → 0x80
         assert_eq!(old[30], new[32]); // present 0xf0 → 0x100
         assert_eq!(new[35], execute_x as *const ()); // 0x118
+    }
+
+    #[test]
+    fn page_batches_become_the_mappers_calls() {
+        const P: u64 = 64 << 10;
+        let ranges = [
+            PageRange { kind: 0, start: 2, count: 3 }, // pool pages 2-4
+            PageRange { kind: 1, start: 7, count: 2 }, // pool page 7, twice
+            PageRange { kind: 2, start: 0, count: 4 }, // unmapped
+            PageRange { kind: 3, start: 0, count: 1 }, // left as it is
+            PageRange { kind: 0, start: 9, count: 2 }, // past the pool's ten pages
+            PageRange { kind: 1, start: 9, count: 1 }, // its last page
+        ];
+        let batches = [
+            PageBatch { destination: 0x1000_0000, count: ranges.len() as u32, ranges: ranges.as_ptr() },
+            PageBatch { destination: 0, count: 5, ranges: std::ptr::null() },
+        ];
+        let (d, pool) = (0x1000_0000, 0x9000_0000);
+        let (ops, ok) = page_ops(&batches, pool, 10);
+        assert_eq!(
+            ops,
+            [(d, pool + 2 * P, 3 * P), (d + 3 * P, pool + 7 * P, P), (d + 4 * P, pool + 7 * P, P), (d + 5 * P, 0, 4 * P), (d + 12 * P, pool + 9 * P, P)]
+        );
+        assert!(!ok, "a range past the pool maps nothing and says so");
+        assert_eq!(page_ops(&[], pool, 10), (Vec::new(), true));
+    }
+
+    /// The tests that run the lines one at a time: one of them forces
+    /// every line.
+    #[cfg(windows)]
+    static LINES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A queue of the tests whose line holds `items`, among the queues
+    /// whose lines are run.
+    #[cfg(windows)]
+    fn queue_holding(items: Vec<Held>) -> This {
+        let null = std::ptr::null();
+        let desc = QueueDesc { kind: 3, priority: 0, flags: 0, nodes: 0 };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        lock(&queue(q).held).extend(items);
+        lock(&WAITING).push(q as usize);
+        q
+    }
+
+    #[cfg(windows)]
+    fn fence_at_zero() -> This {
+        let null = std::ptr::null();
+        let mut fence = null;
+        assert_eq!(crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence), S_OK);
+        fence
+    }
+
+    /// Page-mapping targets of the tests (never dereferenced).
+    #[cfg(windows)]
+    const TARGETS: u64 = 0x7d00_0000_0000;
+
+    /// A fence signalled behind a page-mapping batch is set once the batch
+    /// is applied, never before: the line hands the batch on when it gets
+    /// there, with the batch right behind it, and stands at the first one
+    /// until it is done.
+    #[cfg(windows)]
+    #[test]
+    fn a_signal_behind_page_mappings_waits_for_them() {
+        use crate::pagemap::tests as map;
+        let _one = lock(&LINES);
+        map::use_mapper();
+        let (first, second, fence) = (TARGETS, TARGETS + (64 << 10), fence_at_zero());
+        map::watch(first, fence);
+        map::watch(second, fence);
+        let a = crate::pagemap::batch(vec![(first, 0, 64 << 10)]);
+        let b = crate::pagemap::batch(vec![(second, 0, 64 << 10)]);
+        let q = queue_holding(vec![Held::Map(a.clone()), Held::Map(b.clone()), Held::Signal(fence as usize, 1)]);
+        release_held_now(false);
+        assert_ne!(map::state(&a), map::STATE_PENDING, "handed when the line got to it");
+        assert_ne!(map::state(&b), map::STATE_PENDING, "the batch right behind it too");
+        // (A thread of the tests' own may apply them meanwhile.)
+        assert!(a.done() && b.done() || crate::fence::completed(fence) == 0, "nothing behind them runs before they are done");
+        map::run(&b);
+        release_held_now(false);
+        assert!(a.done() || crate::fence::completed(fence) == 0, "the line stands at the first");
+        map::run(&a);
+        release_held_now(false);
+        assert_eq!(crate::fence::completed(fence), 1);
+        assert_eq!(map::calls_at(first), [Some(0)], "applied once, before the signal");
+        assert_eq!(map::calls_at(second), [Some(0)], "applied once, before the signal");
+        assert!(lock(&queue(q).held).is_empty());
+    }
+
+    /// A batch behind a wait for a fence is not handed on before the fence
+    /// gets there: submissions of other queues the wait is for are prepared
+    /// with the old mappings.
+    #[cfg(windows)]
+    #[test]
+    fn a_page_mapping_behind_a_wait_waits_for_it() {
+        use crate::pagemap::tests as map;
+        let _one = lock(&LINES);
+        map::use_mapper();
+        let (to, waited, after) = (TARGETS + (1 << 20), fence_at_zero(), fence_at_zero());
+        map::watch(to, waited);
+        let batch = crate::pagemap::batch(vec![(to, 0, 64 << 10)]);
+        let q = queue_holding(vec![Held::Wait(waited as usize, 1), Held::Map(batch.clone()), Held::Signal(after as usize, 1)]);
+        release_held_now(false);
+        assert_eq!(map::state(&batch), map::STATE_PENDING, "the line stands at the wait");
+        crate::fence::set(waited, 1);
+        release_held_now(false);
+        assert_ne!(map::state(&batch), map::STATE_PENDING, "handed once the wait is met");
+        map::run(&batch);
+        release_held_now(false);
+        assert_eq!(crate::fence::completed(after), 1);
+        assert_eq!(map::calls_at(to), [Some(1)], "applied after the wait was met");
+        assert!(lock(&queue(q).held).is_empty());
+    }
+
+    /// Lines forced at a present pass their waits, but a batch with only a
+    /// signal behind it is left to our thread: the signal is still set
+    /// after it, and the present's thread does not wait for it.
+    #[cfg(windows)]
+    #[test]
+    fn forced_lines_leave_a_batch_with_nothing_shown_behind_it() {
+        use crate::pagemap::tests as map;
+        let _one = lock(&LINES);
+        map::use_mapper();
+        let (to, never, fence) = (TARGETS + (2 << 20), fence_at_zero(), fence_at_zero());
+        map::watch(to, fence);
+        let batch = crate::pagemap::batch(vec![(to, 0, 64 << 10)]);
+        let q = queue_holding(vec![Held::Wait(never as usize, 1), Held::Map(batch.clone()), Held::Signal(fence as usize, 1)]);
+        release_held_now(true);
+        assert_ne!(map::state(&batch), map::STATE_PENDING, "the wait was passed, the batch handed on");
+        assert!(batch.done() || crate::fence::completed(fence) == 0, "the signal stays behind it");
+        map::run(&batch);
+        release_held_now(false);
+        assert_eq!(crate::fence::completed(fence), 1);
+        assert_eq!(map::calls_at(to), [Some(0)], "applied before the signal behind it");
+        assert!(lock(&queue(q).held).is_empty());
+    }
+
+    /// Forced lines apply a batch in place, on the present's thread, only
+    /// with a submission or a present behind it.
+    #[cfg(windows)]
+    #[test]
+    fn forced_lines_apply_a_batch_in_place_only_before_what_is_shown() {
+        let made = std::cell::RefCell::new(Vec::new());
+        let batch = || {
+            let b = crate::pagemap::batch(Vec::new());
+            made.borrow_mut().push(b.clone());
+            Held::Map(b)
+        };
+        let run = || Held::Run(Vec::new(), Vec::new());
+        assert!(!forced_in_place(&[batch(), Held::Signal(0, 1), batch(), Held::Wait(0, 1)], 0));
+        assert!(forced_in_place(&[batch(), Held::Wait(0, 1), run()], 0));
+        assert!(!forced_in_place(&[run(), batch(), Held::Signal(0, 1)], 1), "a submission before it is not behind it");
+        // Not left among the batches not applied yet.
+        for b in made.borrow().iter() {
+            crate::pagemap::tests::run(b);
+        }
     }
 
     #[test]

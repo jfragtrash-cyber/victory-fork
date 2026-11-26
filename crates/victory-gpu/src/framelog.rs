@@ -63,6 +63,20 @@ pub enum T {
     Remaps,
     RemapUs,
     RemapWaitUs,
+    /// The title's page-mapping copies (`crate::pagemap`): its calls and
+    /// its time in them, on every thread, and its time waiting for batches
+    /// applied elsewhere (at a present that forced the lines, at a fault,
+    /// before a mapping of its own); the batches a thread of ours applied,
+    /// their pages, its time applying them, and their time from the call
+    /// to the end; batches applied before their line got to them.
+    PageMapCalls,
+    PageMapCallUs,
+    PageMapWaitUs,
+    PageMapBatches,
+    PageMapPages,
+    PageMapApplyUs,
+    PageMapLagUs,
+    PageMapEarly,
     /// Texture refreshes on every thread, and of them the wait for title
     /// memory to hold still; uploads recorded.
     RefreshUs,
@@ -412,7 +426,9 @@ fn text(f: &Frame) -> String {
          send-and-hash lists {:.1} ms in {:.0}, our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0} | \
          recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
          still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
-         readers) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
+         readers) | page mappings: {:.0} calls, the title {:.1} ms in them and {:.1} ms waiting for batches; {:.0} batches \
+         {:.0} pages applied by our thread in {:.1} ms, {:.1} ms after their call on average, {:.0} ahead of their place \
+         | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
          faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
          draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
         f.us / 1e3,
@@ -454,6 +470,14 @@ fn text(f: &Frame) -> String {
         t(T::Remaps),
         ms(T::RemapUs),
         ms(T::RemapWaitUs),
+        t(T::PageMapCalls),
+        ms(T::PageMapCallUs),
+        ms(T::PageMapWaitUs),
+        t(T::PageMapBatches),
+        t(T::PageMapPages),
+        ms(T::PageMapApplyUs),
+        ms(T::PageMapLagUs) / t(T::PageMapBatches).max(1.0),
+        t(T::PageMapEarly),
         s(S_PIPELINES_MADE),
         s(S_PIPELINES_LOADED),
         ms(T::PipelineWaitUs),

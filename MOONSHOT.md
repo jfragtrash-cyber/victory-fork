@@ -535,3 +535,14 @@ already reach.
   lists 55.9 ms at 3,799 draws against AW's 48.5 at 3,681). The group merge
   stays off until a same-scene check clears it. AW's fence way: 72 ms =
   43 to the line + 22 the card + 8.5 landing (AU: 109 = 55 + 44 + 10).
+- 2026-11-26, night. Run AX (`VICTORY_EARLY_FENCES=1`, captured): the
+  title's fences set as soon as what comes before them is prepared, without
+  the card's ~22 ms and the landing's ~9: the frame does not get shorter
+  (118-135 ms with the capture); the submitting thread's preparing grows to
+  86-96 ms a frame instead, and after some minutes the title crashed on an
+  address read from memory the card had not written back yet. So: **the
+  frame's limit is how fast the submitting thread prepares** (copies of
+  title memory, the guards and askings, the merges), not the card and not
+  the landing. The switch stays, off, for measuring; the hashing of card
+  copies a group a piece (`VICTORY_CARD_HASH_WIDE=1`) joins the best set
+  (card time -11 ms a frame, pictures right in AW).

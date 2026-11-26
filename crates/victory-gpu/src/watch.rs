@@ -60,7 +60,7 @@ struct Journal {
     /// answer under the shared one takes a number too: [`writes_shared`]).
     asked: AtomicU64,
     /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
+    written: Askings,
     /// Room for the kernel's answer.
     found: Vec<usize>,
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
@@ -81,11 +81,109 @@ impl Journal {
     }
 }
 
+/// Pages to a chunk of [`Askings`]: 256 MiB of title memory, 32 KiB of
+/// askings.
+const ASK_SHIFT: u32 = 12;
+const ASK_CHUNK: usize = 1 << ASK_SHIFT;
+
+/// The journal's pages: for each, the asking that last found it written
+/// (0: none; every asking is numbered from 1), in chunks of [`ASK_CHUNK`]
+/// pages made when a page of theirs is first noted (and kept), in chunk
+/// order, with the highest asking of each 64 pages beside them (at least
+/// as high: one noted lower later leaves it). The pages of a range written
+/// after an asking are found without looking into groups of 64 that hold
+/// none ([`Askings::after`]).
+///
+/// It was a `BTreeMap`, whose range was read whole into a vector at every
+/// asking: 3.4 ms a frame of the submitting thread in run AM (the walk of
+/// the tree, the vector, its freeing), for copies that compared nearly all
+/// of it with their own askings and found it older.
+struct Askings {
+    chunks: Vec<AskChunk>,
+}
+
+struct AskChunk {
+    /// Its number: pages `[at * ASK_CHUNK, (at + 1) * ASK_CHUNK)`.
+    at: usize,
+    askings: Box<[u64; ASK_CHUNK]>,
+    /// Per 64 pages, an asking no lower than any of theirs.
+    most: [u64; ASK_CHUNK / 64],
+}
+
+impl Askings {
+    const fn new() -> Askings {
+        Askings { chunks: Vec::new() }
+    }
+
+    /// The asking that last found `page` written; 0 if none.
+    #[cfg(test)]
+    fn get(&self, page: usize) -> u64 {
+        match self.chunks.binary_search_by_key(&(page >> ASK_SHIFT), |c| c.at) {
+            Ok(i) => self.chunks[i].askings[page & (ASK_CHUNK - 1)],
+            Err(_) => 0,
+        }
+    }
+
+    /// Notes `page` written at `asking`; the asking noted before (0: none).
+    fn set(&mut self, page: usize, asking: u64) -> u64 {
+        let i = match self.chunks.binary_search_by_key(&(page >> ASK_SHIFT), |c| c.at) {
+            Ok(i) => i,
+            Err(i) => {
+                let chunk = AskChunk { at: page >> ASK_SHIFT, askings: Box::new([0; ASK_CHUNK]), most: [0; ASK_CHUNK / 64] };
+                self.chunks.insert(i, chunk);
+                i
+            }
+        };
+        let c = &mut self.chunks[i];
+        let o = page & (ASK_CHUNK - 1);
+        c.most[o / 64] = c.most[o / 64].max(asking);
+        std::mem::replace(&mut c.askings[o], asking)
+    }
+
+    /// The pages of `[first, last)` noted written after asking `since`, with
+    /// the asking that last found each, in page order (`since` 0: all that
+    /// were ever noted).
+    fn after(&self, first: usize, last: usize, since: u64) -> Vec<(usize, u64)> {
+        let mut found = Vec::new();
+        if first >= last {
+            return found;
+        }
+        let (lo_chunk, hi_chunk) = (first >> ASK_SHIFT, (last - 1) >> ASK_SHIFT);
+        let start = self.chunks.partition_point(|c| c.at < lo_chunk);
+        for c in self.chunks[start..].iter().take_while(|c| c.at <= hi_chunk) {
+            let base = c.at << ASK_SHIFT;
+            let (lo, hi) = (first.max(base) - base, last.min(base + ASK_CHUNK) - base);
+            for group in lo / 64..hi.div_ceil(64) {
+                if c.most[group] <= since {
+                    continue;
+                }
+                for o in (group * 64).max(lo)..(group * 64 + 64).min(hi) {
+                    let asking = c.askings[o];
+                    if asking > since {
+                        found.push((base + o, asking));
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// Tests: forgets pages `[first, last)`.
+    #[cfg(test)]
+    fn forget(&mut self, first: usize, last: usize) {
+        for page in first..last {
+            if let Ok(i) = self.chunks.binary_search_by_key(&(page >> ASK_SHIFT), |c| c.at) {
+                self.chunks[i].askings[page & (ASK_CHUNK - 1)] = 0;
+            }
+        }
+    }
+}
+
 /// Behind a lock that askings which change nothing share ([`writes_shared`]);
 /// every other use holds it alone ([`journal`]), as when it was a mutex.
 static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     asked: AtomicU64::new(0),
-    written: BTreeMap::new(),
+    written: Askings::new(),
     found: Vec::new(),
     ahead: Vec::new(),
     ahead_asked: 0,
@@ -108,7 +206,7 @@ fn journal_shared() -> std::sync::RwLockReadGuard<'static, Journal> {
 #[cfg(test)]
 pub(crate) fn forget_written(start: usize, end: usize) {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    journal().written.retain(|&page, _| !(first..last).contains(&page));
+    journal().written.forget(first, last);
 }
 
 /// Ranges of one submission closer than this are asked about together:
@@ -307,7 +405,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
     // (fxceless/victory-fork#410).
     j.ahead_asked = now;
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
-        j.written.insert(page, now);
+        j.written.set(page, now);
     }
 }
 
@@ -329,10 +427,10 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
     if j.kept || !j.ahead.is_empty() {
         j.ahead_asked = now;
     }
-    let before = j.written.insert(page, now).unwrap_or(0);
+    let before = j.written.set(page, now);
     for &other in others {
         if other != page {
-            j.written.insert(other, now);
+            j.written.set(other, now);
         }
     }
     (before, now)
@@ -391,7 +489,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     let now = j.ahead_asked;
     for k in 0..count {
         let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
+        j.written.set(page, now);
     }
     true
 }
@@ -407,7 +505,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+        .then(|| (j.ahead_asked, j.written.after(first, last, 0)))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -416,32 +514,37 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    writes_as(start, end, guarded, shared_asks())
+    writes_as(start, end, guarded, shared_asks(), 0)
 }
 
-/// [`writes`]; with `shared`, an asking that changes nothing is answered
-/// under the shared locks ([`writes_shared`]).
-fn writes_as(start: usize, end: usize, guarded: bool, shared: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+/// [`writes`], with the pages last found written at or before asking
+/// `since` left out of the list: for a caller whose every page of the
+/// range was taken after `since` (or never), to which those pages were
+/// not written since it took them. Most refreshes find nothing new: the
+/// list of every page ever written in the range, made at each asking and
+/// compared page by page with the copy's, was 3.4 ms a frame of the
+/// submitting thread in run AM.
+pub(crate) fn writes_after(start: usize, end: usize, guarded: bool, since: u64) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_as(start, end, guarded, shared_asks(), since)
+}
+
+/// [`writes_after`]; with `shared`, an asking that changes nothing is
+/// answered under the shared locks ([`writes_shared`]).
+fn writes_as(start: usize, end: usize, guarded: bool, shared: bool, since: u64) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     // Copies of physical pages there whose source was written are taken
     // again first: their own write watch then says so (`crate::alias`).
     crate::alias::pull(start, end);
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    if shared && let Some(answer) = writes_shared(first, last, guarded) {
+    if shared && let Some(answer) = writes_shared(first, last, guarded, since) {
         return Some(answer);
     }
     let mut j = journal();
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
-        return Some((
-            j.ahead_asked,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+        return Some((j.ahead_asked, j.written.after(first, last, since)));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -499,17 +602,14 @@ fn writes_as(start: usize, end: usize, guarded: bool, shared: bool) -> Option<(u
         slow(started.elapsed().as_micros() as u64);
     }
     let now = j.next_asking();
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+    for k in 0..count {
+        let page = j.found[k] / PAGE;
+        j.written.set(page, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    for page in guarded {
+        j.written.set(page, now);
+    }
+    Some((now, j.written.after(first, last, since)))
 }
 
 /// Whether an asking that would change nothing is answered under shared
@@ -570,9 +670,9 @@ pub(crate) fn shared_line(frames: f64) {
 /// guards take after the look is found by the next asking, as after any.
 /// Its number is a new one, taken with the journal held: every write
 /// noted before is older, every one noted after (alone) newer.
-fn writes_shared(first: usize, last: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+fn writes_shared(first: usize, last: usize, guarded: bool, since: u64) -> Option<(u64, Vec<(usize, u64)>)> {
     use std::sync::atomic::Ordering::Relaxed;
-    let answer = |j: &Journal, now: u64| (now, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect());
+    let answer = |j: &Journal, now: u64| (now, j.written.after(first, last, since));
     let j = journal_shared();
     if j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
         SHARED[0].fetch_add(1, Relaxed);
@@ -2810,47 +2910,53 @@ mod shared_tests {
         let (start, end) = (view.0, view.0 + view.1);
         let (first, last) = (start / PAGE, end / PAGE);
         // The first asking guards the view (alone: nothing is known yet).
-        assert!(writes_shared(first, last, true).is_none());
-        let (a, written) = writes_as(start, end, true, false).expect("view memory");
-        let (b, shared) = writes_shared(first, last, true).expect("nothing to change");
+        assert!(writes_shared(first, last, true, 0).is_none());
+        let (a, written) = writes_as(start, end, true, false, 0).expect("view memory");
+        let (b, shared) = writes_shared(first, last, true, 0).expect("nothing to change");
         assert!(b > a && shared == written);
         // SAFETY: a byte of our view: the write faults and the guards open the block.
         unsafe { ((start + 3 * BLOCK + 40) as *mut u8).write_volatile(7) };
-        assert!(writes_shared(first, last, true).is_none(), "a block was written");
-        let (c, after) = writes_as(start, end, true, true).expect("view memory");
+        assert!(writes_shared(first, last, true, 0).is_none(), "a block was written");
+        let (c, after) = writes_as(start, end, true, true, 0).expect("view memory");
         assert!(c > b);
         assert!(after.contains(&(first + 3, c)), "the write is reported");
-        let (d, again) = writes_shared(first, last, true).expect("guarded again");
+        let (d, again) = writes_shared(first, last, true, 0).expect("guarded again");
         assert!(d > c && again == after);
         // Memory that is no view: nothing side by side.
         let plain = vec![0u8; 3 * PAGE];
         let p = plain.as_ptr() as usize;
-        assert!(writes_shared(p.div_ceil(PAGE), p.div_ceil(PAGE) + 1, true).is_none());
+        assert!(writes_shared(p.div_ceil(PAGE), p.div_ceil(PAGE) + 1, true, 0).is_none());
     }
 
     /// Several threads keep copies of a view by the answers of their
     /// askings (as a refresh does: a page written after the copy took it is
     /// taken again) while another thread writes it: once the writes are
     /// done and each has asked once more, every copy holds the view's
-    /// bytes, side by side or alone.
+    /// bytes, side by side or alone, and asking for the writes after their
+    /// oldest page alone ([`writes_after`]).
     #[test]
     fn copies_kept_side_by_side_miss_no_write() {
         const BLOCKS: usize = 16;
-        for shared in [true, false] {
+        for (shared, after) in [(true, false), (false, false), (true, true), (false, true)] {
             let view = View::new(BLOCKS);
             let (start, end) = (view.0, view.0 + view.1);
-            assert!(writes_as(start, end, true, false).is_some());
+            assert!(writes_as(start, end, true, false, 0).is_some());
             let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let keep = |done: std::sync::Arc<std::sync::atomic::AtomicBool>| {
                 move || {
                     let mut copy = vec![0u8; BLOCKS * BLOCK];
                     let mut copied = [0u64; BLOCKS];
                     let round = |copy: &mut Vec<u8>, copied: &mut [u64; BLOCKS]| {
-                        let (now, written) = writes_as(start, end, true, shared).expect("view memory");
+                        // As `Shadow::taken_since` has it.
+                        let since = match after {
+                            true => copied.iter().copied().filter(|&at| at != 0).min().unwrap_or(u64::MAX),
+                            false => 0,
+                        };
+                        let (now, written) = writes_as(start, end, true, shared, since).expect("view memory");
                         for (i, at) in copied.iter_mut().enumerate() {
                             let page = start / PAGE + i;
                             let write = written.iter().find(|w| w.0 == page).map_or(0, |w| w.1);
-                            if *at == 0 || write > *at {
+                            if *at == 0 || write > *at || *at < since {
                                 // SAFETY: a block of our view, read only.
                                 unsafe {
                                     std::ptr::copy_nonoverlapping((start + i * BLOCK) as *const u8, copy[i * BLOCK..].as_mut_ptr(), BLOCK)
@@ -2884,8 +2990,68 @@ mod shared_tests {
             for keeper in keepers {
                 let copy = keeper.join().unwrap();
                 let wrong = copy.iter().zip(&bytes).position(|(a, b)| a != b);
-                assert!(wrong.is_none(), "a copy missed a write at {wrong:?} (side by side: {shared})");
+                assert!(wrong.is_none(), "a copy missed a write at {wrong:?} (side by side: {shared}, after: {after})");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod askings_tests {
+    use super::*;
+
+    /// A page near the boundary between chunks 2 and 3.
+    const EDGE: usize = 3 * ASK_CHUNK;
+
+    #[test]
+    fn pages_written_after_an_asking() {
+        let mut j = Askings::new();
+        assert!(j.after(0, usize::MAX >> 16, 0).is_empty());
+        assert_eq!(j.set(EDGE - 1, 4), 0);
+        assert_eq!(j.set(EDGE, 7), 0);
+        assert_eq!(j.set(EDGE + 64, 9), 0);
+        assert_eq!(j.set(EDGE, 8), 7, "the asking noted before");
+        assert_eq!(j.get(EDGE), 8);
+        assert_eq!(j.get(EDGE + 1), 0);
+        assert_eq!(j.chunks.len(), 2);
+        assert_eq!(j.after(EDGE - 10, EDGE + 100, 0), [(EDGE - 1, 4), (EDGE, 8), (EDGE + 64, 9)]);
+        assert_eq!(j.after(EDGE - 10, EDGE + 100, 4), [(EDGE, 8), (EDGE + 64, 9)]);
+        assert_eq!(j.after(EDGE - 10, EDGE + 100, 8), [(EDGE + 64, 9)]);
+        assert!(j.after(EDGE - 10, EDGE + 100, 9).is_empty());
+        assert_eq!(j.after(EDGE, EDGE + 64, 0), [(EDGE, 8)], "the range's end is its own");
+        assert!(j.after(EDGE + 1, EDGE + 64, 0).is_empty());
+        assert!(j.after(EDGE, EDGE, 0).is_empty());
+        // Noted lower later (an asking that stood for a submission): the
+        // group's highest stays, the page's own asking answers.
+        j.set(EDGE + 64, 2);
+        assert_eq!(j.after(EDGE + 64, EDGE + 65, 1), [(EDGE + 64, 2)]);
+        assert!(j.after(EDGE + 64, EDGE + 65, 2).is_empty());
+        j.forget(EDGE - 1, EDGE + 1);
+        assert_eq!(j.after(0, usize::MAX >> 16, 0), [(EDGE + 64, 2)]);
+    }
+
+    /// Random notes and questions, answered as the `BTreeMap` the journal
+    /// was answers them, filtered by the asking.
+    #[test]
+    fn answers_as_a_btree_map() {
+        let mut state: u64 = 0x853c_49e6_748f_ea9b;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize
+        };
+        let bases = [0, ASK_CHUNK - 100, 5 * ASK_CHUNK - 30, (1 << 36) - 50];
+        let (mut j, mut reference) = (Askings::new(), BTreeMap::new());
+        for round in 0..20_000 {
+            let page = bases[next() % bases.len()] + next() % 200;
+            let asking = 1 + (next() % 1_000) as u64;
+            assert_eq!(j.set(page, asking), reference.insert(page, asking).unwrap_or(0));
+            let a = bases[next() % bases.len()] + next() % 200;
+            let b = a + next() % 300;
+            let since = (next() % 1_100) as u64;
+            let expected: Vec<(usize, u64)> = reference.range(a..b).map(|(&p, &w)| (p, w)).filter(|&(_, w)| w > since).collect();
+            assert_eq!(j.after(a, b, since), expected, "round {round}: [{a}, {b}) after {since}");
         }
     }
 }
@@ -3187,5 +3353,38 @@ mod bench_tests {
             }
             CloseHandle(holey_section);
         }
+    }
+
+    /// A frame's answers of the journal: some 20,000 refreshes of 14 pages
+    /// on average (run AM: 19,600 refreshes, 18 GB considered), in memory
+    /// whose every page was written once; as the `BTreeMap` gave them (the
+    /// range read whole into a vector), and as [`Askings::after`] gives
+    /// them to copies that took their pages after those writes.
+    #[test]
+    #[ignore = "a timing, run by hand"]
+    fn a_frame_of_journal_answers() {
+        const PAGES: usize = 280_000;
+        let (mut map, mut j) = (BTreeMap::new(), Askings::new());
+        let base = 0x1_0000_0000 / PAGE;
+        for i in 0..PAGES {
+            let asking = 1 + (i * 7919 % 1000) as u64;
+            map.insert(base + i, asking);
+            j.set(base + i, asking);
+        }
+        let ranges: Vec<(usize, usize)> = (0..20_000).map(|k| (base + k * 14, base + k * 14 + 14)).collect();
+        let time = |f: &dyn Fn(usize, usize) -> usize| {
+            let started = std::time::Instant::now();
+            let mut found = 0;
+            for _ in 0..10 {
+                for &(a, b) in &ranges {
+                    found += f(a, b);
+                }
+            }
+            (started.elapsed() / 10, found / 10)
+        };
+        let tree = time(&|a, b| map.range(a..b).map(|(&p, &w)| (p, w)).collect::<Vec<_>>().len());
+        let all = time(&|a, b| j.after(a, b, 0).len());
+        let newer = time(&|a, b| j.after(a, b, 1000).len());
+        println!("a frame of journal answers: as the tree gave them {tree:?}; all of them now {all:?}; those after the copies' askings {newer:?}");
     }
 }

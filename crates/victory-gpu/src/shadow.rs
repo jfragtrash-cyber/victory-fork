@@ -3043,7 +3043,8 @@ mod piece_tests {
 /// title's bytes: those it never took (`copied` 0), whether or not the
 /// title wrote them since tracking began, and those `written` (as
 /// `crate::watch::writes` gives it, by page in order) shows written after
-/// the copy took them. As [`Shadow::copy_stale`] decides it.
+/// the copy took them. As [`Shadow::copy_stale`] decides it, `since` as
+/// there.
 ///
 /// [`Shadow::stale_under_writes`] and [`Shadow::merge_under_writes`] looked
 /// at `written` alone, so a page of a range shaders may be writing that the
@@ -3051,15 +3052,18 @@ mod piece_tests {
 /// merged nor a reason to settle; the refresh leaves such ranges alone, and
 /// shaders read zeros there (fxceless/victory-fork#206: missing geometry
 /// with `VICTORY_LATE_WAIT`/`VICTORY_RELAY`).
-fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(usize, u64)]) -> Vec<usize> {
+fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(usize, u64)], since: u64) -> Vec<usize> {
     (a / PAGE..e.div_ceil(PAGE))
         .filter(|&page| page >= base)
         .filter(|&page| match copied.get(page - base) {
             None => false,
             Some(0) => true,
-            Some(&at) => written
-                .binary_search_by_key(&page, |&(p, _)| p)
-                .is_ok_and(|i| written[i].1 > at),
+            Some(&at) => {
+                at < since
+                    || written
+                        .binary_search_by_key(&page, |&(p, _)| p)
+                        .is_ok_and(|i| written[i].1 > at)
+            }
         })
         .collect()
 }
@@ -3076,10 +3080,15 @@ mod stale_tests {
         // Page 0x101 was never taken; page 0x102 was written after it was
         // taken, page 0x103 before.
         let written = [(0x102, 6), (0x103, 4)];
-        assert_eq!(stale_pages_in(base, &copied, at(0x100), at(0x104), &written), [0x101, 0x102]);
+        assert_eq!(stale_pages_in(base, &copied, at(0x100), at(0x104), &written, 0), [0x101, 0x102]);
         // Part of a page counts as the page; pages outside the copy do not.
-        assert_eq!(stale_pages_in(base, &copied, at(0x101) + 8, at(0x101) + 16, &[]), [0x101]);
-        assert!(stale_pages_in(base, &copied, at(0x104), at(0x106), &[(0x104, 9)]).is_empty());
+        assert_eq!(stale_pages_in(base, &copied, at(0x101) + 8, at(0x101) + 16, &[], 0), [0x101]);
+        assert!(stale_pages_in(base, &copied, at(0x104), at(0x106), &[(0x104, 9)], 0).is_empty());
+        // Asked after asking 5 (the list leaves out what is older), the
+        // same pages; a page taken before that (here at 3, as a thread
+        // racing this one may leave it) is stale, its last write unknown.
+        assert_eq!(stale_pages_in(base, &copied, at(0x100), at(0x104), &[(0x102, 6)], 5), [0x101, 0x102]);
+        assert_eq!(stale_pages_in(base, &[5, 3], at(0x100), at(0x102), &[], 5), [0x101]);
     }
 }
 
@@ -3902,7 +3911,7 @@ impl Shadow {
         let base = start / PAGE;
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         busy.into_iter().any(|(a, e)| match crate::watch::asked(a, e) {
-            Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written).is_empty(),
+            Some((_, written)) => !stale_pages_in(base, &copied, a, e, &written, 0).is_empty(),
             None => true,
         })
     }
@@ -3989,9 +3998,10 @@ impl Shadow {
         // of view memory, which is guarded and not write-watched, and
         // those were all of run 99's cases: the flights were settled
         // 4-5 times a frame for "0 pages looked at".
-        let (now, written) = crate::watch::writes(a, e, true)?;
+        let since = self.taken_since(a, e);
+        let (now, written) = crate::watch::writes_after(a, e, true, since)?;
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        Some((now, stale_pages_in(base, &copied, a, e, &written)))
+        Some((now, stale_pages_in(base, &copied, a, e, &written, since)))
     }
 
     /// One page of [`Shadow::merge_pages`]: `page` of the range `[a, e)`,
@@ -4170,11 +4180,12 @@ impl Shadow {
         if crate::host::late() || self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
             return 0;
         }
-        let Some((now, written)) = crate::watch::writes(from, to, true) else {
+        let since = self.taken_since(from, to);
+        let Some((now, written)) = crate::watch::writes_after(from, to, true, since) else {
             return 0;
         };
         // Not spread: the snapshot below reads the bytes at once.
-        let copied = self.copy_stale(from, to, now, &written, false);
+        let copied = self.copy_stale(from, to, now, &written, since, false);
         if copied > 0 && self.card.is_none() {
             let start = self.start as usize;
             let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -4197,9 +4208,10 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            let since = self.taken_since(from, to);
+            if let Some((now, written)) = crate::watch::writes_after(from, to, true, since) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written, !refresh_check_on());
+                let copied = self.copy_stale(from, to, now, &written, since, !refresh_check_on());
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
@@ -4277,11 +4289,26 @@ impl Shadow {
         }
     }
 
+    /// The lowest asking at which a page of `[from, to)` (inside the
+    /// buffer) was taken, pages never taken aside (`u64::MAX` if none was):
+    /// a write noted at or before it is older than every page's copy, so
+    /// the asking for the range leaves such writes out
+    /// (`crate::watch::writes_after`).
+    fn taken_since(&self, from: usize, to: usize) -> u64 {
+        let base = self.start as usize / PAGE;
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let (lo, hi) = (from / PAGE - base, ((to - 1) / PAGE + 1 - base).min(copied.len()));
+        copied.get(lo..hi).unwrap_or_default().iter().filter(|&&at| at != 0).min().copied().unwrap_or(u64::MAX)
+    }
+
     /// Copies the pages of `[from, to)` written after their last copy
-    /// (`written`: last writes by page, in page order; `now`: this
+    /// (`written`: last writes by page, in page order, those at or before
+    /// asking `since` left out, [`Shadow::taken_since`]; `now`: this
     /// asking), whole pages within the buffer; with `spread`, as
-    /// [`Shadow::copy`] says.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], spread: bool) -> usize {
+    /// [`Shadow::copy`] says. A page taken before `since` (another thread
+    /// took it again meanwhile, at an older asking) is copied: its last
+    /// write may have been left out.
+    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)], since: u64, spread: bool) -> usize {
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
@@ -4296,7 +4323,7 @@ impl Shadow {
                 _ => 0,
             };
             let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
+            if *at == 0 || write > *at || *at < since {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);

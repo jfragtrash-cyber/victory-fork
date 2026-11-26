@@ -561,7 +561,7 @@ type RootSlot = (u32, Option<std::sync::Arc<crate::shadow::Shadow>>);
 /// one (SipHash) over a list's tables and root views was 1.7 ms a frame of
 /// the recording threads in run P's gameplay.
 #[derive(Default, Clone, Copy)]
-struct Fast(u64);
+pub(crate) struct Fast(u64);
 
 impl std::hash::Hasher for Fast {
     fn write(&mut self, bytes: &[u8]) {
@@ -585,7 +585,7 @@ impl std::hash::Hasher for Fast {
     }
 }
 
-type FastMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<Fast>>;
+pub(crate) type FastMap<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<Fast>>;
 
 /// Root parameter slots as a set, in slot order: the tables
 /// [`State::tables`] makes afresh, without a vector of them for each stage
@@ -760,9 +760,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
         shadow.refresh(list, address, len);
         return Some(gpu);
     }
-    let (gpu, to) = list.scratch(len)?;
-    list.defer_fill(to, address as *const u8, len as usize);
-    Some(gpu)
+    list.fill(address as usize, len)
 }
 
 macro_rules! once {
@@ -3037,11 +3035,10 @@ impl State {
                 let used = entries().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
-                        let Some((gpu, to)) = list.scratch(u64::from(size)) else {
+                        let Some(gpu) = list.fill(address as usize, u64::from(size)) else {
                             host.make_null(index);
                             continue;
                         };
-                        list.defer_fill(to, address as *const u8, size as usize);
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {

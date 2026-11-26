@@ -488,6 +488,98 @@ fn max_and_min_order_negative_zero_below_positive_zero() {
     }
 }
 
+/// [`build_valu_cs`] with the lowering's choices of this thread set for the build, and the
+/// module's instruction count.
+fn build_with(minmax_const: Option<bool>, legacy: Option<lower::LegacyMul>, body: &[u32]) -> (HostShader, u32) {
+    let was = (
+        lower::TEST_MINMAX_CONST.replace(minmax_const),
+        lower::TEST_LEGACY_MUL.replace(legacy),
+        super::census::TEST_ON.replace(true),
+    );
+    let shader = build_valu_cs(body);
+    lower::TEST_MINMAX_CONST.set(was.0);
+    lower::TEST_LEGACY_MUL.set(was.1);
+    super::census::TEST_ON.set(was.2);
+    let total = super::census::take(&shader.dxil).expect("a census of the module").counts[0];
+    (shader, total)
+}
+
+/// A maximum or minimum against a constant whose magnitude is not zero leaves out the test
+/// for two zeros (`VICTORY_MINMAX_CONST`): a smaller module, the same results; against a
+/// zero constant the test stays, and -0 still orders below +0.
+#[test]
+fn max_and_min_against_a_non_zero_constant_skip_the_zero_test() {
+    let f = f32::to_bits;
+    let inputs: Vec<[u32; 4]> = [0.0, -0.0, 0.25, 0.75, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY]
+        .iter()
+        .map(|&x| [f(x), 0, 0, 0])
+        .collect();
+    // (inline constant code, its value)
+    let constants = [(240u16, 0.5f32), (241, -0.5), (128, 0.0)];
+    for (name, op, max) in [("v_max_f32", 0x110u16, true), ("v_min_f32", 0x10F, false)] {
+        for (code, k) in constants {
+            let body = vop3(op, 0, code, vgpr(1), 0);
+            let ((on, n_on), (off, n_off)) = (build_with(Some(true), None, &body), build_with(Some(false), None, &body));
+            if k == 0.0 {
+                assert_eq!(n_on, n_off, "{name} against 0 keeps the zero test");
+            } else {
+                assert!(n_on + 4 <= n_off, "{name} against {k}: {n_on} instructions, {n_off} with the test");
+            }
+            let want = |x: f32| -> u32 {
+                if x == 0.0 && k == 0.0 {
+                    // RDNA2: -0 below +0
+                    return if max { f(0.0) } else { f(x) };
+                }
+                // NaN gives the constant, as `f32::max`/`min` do
+                f(if max { k.max(x) } else { k.min(x) })
+            };
+            for shader in [&on, &off] {
+                run_cases(shader, &inputs, |backend, _, inp, got| {
+                    let x = f32::from_bits(inp[0]);
+                    assert_eq!(got, want(x), "{backend}: {name}({k}, {x}) = {:?}", f32::from_bits(got));
+                });
+            }
+        }
+    }
+}
+
+/// `v_mul_legacy_f32` against a constant (`VICTORY_LEGACY_MUL=exact`): one FMad with +0
+/// against a normal constant, +0 against a zero one, the D3D9 rule's results either way
+/// (`0 × anything = +0`, otherwise the IEEE product). No case underflows: there an unfused
+/// FMad would turn -0 into +0.
+#[test]
+fn legacy_multiply_against_a_constant_keeps_the_d3d9_rule() {
+    let f = f32::to_bits;
+    let inputs: Vec<[u32; 4]> =
+        [0.0, -0.0, 1.5, -3.0, 3.0e38, f32::INFINITY, f32::NEG_INFINITY, f32::NAN, 1.0e-30]
+            .iter()
+            .map(|&x| [f(x), 0, 0, 0])
+            .collect();
+    // (inline constant code, its value): 2, -4, 0.5, 1/(2π), 0
+    let constants = [(244u16, 2.0f32), (247, -4.0), (240, 0.5), (248, 0.159_154_94), (128, 0.0)];
+    for (code, k) in constants {
+        for (src0, src1) in [(code, vgpr(1)), (vgpr(1), code)] {
+            // v_mul_legacy_f32 v0, src0, src1 (VOP3 0x107)
+            let body = vop3(0x107, 0, src0, src1, 0);
+            let (exact, n_exact) = build_with(None, Some(lower::LegacyMul::Exact), &body);
+            let (guard, n_guard) = build_with(None, Some(lower::LegacyMul::Guard), &body);
+            // (against 0 the clean-up already folds the guarded form to +0)
+            assert!(n_exact < n_guard || k == 0.0 && n_exact == n_guard, "legacy multiply by {k}: {n_exact} instructions, {n_guard} guarded");
+            for (form, shader) in [("exact", &exact), ("guard", &guard)] {
+                run_cases(shader, &inputs, |backend, _, inp, got| {
+                    let x = f32::from_bits(inp[0]);
+                    let want = if k == 0.0 || x == 0.0 { 0.0 } else { k * x };
+                    if want.is_nan() {
+                        assert!(f32::from_bits(got).is_nan(), "{backend} {form}: {k} × {x} = {got:#010x}, want NaN");
+                    } else {
+                        assert_eq!(got, f(want), "{backend} {form}: {k} × {x} = {:?}, want {want:?}", f32::from_bits(got));
+                    }
+                });
+            }
+        }
+    }
+}
+
 #[test]
 fn v_med3_f16_matches_rdna2_with_nan() {
     // v_med3_f16 v0, v1, v2, v3 (VOP3 opcode 0x357)
@@ -1557,10 +1649,12 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        loop_report: None,
     })
     .expect("lower");
 
     let shader = HostShader {
+        loop_report: false,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,

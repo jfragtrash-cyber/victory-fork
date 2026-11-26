@@ -326,6 +326,25 @@ impl Module {
         }
     }
 
+    /// The bits of a 32-bit float constant: a float constant, or the bitcast of an
+    /// integer constant (how the lowering reads an immediate as a float, before the
+    /// clean-up folds it); `None` for anything else.
+    pub fn float_bits(&self, v: V) -> Option<u32> {
+        match v {
+            V::Const(i) => match self.consts[i as usize].1 {
+                Const::Float(bits) => Some(bits),
+                _ => None,
+            },
+            V::Inst(i) => match self.insts[i as usize].op {
+                Op::Cast(Cast::Bitcast, inner @ V::Const(_)) => {
+                    self.int_value(inner).map(|x| x as u32)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Gives constant `old` the content of `new` (both stay valid).
     pub fn replace_const(&mut self, old: V, new: V) {
         if let (V::Const(o), V::Const(n)) = (old, new) {

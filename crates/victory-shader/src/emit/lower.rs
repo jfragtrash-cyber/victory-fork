@@ -1280,6 +1280,67 @@ pub(super) fn host_max_wave() -> u32 {
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// A test's [`minmax_const`], for its thread only.
+    pub(super) static TEST_MINMAX_CONST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's [`legacy_mul_mode`], for its thread only.
+    pub(super) static TEST_LEGACY_MUL: std::cell::Cell<Option<LegacyMul>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a float maximum or minimum against a constant whose magnitude is not zero is
+/// the plain FMax/FMin ([`Lower::max_min`]), without the test for two zeros of opposite
+/// signs: exact, as the two operands are then never both zeros. Half of the time-weighted
+/// `v_max_f32`/`v_min_f32` of the 40 costliest command kinds of run AN have such an
+/// operand; the test is five integer instructions (with the others, 5.7% of those kinds'
+/// host instructions), and the clean-up (`bitcode::opt`) does not fold it.
+/// `VICTORY_MINMAX_CONST=0`: the test everywhere, as before.
+fn minmax_const() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_MINMAX_CONST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_MINMAX_CONST").map_or(true, |v| v.trim() != "0"))
+}
+
+/// How the D3D9 multiply (`0 × anything = +0`) of `v_mul_legacy_f32`, `v_mac_legacy_f32`
+/// and `v_mad_legacy_f32` is written ([`Lower::legacy_mul`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LegacyMul {
+    /// A multiply, a compare of each operand with 0, an or and a select.
+    Guard,
+    /// [`LegacyMul::Guard`], but against a constant that is a normal float, `FMad(K, b, +0)`,
+    /// and against a zero constant, +0.
+    Exact,
+    /// A bare multiply.
+    Plain,
+}
+
+/// [`LegacyMul`] from `VICTORY_LEGACY_MUL`. The console's compiler writes most float
+/// multiplies as `v_mul_legacy_f32`: 12.8% of the time-weighted vector instructions of the
+/// 40 costliest command kinds of run AN (811 of 4,320 in the 3.4 ms shadow-mask program),
+/// and the guarded form added 16.8% to those kinds' host instructions.
+/// - unset: [`LegacyMul::Guard`].
+/// - `exact`: [`LegacyMul::Exact`]. Bit for bit the rule wherever the host fuses FMad
+///   (NVIDIA does; the lowering of `v_fma_f32` counts on it too): an exact zero product plus
+///   +0 is +0, any other product is rounded once, as the multiply alone rounds it, and with
+///   a finite non-zero K no 0 × ∞ arises. Where FMad is not fused, a product that rounds to
+///   -0 (an underflow) comes out +0. 18% of the time-weighted legacy multiplies have such a
+///   constant (one instruction instead of three).
+/// - `plain`: [`LegacyMul::Plain`]. **Inexact**: 0 × ∞ and 0 × NaN give NaN (the
+///   normalisation of a zero vector), and a zero product keeps its sign. For a timing run
+///   only, which tells what the rule costs: if nothing moves, the host's compiler already
+///   makes the guarded form one instruction.
+pub(super) fn legacy_mul_mode() -> LegacyMul {
+    #[cfg(test)]
+    if let Some(mode) = TEST_LEGACY_MUL.get() {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<LegacyMul> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_LEGACY_MUL").ok().as_deref().map(str::trim) {
+        Some("exact") => LegacyMul::Exact,
+        Some("plain") => LegacyMul::Plain,
+        _ => LegacyMul::Guard,
+    })
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -3572,6 +3633,12 @@ impl<'a> Lower<'a> {
     fn max_min(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
         let r = self.binary(if max { 35 } else { 36 }, a, b);
+        // Against a constant whose magnitude is not zero the two are never both zeros:
+        // the test below would always give `r` ([`minmax_const`]).
+        let nonzero = |m: &super::bitcode::Module, v: V| m.float_bits(v).is_some_and(|x| x & 0x7FFF_FFFF != 0);
+        if minmax_const() && (nonzero(&self.s.m, a) || nonzero(&self.s.m, b)) {
+            return r;
+        }
         let (ia, ib) = (self.as_int(a), self.as_int(b));
         let either = self.s.m.bin(c, Bin::Or, ia, ib);
         let magnitude = self.s.m.i32(0x7FFF_FFFF);
@@ -3773,11 +3840,31 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
-    /// `0 × anything = 0`, as in D3D9.
+    /// `0 × anything = 0`, as in D3D9 (the form: [`legacy_mul_mode`]).
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
-        let m = self.s.m.bin(c, Bin::Mul, a, b);
         let zero = self.s.m.f32(0);
+        match legacy_mul_mode() {
+            LegacyMul::Guard => {}
+            LegacyMul::Plain => return self.s.m.bin(c, Bin::Mul, a, b),
+            LegacyMul::Exact => {
+                for (k, x) in [(a, b), (b, a)] {
+                    let Some(bits) = self.s.m.float_bits(k) else {
+                        continue;
+                    };
+                    if bits & 0x7FFF_FFFF == 0 {
+                        return zero;
+                    }
+                    // a normal float: neither 0, nor a denormal (0 where the host flushes it,
+                    // where 0 × ∞ would arise), nor ∞ or NaN
+                    let exponent = bits >> 23 & 0xFF;
+                    if exponent != 0 && exponent != 0xFF {
+                        return self.fmad(k, x, zero);
+                    }
+                }
+            }
+        }
+        let m = self.s.m.bin(c, Bin::Mul, a, b);
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
         let z = self.s.m.bin(c, Bin::Or, az, bz);

@@ -290,6 +290,30 @@ fn instruction(code: &[u8], offset: usize) -> Result<Instruction, ShaderError> {
     })
 }
 
+/// The opcode of `name` in `encoding`'s table (VOP3: the VOP3-only opcodes and, at their
+/// bases, the VOPC, VOP2 and VOP1 ones), for code that writes instructions.
+pub fn opcode(encoding: Encoding, name: &str) -> Option<u16> {
+    use opcodes as t;
+    let find = |table: &[(u16, &str)], base: u16| {
+        table.iter().find(|(_, n)| *n == name).map(|(o, _)| o + base)
+    };
+    match encoding {
+        Encoding::Sop2 => find(t::SOP2, 0),
+        Encoding::Sop1 => find(t::SOP1, 0),
+        Encoding::Sopc => find(t::SOPC, 0),
+        Encoding::Sopp => find(t::SOPP, 0),
+        Encoding::Vop2 => find(t::VOP2, 0),
+        Encoding::Vop1 => find(t::VOP1, 0),
+        Encoding::Vopc => find(t::VOPC, 0),
+        Encoding::Vop3 => find(t::VOP3, 0)
+            .or_else(|| find(t::VOPC, 0))
+            .or_else(|| find(t::VOP2, 0x100))
+            .or_else(|| find(t::VOP1, 0x180)),
+        Encoding::Ds => find(t::DS, 0),
+        _ => None,
+    }
+}
+
 fn name(encoding: Encoding, opcode: u16) -> Option<&'static str> {
     use opcodes as t;
     let (table, op) = match encoding {

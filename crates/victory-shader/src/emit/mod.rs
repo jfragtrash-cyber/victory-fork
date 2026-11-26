@@ -112,6 +112,8 @@ mod valu_tests;
 mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
+#[cfg(all(test, windows))]
+mod lane_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -120,7 +122,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::set_host_max_wave;
+pub use lower::{form, set_host_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     LOOP_REPORT_SPACE, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -398,6 +400,24 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+thread_local! {
+    /// Which of [`emit`]'s attempts gave the last result on this thread ([`last_path`]).
+    static TOOK: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+fn took(what: &'static str) {
+    TOOK.set(what);
+}
+
+/// How the last translation on this thread came about, for the census of `victory
+/// translate`: which attempt of [`emit`] gave it (the first try, a retry in another form,
+/// dual-bank, the local-wave forms, some of them approximate) and what its lowering did with
+/// the console's lanes ([`lower::form`] bits). Meaningful right after a translation that
+/// succeeded.
+pub fn last_path() -> (&'static str, u8) {
+    (TOOK.get(), lower::last_form())
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -407,9 +427,12 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    took("first try");
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    lower::set_last_form(0);
     let original = emit_program(c, native, p, st, io, res);
+    let original_form = lower::last_form();
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
     // lane runs: once more with its early-outs left out
@@ -471,6 +494,7 @@ pub fn emit(
                 let again = emit_program(c, native, p, st, io, res);
                 report(name, &again);
                 if done(&again) {
+                    took("retry: another form of the program");
                     return again.map(|(shader, _)| shader);
                 }
             }
@@ -497,8 +521,16 @@ pub fn emit(
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
                     if done(&again) {
+                        took("retry: skips left out");
                         return again.map(|(shader, _)| shader);
                     }
+                }
+                // Dual-bank ([`dual_bank`]): exact, no group barrier; after the exact paired
+                // forms, before the approximate ones.
+                if dual_bank() == DualBank::BeforeApproximate
+                    && let Some(shader) = dual_bank_form(c, native, why, &report)
+                {
+                    return Ok(shader);
                 }
                 deep_form = deep;
                 if strict {
@@ -515,6 +547,7 @@ pub fn emit(
                     let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                     report(&format!("local waves ({}), {name}", if exact { "idiom" } else { "APPROXIMATE" }), &local);
                     if done(&local) {
+                        took(if exact { "local waves: the allocation idiom (exact)" } else { "local waves: APPROXIMATE" });
                         return local.map(|(shader, _)| shader);
                     }
                 }
@@ -523,6 +556,7 @@ pub fn emit(
                 let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
                 report(if exact { "local waves (idiom)" } else { "local waves (APPROXIMATE)" }, &local);
                 if done(&local) {
+                    took(if exact { "local waves: the allocation idiom (exact)" } else { "local waves: APPROXIMATE" });
                     return local.map(|(shader, _)| shader);
                 }
             }
@@ -535,6 +569,7 @@ pub fn emit(
                         let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                         report(&format!("local waves (APPROXIMATE, any mask), {name}"), &local);
                         if done(&local) {
+                            took("local waves: APPROXIMATE, any mask");
                             return local.map(|(shader, _)| shader);
                         }
                     }
@@ -542,9 +577,15 @@ pub fn emit(
                 let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
+                    took("local waves: APPROXIMATE, any mask");
                     return local.map(|(shader, _)| shader);
                 }
             }
+        }
+        if dual_bank() == DualBank::Last
+            && let Some(shader) = dual_bank_form(c, native, why, &report)
+        {
+            return Ok(shader);
         }
         // Last of all, for programs no other form takes off 64-lane waves (which the host
         // refuses): the per-lane branches around the places where not every lane runs taken
@@ -563,11 +604,15 @@ pub fn emit(
                 let again = widen(c, native, base, why);
                 report("wave-wide branches", &again);
                 if done(&again) {
+                    took("retry: wave-wide branches");
                     return again.map(|(shader, _)| shader);
                 }
             }
         }
     }
+    // (a retry that lowered but was not taken must not stand for the original)
+    lower::set_last_form(original_form);
+    took("first try");
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
     // trace programs): right once the wave takes that skip together ([`widen`]; the
     // lowering has named the skipped blocks).
@@ -577,6 +622,7 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
+            took("retry: wave-wide skip");
             let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
             match again {
                 Ok(_) => again,
@@ -595,6 +641,7 @@ pub fn emit(
     if edges.is_empty() {
         return original;
     }
+    took("retry: jump threading");
     let p = ir::thread_edges(p, &edges)?;
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
@@ -663,6 +710,81 @@ fn widen(
         }
         wide.extend(more);
     }
+}
+
+/// Where [`emit`] tries the dual-bank form ([`crate::dualbank`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DualBank {
+    Off,
+    /// After the exact paired forms, before the approximate half-wave ones (the default).
+    BeforeApproximate,
+    /// Only for programs no other form takes off 64-lane waves.
+    Last,
+}
+
+/// Dual-bank Wave64, ported from the dual-bank fork of fxceless/victory-fork: a console wave64
+/// compute program rewritten so one host wave of 32 runs the whole console wave, each host lane
+/// carrying console lanes p and p + 32. Exact, with no group barrier and no exchange, so it
+/// runs where the paired form cannot meet (a lane mask held or exchanged where not every lane
+/// runs) and where the program would otherwise keep 64-lane waves, which a 32-lane host refuses
+/// (`E_INVALIDARG`). On that fork's RTX 3060 it took 45 of the 65 compute programs with no
+/// exact path: refused 64-lane programs 27 -> 5, approximate half-wave ones 38 -> 15.
+/// On our RTX 3090 (`translate --validate --pipelines`, the title's pack, 32-lane host):
+/// compute pipelines 2,721 -> 2,750 of 2,763, refused by the driver 26 -> 3, none lost; 49
+/// programs take it, 23 of them from an approximate half-wave form and 3 (the upscaler's)
+/// that did not translate.
+/// `VICTORY_DUAL_BANK=0`: never; `=last`: only where every other form fails, so programs on an
+/// approximate half-wave form keep it.
+fn dual_bank() -> DualBank {
+    static MODE: std::sync::OnceLock<DualBank> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_DUAL_BANK").ok().as_deref().map(str::trim) {
+        Some("0") => DualBank::Off,
+        Some("last") => DualBank::Last,
+        _ => DualBank::BeforeApproximate,
+    })
+}
+
+/// `native` in the dual-bank form ([`dual_bank`]), lowered for 32-lane host waves: the rewritten
+/// program as it is, then in the forms the other retries use (a skip of the console's whose
+/// scalar code the code after it reads, a sampler built inside the region, translates once the
+/// skip is left out). `None` where it does not translate (`why`: the reasons on stderr).
+fn dual_bank_form(
+    c: &Container,
+    native: &NativeProgram,
+    why: bool,
+    report: &dyn Fn(&str, &Result<(HostShader, Option<u32>), ShaderError>),
+) -> Option<HostShader> {
+    let refused = |e: ShaderError| {
+        if why {
+            eprintln!("WAVE64-RETRY dual-bank: {e}");
+        }
+    };
+    let dual = crate::dualbank::transform(native).map_err(refused).ok()?;
+    let p = crate::spill::build(&dual).map_err(refused).ok()?;
+    let lowered = |p: &ir::Program| -> Result<(HostShader, Option<u32>), ShaderError> {
+        let st = structure::structure(p)?;
+        let res = resource::track(p, &dual.layout, dual.stage, Some(&st))?;
+        let io = io::raise(p, &dual)?;
+        lower::with_dual_bank(|| emit_program(c, &dual, p, &st, &io, &res))
+    };
+    let forms = [
+        ("dual-bank", Some(p.clone())),
+        ("dual-bank without early-outs", ir::without_early_outs(&p)),
+        ("dual-bank without skips", ir::without_skips(&p, false)),
+        ("dual-bank without skips, scalars followed", ir::without_skips(&p, true)),
+    ];
+    for (what, form) in forms {
+        let Some(form) = form else { continue };
+        let again = lowered(&form);
+        report(what, &again);
+        if let Ok((shader, wave)) = again
+            && wave != Some(64)
+        {
+            took("dual-bank (exact)");
+            return Some(shader);
+        }
+    }
+    None
 }
 
 /// The translated program, and the wave size it requires of the host.

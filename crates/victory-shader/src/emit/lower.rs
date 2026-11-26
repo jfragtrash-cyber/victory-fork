@@ -230,6 +230,8 @@ struct Lower<'a> {
     writes_uavs: bool,
     /// src0 of the current instruction as DPP fetched it.
     src0: Option<V>,
+    /// A DPP compare's lanes that write their bit ([`Lower::dpp`]; none: all).
+    dpp_enable: Option<V>,
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
@@ -276,6 +278,13 @@ struct Lower<'a> {
     clane: Option<V>,
     /// The first exchange dword of this thread's console wave ([`Self::exchange_pair`]).
     pair: Option<V>,
+    /// A console wave64 program in two host waves with `ds_bpermute`: the first of the 64 LDS
+    /// dwords per console wave its lanes write their data into, which every lane then reads at
+    /// the lane its address names (the handover's paired-wave shuffle).
+    permute_area: Option<u32>,
+    /// A `v_writelane_b32` where not every lane runs: its target lane may not be there to
+    /// take the value (`form::APPROX_LANE_WRITE`).
+    approx_lane_write: bool,
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
@@ -471,6 +480,11 @@ fn need(block: usize) {
 /// written by an instruction every arriving lane runs (no guard), lane by lane, from scalars,
 /// constants and such values; or loaded from an address made of them. The compiler keeps
 /// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
+/// Also what a shared-memory read at such an address loads where the shared memory has
+/// settled ([`lds_settled`]): both halves of a console wave read the same dwords, whenever
+/// each gets there (the ray-tracing structure builder's scans sum the waves' totals this way
+/// inside a loop each console wave leaves together, and broadcast the sum with
+/// `v_readfirstlane`).
 /// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
 /// run (no lane branch can have split the arriving lanes); loop-carried values never do.
 fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
@@ -486,6 +500,19 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
         for (i, inst) in block.insts.iter().enumerate() {
             let name = inst.name();
+            if let Fields::Ds {
+                addr: Some(Operand::Vector { reg, .. }),
+                gds: false,
+                ..
+            } = inst.fields
+                && name.starts_with("ds_read")
+                && st.guards[b][i].is_none()
+                && inst.read(Reg::V(reg)).is_some_and(|a| same.contains(&a))
+                && lds_settled(p, (b, i))
+            {
+                same.extend(inst.writes.iter().map(|w| w.1));
+                continue;
+            }
             let ops: Vec<Operand> = match &inst.fields {
                 Fields::Valu(v)
                     if v.dpp.is_none()
@@ -501,11 +528,25 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
             if st.guards[b][i].is_some() {
                 continue; // lanes outside EXEC keep another value
             }
+            // the registers of one operand: two for a 64-bit operation (its sources are pairs),
+            // else one (not the destination's old value, which the IR also reads: an unguarded
+            // write replaces it in every lane that arrives). The (m)qsad sources are 64 and
+            // 128 bits wide without saying so in the name: four, to be safe.
+            let width = if name.contains("qsad") {
+                4
+            } else if name.contains("64") {
+                2
+            } else {
+                1
+            };
             let alike = ops.iter().all(|op| match *op {
                 Operand::Vector { reg, .. } => {
-                    // every dword of the operand the instruction reads from that register on
-                    let read: Vec<Value> =
-                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
+                    let read: Vec<Value> = inst
+                        .reads
+                        .iter()
+                        .filter(|r| matches!(r.0, Reg::V(x) if x >= reg && x < reg.saturating_add(width)))
+                        .map(|r| r.1)
+                        .collect();
                     !read.is_empty() && read.iter().all(|x| same.contains(x))
                 }
                 // a scalar is one value; a lane mask is not, unless a compare of such values made it
@@ -520,6 +561,82 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
         }
     }
     same
+}
+
+/// Whether the shared memory a read at `read` (block, instruction) sees can no longer change
+/// while the thread group runs it: no shared-memory write follows it on any path (the read's
+/// own wave writes nothing after), and every write before it reaches it only through an
+/// `s_barrier` (the group's other waves have written theirs before any wave reads). Then two
+/// host waves that read the same address get the same dwords, whenever each gets there.
+fn lds_settled(p: &Program, read: (usize, usize)) -> bool {
+    let writes = |i: &Inst| {
+        let n = i.name();
+        matches!(i.fields, Fields::Ds { .. })
+            && !(n.starts_with("ds_read")
+                || n.starts_with("ds_swizzle")
+                || n.starts_with("ds_permute")
+                || n.starts_with("ds_bpermute")
+                || n == "ds_nop")
+    };
+    let barrier = |i: &Inst| i.name() == "s_barrier";
+    let n = p.blocks.len();
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (b, block) in p.blocks.iter().enumerate() {
+        for &q in &block.preds {
+            if q < n && !succ[q].contains(&b) {
+                succ[q].push(b);
+            }
+        }
+    }
+    // a write after the read, on any path (around a loop too)
+    let after = (read.0, read.1 + 1);
+    if reaches(p, &succ, after, &|b, i| writes(&p.blocks[b].insts[i]), None) {
+        return false;
+    }
+    // a write before it that reaches it without a barrier between
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (i, inst) in block.insts.iter().enumerate() {
+            let hit = |bb, ii| (bb, ii) == read;
+            if writes(inst) && reaches(p, &succ, (b, i + 1), &hit, Some(&barrier)) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Whether a path from instruction `start` (block, index) on meets an instruction `hit`
+/// holds, before one `cut` holds (paths that pass such an instruction stop there).
+fn reaches(
+    p: &Program,
+    succ: &[Vec<usize>],
+    start: (usize, usize),
+    hit: &dyn Fn(usize, usize) -> bool,
+    cut: Option<&dyn Fn(&Inst) -> bool>,
+) -> bool {
+    let mut entered = vec![false; p.blocks.len()];
+    let mut stack = vec![start];
+    while let Some((b, from)) = stack.pop() {
+        let mut stopped = false;
+        for (i, inst) in p.blocks[b].insts.iter().enumerate().skip(from) {
+            if hit(b, i) {
+                return true;
+            }
+            if cut.is_some_and(|cut| cut(inst)) {
+                stopped = true;
+                break;
+            }
+        }
+        if !stopped {
+            for &s in &succ[b] {
+                if !entered[s] {
+                    entered[s] = true;
+                    stack.push((s, 0));
+                }
+            }
+        }
+    }
+    false
 }
 
 /// What a register value holds, for [`wave_local`].
@@ -1280,6 +1397,56 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     result
 }
 
+/// What the last successful lowering on this thread did with the console's lanes
+/// ([`last_form`]), for the census of `victory translate`.
+pub mod form {
+    /// Lanes 32..63 are the other host wave: masks, lane reads and lane numbers go through
+    /// LDS dwords the two host waves exchange (with group barriers).
+    pub const EXCHANGE: u8 = 1;
+    /// LDS the console shares within one wave, split over two host waves with a group
+    /// barrier before each access.
+    pub const SPLIT_LDS: u8 = 2;
+    /// Each host wave lowered as a wave of its own (no exchange between the halves).
+    pub const LOCAL: u8 = 4;
+    /// ... with every mask and lane read per host wave too: approximate.
+    pub const LOCAL_ANY: u8 = 8;
+    /// DXIL wave operations in the result.
+    pub const WAVE_OPS: u8 = 16;
+    /// Code that reads other lanes, or lane masks as numbers (needs the console's lane order).
+    pub const CONSOLE_LANES: u8 = 32;
+    /// The program kept the console's 64-lane waves (`WaveSize(64)`).
+    pub const WAVE64: u8 = 64;
+    /// A lane write where not every lane runs: APPROXIMATE (its target lane may be elsewhere).
+    pub const APPROX_LANE_WRITE: u8 = 128;
+}
+
+thread_local! {
+    static LAST_FORM: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// Lowering a program rewritten by [`crate::dualbank`]: its lanes stand for two console
+    /// lanes each, so its host waves must be exactly 32 lanes (`WaveSize(32)`).
+    static DUAL_BANK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` lowering a dual-bank program ([`crate::dualbank`]).
+pub(super) fn with_dual_bank<R>(f: impl FnOnce() -> R) -> R {
+    let was = DUAL_BANK.replace(true);
+    let r = f();
+    DUAL_BANK.set(was);
+    r
+}
+
+/// The [`form`] bits of the last successful lowering on this thread.
+pub fn last_form() -> u8 {
+    LAST_FORM.get()
+}
+
+pub(super) fn set_last_form(bits: u8) {
+    LAST_FORM.set(bits);
+}
+
 pub(super) fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
@@ -1644,6 +1811,9 @@ impl<'a> Lower<'a> {
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        // `ds_bpermute` in a console wave64 program run as two host waves: the first LDS dword of
+        // the area each console wave writes its lanes into ([`Lower::permute_area`])
+        let mut permute: Option<u32> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
@@ -1656,6 +1826,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -1726,6 +1897,12 @@ impl<'a> Lower<'a> {
                                 // ([`exchange_dwords`] a console wave)
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 s.lds_dwords += exchange_dwords() * group.div_ceil(64);
+                                // `ds_bpermute` across the halves goes through 64 dwords per
+                                // console wave ([`Lower::permute_area`])
+                                if group > 32 && insts().any(|i| i.name() == "ds_bpermute_b32") {
+                                    permute = Some(s.lds_dwords);
+                                    s.lds_dwords += 64 * group.div_ceil(64);
+                                }
                             }
                         }
                     }
@@ -1774,12 +1951,14 @@ impl<'a> Lower<'a> {
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
             }
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            if console_lanes || one_wave && s.lds_dwords > 0 || DUAL_BANK.get() {
                 s.wave_size = Some(wave);
             }
             // k console groups in a host group ([`group_merge`]): one whole wave of 32 lanes
             // a group, nothing shared between the threads of a group, and a first block no
             // branch comes back to (the host's first block is then the merge's prologue).
+            // Not a dual-bank program ([`crate::dualbank`]): its 32 threads are a console
+            // wave of 64, numbered from the host thread id by its own prologue.
             let shares = insts().any(|i| {
                 i.name() == "s_barrier"
                     || matches!(i.fields, Fields::Ds { .. })
@@ -1788,6 +1967,7 @@ impl<'a> Lower<'a> {
             let merge = group_merge();
             if merge > 1
                 && !x.native.wave64
+                && !DUAL_BANK.get()
                 && group == 32
                 && host_max_wave() == 32
                 && x.native.vgprs <= MERGE_VGPRS
@@ -1933,6 +2113,7 @@ impl<'a> Lower<'a> {
             tail: vec![None; p.blocks.len()],
             writes_uavs,
             src0: None,
+            dpp_enable: None,
             console_lanes,
             split_lds,
             lds_meet,
@@ -1952,6 +2133,8 @@ impl<'a> Lower<'a> {
             exchange,
             clane: None,
             pair: None,
+            permute_area: permute,
+            approx_lane_write: false,
             halves,
             wave_base: None,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
@@ -2695,6 +2878,21 @@ impl<'a> Lower<'a> {
             self.s.wave_size = Some(32);
         }
         let wave_size = self.s.wave_size;
+        LAST_FORM.set(
+            [
+                (self.exchange.is_some(), form::EXCHANGE),
+                (self.split_lds, form::SPLIT_LDS),
+                (self.local, form::LOCAL),
+                (self.local_any, form::LOCAL_ANY),
+                (self.s.flags & flags::WAVE_OPS != 0, form::WAVE_OPS),
+                (self.console_lanes, form::CONSOLE_LANES),
+                (self.s.wave_size == Some(64), form::WAVE64),
+                (self.approx_lane_write, form::APPROX_LANE_WRITE),
+            ]
+            .into_iter()
+            .filter(|&(on, _)| on)
+            .fold(0, |bits, (_, bit)| bits | bit),
+        );
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -4172,10 +4370,38 @@ impl<'a> Lower<'a> {
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
         let k32 = self.s.m.i32(32);
-        let add = self.s.m.select(e, first, k32, zero);
+        // A group that is not a multiple of 32 threads has one short host wave, and it can
+        // only be the last run of 32 console threads (group & !31). Taking the counter in
+        // arrival order, it could take base 0 and leave console lanes with no thread at all
+        // (a group of 48: the 16-thread wave first gave lanes 0..15, the full wave 32..63,
+        // and lanes 16..31 read 0; found by `lane_tests`). So only full waves count off
+        // the counter; the short one takes the last run.
+        let group = self.s.threads.map_or(0, |t| t.iter().product::<u32>());
+        let full = if !group.is_multiple_of(32) {
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let here = self.s.m.bool(true);
+            let ballot = self.s.op(e, "waveActiveBallot", Attr::NoUnwind, four, 116, &[here]);
+            let lo = self.s.m.extract(e, ballot, 0);
+            let all = self.s.m.i32(u32::MAX);
+            Some(self.s.m.cmp(e, pred::EQ, lo, all))
+        } else {
+            None
+        };
+        let counts = match full {
+            Some(f) => self.s.m.bin(e, Bin::And, first, f),
+            None => first,
+        };
+        let add = self.s.m.select(e, counts, k32, zero);
         let ptr = self.s.m.element(e, lds, k);
         let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
         let base = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+        let base = match full {
+            Some(f) => {
+                let last = self.s.m.i32(group & !31);
+                self.s.m.select(e, f, base, last)
+            }
+            None => base,
+        };
         self.s.flags |= flags::WAVE_OPS;
         self.wave_base = Some(base);
         Some(base)
@@ -4796,6 +5022,17 @@ impl<'a> Lower<'a> {
         if self.x.native.wave64 { 64 } else { 32 }
     }
 
+    /// A lane number as the ISA takes it for `v_readlane` / `v_writelane`: modulo the wave.
+    fn lane_mod(&mut self, lane: V) -> V {
+        // (a constant lane is the console compiler's, in range; the checks after this one
+        // tell constants from computed lanes)
+        if matches!(lane, V::Const(_)) {
+            return lane;
+        }
+        let last = self.s.m.i32(self.wave() - 1);
+        self.s.m.bin(self.cur, Bin::And, lane, last)
+    }
+
     fn lane_index(&mut self) -> V {
         if self.s.mesh.is_some() {
             // The console's lane: mesh code reads no other lanes, so host
@@ -5001,9 +5238,63 @@ impl<'a> Lower<'a> {
             // host gives it; the console reads 0.
             self.cross_lane(false)?;
             if self.exchange.as_ref().is_some_and(|e| !e.1) {
-                // a console wave of 64 run as two host waves: the lane named
-                // may be in the other one
-                return Err("a lane permute across two host waves");
+                // A console wave of 64 run as two host waves: the lane named may be in the
+                // other one. Every lane writes its data (0 where EXEC leaves it out) to its
+                // console wave's 64 dwords, the group meets, every lane reads the dword of
+                // the lane its address names, and the group meets again before the dwords
+                // can be written anew (the handover's paired-wave shuffle). The meetings
+                // are group barriers, so every thread of the group must be here.
+                let Some(area) = self.permute_area else {
+                    return Err("a lane permute across two host waves");
+                };
+                if self.local || !self.all_lanes(self.cur_ir) {
+                    need(self.cur_ir);
+                    return Err("a lane permute across two host waves where not every lane runs");
+                }
+                let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
+                let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
+                let x = match guard {
+                    Some(g) => {
+                        let z = self.s.m.i32(0);
+                        self.s.m.select(c, g, x, z)
+                    }
+                    None => x,
+                };
+                let o = self.s.m.i32(offset);
+                let at = self.s.m.bin(c, Bin::Add, at, o);
+                let two = self.s.m.i32(2);
+                let src = self.s.m.bin(c, Bin::LShr, at, two);
+                let k63 = self.s.m.i32(63);
+                let src = self.s.m.bin(c, Bin::And, src, k63);
+                // thread t of the group writes dword area + t; its console wave's lane `src`
+                // is at area + (t & !63) + src
+                let thread = self.console_thread();
+                let lds = self.s.lds();
+                let base = self.s.m.i32(area);
+                let mine = self.s.m.bin(c, Bin::Add, base, thread);
+                let p = self.s.m.element(c, lds, mine);
+                self.s.m.store(c, p, x);
+                self.group_sync(c);
+                let not63 = self.s.m.i32(!63);
+                let wave = self.s.m.bin(c, Bin::And, thread, not63);
+                let theirs_thread = self.s.m.bin(c, Bin::Or, wave, src);
+                let theirs = self.s.m.bin(c, Bin::Add, base, theirs_thread);
+                let p = self.s.m.element(c, lds, theirs);
+                let r = self.s.m.load(c, p);
+                self.group_sync(c);
+                // a lane past the end of the group is not there on the console: 0
+                let group = self.s.threads.map_or(64, |t| t.iter().product::<u32>());
+                let r = if !group.is_multiple_of(64) {
+                    let n = self.s.m.i32(group);
+                    let there = self.s.m.cmp(c, pred::IULT, theirs_thread, n);
+                    let z = self.s.m.i32(0);
+                    self.s.m.select(c, there, r, z)
+                } else {
+                    r
+                };
+                let reg = dst_reg.ok_or("a permute result")?;
+                self.write(inst, Reg::V(reg), r, guard);
+                return Ok(());
             }
             let at = self.vgprs(inst, addr.as_ref().ok_or("a permute address")?, 1)?[0];
             let x = self.vgprs(inst, data.first().ok_or("a permute source")?, 1)?[0];
@@ -5725,6 +6016,29 @@ impl<'a> Lower<'a> {
                             }
                         };
                         r.push(x);
+                    }
+                    self.set(lo, Val::I32(r[0]));
+                    self.set(hi, Val::I32(r[1]));
+                    let s = nonzero(self, r[0], r[1]);
+                    self.set(scc, Val::Bit(s));
+                    Ok(())
+                }
+                "s_wqm_b64" => {
+                    // Whole quad mode of a scalar: each 4-bit group all ones if any of its bits
+                    // is set; SCC: the result is not zero (a dual-bank program's console EXEC is
+                    // such a scalar, `crate::dualbank`).
+                    let (q, f) = (self.s.m.i32(0x1111_1111), self.s.m.i32(0xF));
+                    let mut r = Vec::new();
+                    for h in 0..2u8 {
+                        let a = half(self, 0, h)?;
+                        let mut any = a;
+                        for n in 1..4 {
+                            let k = self.s.m.i32(n);
+                            let s = self.s.m.bin(c, Bin::LShr, a, k);
+                            any = self.s.m.bin(c, Bin::Or, any, s);
+                        }
+                        let any = self.s.m.bin(c, Bin::And, any, q);
+                        r.push(self.s.m.bin(c, Bin::Mul, any, f));
                     }
                     self.set(lo, Val::I32(r[0]));
                     self.set(hi, Val::I32(r[1]));
@@ -7215,10 +7529,22 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(rest) = name.strip_prefix("v_cmp_").or(name.strip_prefix("v_cmpx_")) {
-            let r = if v.dpp.is_some() {
-                Err("a compare with DPP")
-            } else {
-                self.compare(inst, rest)
+            // A compare with DPP: src0 as read from the lane DPP names, and the bits of the
+            // lanes DPP leaves unwritten clear ([`Self::dpp`]). Found as the reason one compute
+            // program did not translate on any host (the DPP compare lane tests).
+            let r = match v.dpp {
+                Some(d) => match self.dpp(inst, d) {
+                    Ok((x, enable)) => {
+                        self.src0 = Some(x);
+                        self.dpp_enable = enable;
+                        let r = self.compare(inst, rest);
+                        self.src0 = None;
+                        self.dpp_enable = None;
+                        r
+                    }
+                    Err(e) => Err(e),
+                },
+                None => self.compare(inst, rest),
             };
             if let Err(why) = r {
                 for &(_, w) in &inst.writes {
@@ -8148,6 +8474,9 @@ impl<'a> Lower<'a> {
             }
             "v_readlane_b32" => {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
+                // the ISA takes the lane modulo the wave size (lane 32 of a wave32 is lane 0;
+                // found by `lane_tests` through `dualbank`)
+                let lane = self.lane_mod(lane);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
                 if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
@@ -8200,6 +8529,7 @@ impl<'a> Lower<'a> {
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
                 };
+                let lane = self.lane_mod(lane);
                 let old = match inst.read(Reg::V(reg)) {
                     Some(o) => self.i32_of(o)?,
                     None => self.s.m.i32(0),
@@ -8208,10 +8538,24 @@ impl<'a> Lower<'a> {
                 if self.local && !self.local_any {
                     return Err("a lane write in a half-wave");
                 }
+                // The ISA's `v_writelane_b32` ignores EXEC: the lane given takes the value
+                // even when it is not active, so the result is written without the EXEC
+                // guard (the select above already leaves every other lane as it was). Found
+                // by `lane_tests` (an inactive target lane kept its old value). Where not
+                // every lane reaches this code, the target lane's thread may not be here to
+                // take it: refused rather than lost.
+                let reached = all_lane_blocks(self.x.st)
+                    .is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false));
+                if !reached {
+                    // shortcut: translated all the same, and marked APPROXIMATE (the census of
+                    // `victory translate` lists it; `form::APPROX_LANE_WRITE`). Refusing them
+                    // stopped 36 of the title's programs, ray-traced shadows among them.
+                    self.approx_lane_write = true;
+                }
                 let me = self.console_lane();
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
-                int(self, r)
+                self.write_i(inst, r, None)
             }
             "v_readfirstlane_b32"
                 if inst
@@ -9714,6 +10058,12 @@ impl<'a> Lower<'a> {
                 self.s.m.cmp(c, p, a, b)
             }
             _ => return Err(inst.name()),
+        };
+        // a DPP compare: the lanes DPP leaves unwritten (a source past the row without
+        // bound_ctrl, a row or bank masked off) have their bit clear
+        let r = match self.dpp_enable {
+            Some(e) => self.s.m.bin(self.cur, Bin::And, r, e),
+            None => r,
         };
         self.lane_bits_for(inst, r);
         Ok(())
@@ -13057,5 +13407,74 @@ mod tests {
         assert!(f10(0x3FF).is_nan());
         // A 16-bit float is a half already, sign included.
         assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
+    }
+
+    /// A wave64 program of `words` (`ir::build`'s console form).
+    fn wave64(words: &[u32]) -> ir::Program {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        ir::build(&code, true, 8).unwrap()
+    }
+
+    /// DS `op vdst, addr, data0` at offset 0.
+    const fn ds(op: u32, vdst: u32, addr: u32, data0: u32) -> [u32; 2] {
+        [0x36 << 26 | op << 18, vdst << 24 | data0 << 8 | addr]
+    }
+    const V_MOV_V1_S0: u32 = 0x7E02_0200; // v_mov_b32 v1, s0
+    const S_BARRIER: u32 = 0xBF8A_0000;
+    const DS_WRITE_B32: u32 = 0x0D;
+    const DS_READ_B32: u32 = 0x36;
+
+    /// The site of the program's `ds_read_b32` and the value it loads into v3.
+    fn the_read(p: &ir::Program) -> ((usize, usize), ir::Value) {
+        for (b, block) in p.blocks.iter().enumerate() {
+            for (i, inst) in block.insts.iter().enumerate() {
+                if inst.name() == "ds_read_b32" {
+                    return ((b, i), inst.write(ir::Reg::V(3)).unwrap());
+                }
+            }
+        }
+        panic!("no ds_read_b32");
+    }
+
+    #[test]
+    fn a_shared_read_at_a_uniform_address_after_a_barrier_is_uniform() {
+        // every wave writes, the group meets, then each reads one address
+        let mut words = vec![V_MOV_V1_S0];
+        words.extend(ds(DS_WRITE_B32, 0, 1, 2));
+        words.push(S_BARRIER);
+        words.extend(ds(DS_READ_B32, 3, 1, 0));
+        words.push(S_ENDPGM);
+        let p = wave64(&words);
+        let st = structure::structure(&p).unwrap();
+        let all = super::all_lane_blocks(&st).unwrap();
+        let (site, loaded) = the_read(&p);
+        assert!(super::lds_settled(&p, site));
+        assert!(super::lane_uniform(&p, &st, &all).contains(&loaded));
+    }
+
+    #[test]
+    fn a_shared_read_another_wave_may_race_is_not_uniform() {
+        // no barrier between the writes and the read: another wave may
+        // still be writing while the two halves of this one read
+        let mut words = vec![V_MOV_V1_S0];
+        words.extend(ds(DS_WRITE_B32, 0, 1, 2));
+        words.extend(ds(DS_READ_B32, 3, 1, 0));
+        words.push(S_ENDPGM);
+        let p = wave64(&words);
+        let st = structure::structure(&p).unwrap();
+        let all = super::all_lane_blocks(&st).unwrap();
+        let (site, loaded) = the_read(&p);
+        assert!(!super::lds_settled(&p, site));
+        assert!(!super::lane_uniform(&p, &st, &all).contains(&loaded));
+        // a write after the read: the second half may read it, the first not
+        let mut words = vec![V_MOV_V1_S0];
+        words.extend(ds(DS_WRITE_B32, 0, 1, 2));
+        words.push(S_BARRIER);
+        words.extend(ds(DS_READ_B32, 3, 1, 0));
+        words.extend(ds(DS_WRITE_B32, 0, 1, 3));
+        words.push(S_ENDPGM);
+        let p = wave64(&words);
+        let (site, _) = the_read(&p);
+        assert!(!super::lds_settled(&p, site));
     }
 }

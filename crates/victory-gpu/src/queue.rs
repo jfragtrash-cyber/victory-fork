@@ -548,6 +548,15 @@ fn wake() {
     WORK.1.notify_one();
 }
 
+/// A list was closed with refreshes our thread may make ahead
+/// (`crate::host::ahead`): it looks at the lines first, then at those.
+#[cfg(windows)]
+pub(crate) fn wake_for_ahead() {
+    if behind() {
+        wake();
+    }
+}
+
 /// A page-mapping batch is done (`crate::pagemap`): what its line holds
 /// behind it may run. With [`behind`] only, whose thread runs the lines;
 /// never runs them here (the batch may have been applied from inside a
@@ -585,6 +594,15 @@ fn worker() {
         crate::framelog::add(crate::framelog::T::WorkerUs, started.elapsed().as_micros() as u64);
         crate::framelog::add(crate::framelog::T::WorkerUserUs, user_now.saturating_sub(user));
         crate::framelog::add(crate::framelog::T::WorkerKernelUs, kernel_now.saturating_sub(kernel));
+        // Nothing free to run: the refreshes of lists closed and not
+        // submitted yet are made ahead (`crate::host::ahead`; not counted
+        // as at work above), until work comes.
+        if crate::host::ahead::on()
+            && let Some(host) = crate::host::host()
+        {
+            let more = || *lock(&WORK.0);
+            while !more() && crate::host::ahead::run(host, &more) {}
+        }
     }
 }
 

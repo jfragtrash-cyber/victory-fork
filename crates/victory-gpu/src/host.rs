@@ -2103,6 +2103,10 @@ struct Deferred {
     /// memory (host copy, address, bytes): declaring them again changes
     /// nothing ([`declare_once`]).
     gpu_written: std::collections::HashSet<(usize, usize, usize)>,
+    /// The fills of upload memory recorded through [`HostList::fill`] by
+    /// what they read, since the list last recorded a step that may write
+    /// title memory ([`fill_once`]).
+    filled: Filled,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2146,6 +2150,112 @@ impl Drop for Deferred {
         ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
     }
 }
+
+/// A recording's fills of upload memory by what they read ([`fill_once`]):
+/// for each (title address, bytes), the host GPU address of the memory the
+/// first fill of them fills, since the recording last recorded a step
+/// that may write title memory.
+#[derive(Default)]
+struct Filled {
+    first: crate::draw::FastMap<(usize, usize), u64>,
+    /// Fills recorded as steps; fills that read what one before them read
+    /// (given its memory with the switch, made as steps of their own
+    /// without it). Counted for the frame line when the list is closed.
+    made: u32,
+    same: u32,
+    /// [`fill_once`] as the recording's first such fill found it: one
+    /// recording goes one way, `alt` too.
+    on: Option<bool>,
+}
+
+impl Filled {
+    /// The memory of a fill of the same `len` bytes at `src` recorded
+    /// before, if `on` (asked once a recording) says to give it again;
+    /// counted either way.
+    fn earlier(&mut self, src: usize, len: usize, on: impl FnOnce() -> bool) -> Option<u64> {
+        let gpu = *self.first.get(&(src, len))?;
+        self.same += 1;
+        (*self.on.get_or_insert_with(on)).then_some(gpu)
+    }
+
+    /// A fill of `len` bytes at `src` into the memory at `gpu` was recorded
+    /// as a step of its own.
+    fn made(&mut self, src: usize, len: usize, gpu: u64) {
+        self.made += 1;
+        self.first.entry((src, len)).or_insert(gpu);
+    }
+
+    /// A step that may write title memory was recorded: a fill after it
+    /// reads what that step leaves, which no fill before it has read.
+    fn title_may_change(&mut self) {
+        self.first.clear();
+    }
+
+    /// The counts since the last call, for the frame line.
+    fn take_counts(&mut self) -> [u32; 2] {
+        [std::mem::take(&mut self.made), std::mem::take(&mut self.same)]
+    }
+}
+
+/// Whether a fill of upload memory that reads the same bytes (title
+/// address and length) as one recorded before it in its list, with no
+/// step between the two that may write title memory (a title buffer copy,
+/// work of ours that may write it), is given that fill's memory instead
+/// of being made too (`VICTORY_FILL_ONCE=1`; `alt`: twenty seconds with,
+/// twenty without, in turn, each change said in the log, a recording going
+/// one way whole; off by default).
+///
+/// The bytes are the same: a submission's steps run in recorded order on
+/// one thread, and none of ours between the two fills writes title memory.
+/// What another thread (the title's, a landing) writes there between the
+/// two the second fill may see and the first not: a race either way, and
+/// on the console both draws read the memory when the card runs them
+/// (`fill_ahead` compares landings with the fills ahead of them: none read
+/// bytes a flight then changed in run BL).
+///
+/// Why: a table holding a constant buffer is made afresh for each draw
+/// that binds it ([`crate::draw::State::tables`]), and with it a fill of
+/// the buffer's bytes; the same table is made once a list, but the same
+/// buffer comes in many tables. Run BL's frame 7717 (its ops file): 13,772
+/// constant buffer views in such tables, 2,859 distinct (address, bytes)
+/// per list; its frame line ~12,100 fills a frame. A fill costs the
+/// submitting thread about 0.3 us whatever its size (run BA: ~16,000 a
+/// frame, 3.7 ms in `copy_mapped`, the copy itself 0.65 ms of it, the rest
+/// its clock reads and counters; ~1 ms more of clock reads around it in
+/// the steps), the recording thread a scratch allocation, and the card's
+/// upload memory its bytes again.
+fn fill_once() -> bool {
+    match fill_once_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = (now_us() / 20_000_000) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "fills of upload memory from now (VICTORY_FILL_ONCE=alt): {}",
+                    if on { "ONCE, the same bytes in a list filled once" } else { "each its own, as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// [`fill_once`]'s switch: 0 off, 1 on, 2 in turn.
+fn fill_once_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_FILL_ONCE").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    })
+}
+
+/// Since the last frame-rate line: fills of upload memory recorded through
+/// [`HostList::fill`] as steps, and fills that read what one before them
+/// in their list read ([`fill_once`]); counted as lists are closed.
+static FILLS_ONCE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Whether a queue's submissions go to the card without a wait for each
 /// (`VICTORY_LATE_WAIT=1`; off by default, and off in the timing run, which
@@ -6354,6 +6464,12 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        let fills = self.deferred().filled.take_counts();
+        if fills != [0, 0] {
+            for (count, n) in FILLS_ONCE.iter().zip(fills) {
+                count.fetch_add(u64::from(n), Ordering::Relaxed);
+            }
+        }
         self.twins_to_depth();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some((scratch, _)) = scratch {
@@ -6995,6 +7111,7 @@ impl HostList {
         // A copy that goes on where the one recorded just before it ended,
         // source and destination both: with `join_copies` the two are one
         // step.
+        deferred.filled.title_may_change();
         if let Some(Step::Copy(d, s, n)) = deferred.copies.last_mut()
             && continues((*d, *s, *n), (dst as usize, src as usize, len))
         {
@@ -7009,6 +7126,29 @@ impl HostList {
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
         deferred.gpu_written.clear();
+    }
+
+    /// Upload memory that holds, when the list runs, the `len` bytes of
+    /// title memory at `src` as they are when the list is submitted (a
+    /// constant buffer, which the host wants 256-byte aligned): its host
+    /// GPU address, or `None` without room. A fill of the same bytes
+    /// recorded before it in the list, with no step between them that may
+    /// write title memory, holds them already: with [`fill_once`] its
+    /// memory is given again and nothing more is copied.
+    pub(crate) fn fill(&self, src: usize, len: u64) -> Option<u64> {
+        // With the switch off the fills are noted only to be counted, in
+        // diagnostics builds (and tests, which set the recording's way).
+        let noted = cfg!(any(test, feature = "diagnostics")) || fill_once_mode() != 0;
+        if noted && let Some(gpu) = self.deferred().filled.earlier(src, len as usize, fill_once) {
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Fill(to as usize, src, len as usize));
+        if noted {
+            deferred.filled.made(src, len as usize, gpu);
+        }
+        Some(gpu)
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -7366,6 +7506,7 @@ impl HostList {
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.refreshed.clear();
         deferred.gpu_written.clear();
+        deferred.filled.title_may_change();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -8629,6 +8770,21 @@ impl Meter {
                 );
             }
         }
+        {
+            let [made, same] = [0, 1].map(|i| FILLS_ONCE[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if made > 0.0 {
+                tracing::info!(
+                    "fills of constant buffers recorded per frame: {made:.0} made at their lists' submissions; {same:.0} \
+                     read the same bytes as one before them in their list (VICTORY_FILL_ONCE=1 gives them its memory, \
+                     not made again: now {})",
+                    match std::env::var("VICTORY_FILL_ONCE").as_deref() {
+                        Ok("1") => "on",
+                        Ok("alt") => "in turn",
+                        _ => "off",
+                    }
+                );
+            }
+        }
         // Title-filled textures read past their guards, by why.
         {
             let [written, turn, aliased, unguarded, partial] =
@@ -9691,6 +9847,144 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+}
+
+#[cfg(test)]
+mod fill_once_tests {
+    use super::*;
+
+    /// A fill is given again only for the same bytes (address and length),
+    /// only until a step that may write title memory, and only when the
+    /// switch, asked once a recording, says so; counted either way.
+    #[test]
+    fn a_fill_is_given_again_for_the_same_bytes_until_title_memory_may_change() {
+        let mut filled = Filled::default();
+        assert_eq!(filled.earlier(0x1000, 480, || true), None);
+        filled.made(0x1000, 480, 0xa000);
+        assert_eq!(filled.earlier(0x1000, 480, || true), Some(0xa000));
+        assert_eq!(filled.earlier(0x1000, 512, || true), None, "another length");
+        assert_eq!(filled.earlier(0x1010, 480, || true), None, "another address");
+        // A later fill of the same bytes made as a step leaves the first's.
+        filled.made(0x1000, 480, 0xb000);
+        assert_eq!(filled.earlier(0x1000, 480, || unreachable!("asked once a recording")), Some(0xa000));
+        filled.title_may_change();
+        assert_eq!(filled.earlier(0x1000, 480, || true), None);
+        assert_eq!(filled.take_counts(), [2, 2]);
+        assert_eq!(filled.take_counts(), [0, 0]);
+        // Off: the same bytes are counted, and made as fills of their own.
+        let mut off = Filled::default();
+        off.made(0x70, 32, 0xc000);
+        assert_eq!(off.earlier(0x70, 32, || false), None);
+        assert_eq!(off.earlier(0x70, 32, || true), None, "a recording goes one way whole");
+        assert_eq!(off.take_counts(), [1, 2]);
+    }
+
+    /// The fills of a list recorded with the switch on and off: what each
+    /// draw's memory holds once the list has run is the same, the bytes
+    /// as they were at submission (written after recording too), and a
+    /// title buffer copy recorded between two fills of its destination is
+    /// seen by the second only. With the switch, a fill of bytes filled
+    /// before (and no copy or step of ours between) is no step of its own.
+    #[test]
+    fn fills_given_again_hold_what_their_own_would_hold() {
+        let Some(host) = host() else {
+            eprintln!("fill_once_tests: skipped, no host device");
+            return;
+        };
+        // Memory standing for the title's: four pieces of 512 bytes, read
+        // and written through raw pointers alone (the submission writes it).
+        const LEN: usize = 2048;
+        let title: *mut u8 = Box::into_raw(vec![0u8; LEN].into_boxed_slice()).cast();
+        let at = title as usize;
+        let piece = |k: usize| at + 512 * k;
+        let pattern: Vec<u8> = (0..LEN).map(|i| (i * 7 + 3) as u8).collect();
+        let mut seen = Vec::new();
+        for on in [false, true] {
+            // SAFETY: inside the allocation; nothing else uses it now.
+            unsafe { title.copy_from_nonoverlapping(pattern.as_ptr(), LEN) };
+            let list = host.new_list().expect("a host list");
+            list.deferred().filled.on = Some(on);
+            // Draws reading pieces 0, 0, 1, 0 (piece 0 as 480 and 512
+            // bytes), then piece 2; a title copy of piece 3 into piece 2;
+            // then pieces 2 and 0 again.
+            let reads = [(0, 480), (0, 480), (1, 480), (0, 512), (0, 480), (2, 480)];
+            let mut gpus: Vec<u64> = reads.iter().map(|&(k, n)| list.fill(piece(k), n).expect("upload memory")).collect();
+            list.defer_copy(piece(2) as *mut u8, piece(3) as *const u8, 512);
+            gpus.extend([(2, 480), (0, 480)].map(|(k, n)| list.fill(piece(k), n).expect("upload memory")));
+            let fills = |list: &HostList| {
+                list.deferred().copies.iter().filter(|s| matches!(s, Step::Fill(..))).count()
+            };
+            if on {
+                assert_eq!(gpus[1], gpus[0]);
+                assert_eq!(gpus[4], gpus[0]);
+                assert_ne!(gpus[2], gpus[0], "other bytes");
+                assert_ne!(gpus[3], gpus[0], "another length");
+                assert_ne!(gpus[6], gpus[5], "a title copy between");
+                assert_ne!(gpus[7], gpus[0], "a title copy between");
+                assert_eq!(fills(&list), 6);
+            } else {
+                let mut distinct = gpus.clone();
+                distinct.sort_unstable();
+                distinct.dedup();
+                assert_eq!(distinct.len(), gpus.len(), "each fill its own memory");
+                assert_eq!(fills(&list), 8);
+            }
+            assert_eq!(list.deferred().filled.same, 2);
+            // Written after recording, before submission: every draw sees it.
+            // SAFETY: inside the allocation; nothing else uses it now.
+            unsafe {
+                title.add(5).write(0xee);
+                title.add(512 + 9).write(0xdd);
+            }
+            let mut before = pattern.clone();
+            before[5] = 0xee;
+            before[512 + 9] = 0xdd;
+            list.close();
+            host.execute(&[&list]);
+            // What each draw reads, by its memory's host address: the fill
+            // whose memory it is.
+            let mut by_gpu = std::collections::HashMap::new();
+            let mut cpu = Vec::new();
+            for step in &list.deferred().copies {
+                if let &Step::Fill(dst, _, len) = step {
+                    cpu.push((dst, len));
+                }
+            }
+            let firsts: Vec<u64> = {
+                let mut v = Vec::new();
+                for &g in &gpus {
+                    if !v.contains(&g) {
+                        v.push(g);
+                    }
+                }
+                v
+            };
+            assert_eq!(firsts.len(), cpu.len());
+            for (g, (dst, len)) in firsts.into_iter().zip(cpu) {
+                // SAFETY: the list's upload memory, alive until it is reset.
+                by_gpu.insert(g, unsafe { std::slice::from_raw_parts(dst as *const u8, len) }.to_vec());
+            }
+            let read: Vec<Vec<u8>> = gpus.iter().map(|g| by_gpu[g].clone()).collect();
+            let expected: Vec<&[u8]> = vec![
+                &before[..480],
+                &before[..480],
+                &before[512..992],
+                &before[..512],
+                &before[..480],
+                // Piece 2 before the copy, then piece 3's bytes after it.
+                &before[1024..1504],
+                &before[1536..2016],
+                &before[..480],
+            ];
+            for (k, (read, expected)) in read.iter().zip(&expected).enumerate() {
+                assert_eq!(&read[..], *expected, "draw {k}, switch {on}");
+            }
+            seen.push(read);
+        }
+        assert_eq!(seen[0], seen[1], "the same bytes with the switch and without");
+        // SAFETY: the allocation made above, no longer used.
+        drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(title, LEN)) });
     }
 }
 

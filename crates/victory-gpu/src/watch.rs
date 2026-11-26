@@ -955,6 +955,21 @@ fn next_open(g: &Guards, at: usize, hole_until: usize, last: usize) -> usize {
     g.clean.first_unset(at, last)
 }
 
+/// [`next_open`] with the quiet blocks ([`hole_bits`]) passed over as
+/// well: absent blocks inside a hole lately said are there.
+fn next_open_quiet(g: &Guards, at: usize, hole_until: usize, last: usize) -> usize {
+    let inside = hole_until.min(last);
+    let mut at = at;
+    if at < inside {
+        let block = Blocks::first_in_none(&g.clean, Some(&g.absent), at, inside);
+        if block < inside {
+            return block;
+        }
+        at = inside;
+    }
+    Blocks::first_in_none(&g.clean, Some(&g.quiet), at, last)
+}
+
 /// Diagnostics: one in 2,048 of the askings the kernel's write watch
 /// refused for memory the guards did not know (some 200 a frame in the
 /// first rooms, each followed by a question to Windows about the memory):
@@ -1209,6 +1224,29 @@ impl Blocks {
         }
     }
 
+    /// Sets the blocks of `[from, to)` that `other` holds; how many were
+    /// not set before.
+    fn insert_and(&mut self, other: &Blocks, from: usize, to: usize) -> usize {
+        let mut added = 0;
+        for c in other.chunks_in(from, to) {
+            if c.set == 0 {
+                continue;
+            }
+            let (lo, hi) = Self::local(c.at, from, to);
+            let mine = Self::chunk_made(&mut self.chunks, c.at);
+            let mut n = 0;
+            for (w, mask) in chunk_words(lo, hi) {
+                let bits = c.bits[w] & mask & !mine.bits[w];
+                n += bits.count_ones() as usize;
+                mine.bits[w] |= bits;
+            }
+            mine.set += n;
+            added += n;
+        }
+        self.len += added;
+        added
+    }
+
     /// Clears blocks `[from, to)`.
     fn remove_range(&mut self, from: usize, to: usize) {
         if from >= to {
@@ -1329,6 +1367,12 @@ struct Guards {
     /// With [`rest_now`]: when checks last made blocks read-only, and the
     /// blocks a write opened soon after, left open for a while.
     rests: Rests,
+    /// With [`hole_bits`]: the blocks of `absent` inside a hole of `holes`
+    /// that is fresh ([`fresh`]); and for each run of them noted, the
+    /// millisecond of the answer that holds it, the earliest first
+    /// ([`quiet_expire`]).
+    quiet: Blocks,
+    quiet_ends: std::collections::BinaryHeap<std::cmp::Reverse<(u64, usize, usize)>>,
 }
 
 impl Guards {
@@ -1343,6 +1387,8 @@ impl Guards {
             holes_changed: 0,
             protecting: Blocks::new(),
             rests: Rests::new(),
+            quiet: Blocks::new(),
+            quiet_ends: std::collections::BinaryHeap::new(),
         }
     }
 }
@@ -1828,6 +1874,16 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         // Nothing written, mapped or new since the range was last taken.
         return Some(written);
     }
+    // Absent blocks inside holes Windows lately said are there pass as
+    // clean ones do ([`hole_bits`]), once the answers grown old are let go.
+    if !g.quiet_ends.is_empty() {
+        quiet_expire(&mut g, crate::host::now_ms());
+    }
+    let quiet = !g.quiet.is_empty() && hole_bits();
+    if quiet && Blocks::first_in_none(&g.clean, Some(&g.quiet), first, last) == last {
+        HOLE_BITS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Some(written);
+    }
     let mut uncommitted_until = first;
     let mut holes = HolesAhead::new(last);
     // Blocks resting ([`rest_now`]) are reported and left open; the clock
@@ -1837,8 +1893,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut at = first;
     loop {
         // Blocks `[at, block)` are clean, or absent inside the hole the
-        // walk last found: nothing to do there but end the run before them.
-        let block = next_open(&g, at, uncommitted_until, last);
+        // walk last found (or, with `quiet`, inside any hole lately said):
+        // nothing to do there but end the run before them.
+        let block = if quiet { next_open_quiet(&g, at, uncommitted_until, last) } else { next_open(&g, at, uncommitted_until, last) };
         if block > at {
             end_run(&mut g, &mut run, at, &mut holes);
         }
@@ -1856,6 +1913,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             open = block >= uncommitted_until;
             if open {
                 g.absent.remove(block);
+                g.quiet.remove(block);
             }
         }
         if open {
@@ -2123,6 +2181,10 @@ fn protect_noted(g: &mut Guards, from: usize, to: usize, whole: bool, each: &[Op
             }
         }
     }
+    // The blocks just noted absent lie in holes just said or known fresh.
+    if hole_bits_mode() != 0 {
+        quiet_mark_fresh(g, from, to, crate::host::now_ms());
+    }
 }
 
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`,
@@ -2301,14 +2363,155 @@ impl HolesAhead {
 }
 
 /// [`hole_end`] for [`guard`]'s walk, looking in what it read of the map.
+/// A fresh hole found there notes its absent blocks quiet ([`hole_bits`]).
 fn hole_end_ahead(g: &mut Guards, block: usize, ahead: &mut HolesAhead) -> usize {
     if let Some((end, _)) = ahead.known(g, block) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::HolesKnown, 1);
+        if let Some(&(_, hole)) = ahead.holes.get(ahead.at) {
+            quiet_mark(g, block, end, hole.ms);
+        }
         return end;
     }
     ahead.asked();
     hole_end_asked(g, block)
+}
+
+/// Whether [`guard`]'s walk passes over the absent blocks inside a hole
+/// Windows lately said is there as it passes over clean ones, by bits
+/// (`VICTORY_HOLE_BITS=1`; `alt`: twenty seconds with, twenty without, in
+/// turn, each change said in the log; off by default).
+///
+/// Ranges of view memory that hold unmapped blocks (placeholders between
+/// the title's views) are never all clean, so every check of them walked
+/// them, and every absent block past the hole it last found was looked up
+/// in [`Guards::holes`]: run BL's play 8,823 such lookups a frame against
+/// 510 questions to Windows; run BA's profile 1.7 ms a frame of the
+/// submitting thread in [`HolesAhead::known`] (most of it reading the map
+/// again: each answer of Windows changes it) beside 1.1 ms of
+/// `VirtualQuery`, all with the guards held. With the switch the absent
+/// blocks inside such a hole are bits ([`Guards::quiet`]), set when the
+/// hole is said or first found, and gone when it is forgotten, when the
+/// block is no longer absent, and when the answer is older than
+/// [`hole_keep`] (the same freshness the lookups use). A check whose blocks
+/// are all clean or quiet then returns at once, and a walk passes over
+/// quiet blocks 64 to a word; what it does at the others is unchanged.
+/// (Windows is asked as often as before: when no fresh answer holds.)
+fn hole_bits() -> bool {
+    match hole_bits_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = (crate::host::now_us() / 20_000_000) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "absent blocks inside known holes are passed over by bits from now (VICTORY_HOLE_BITS=alt): {}",
+                    if on { "BITS" } else { "off, looked up one by one as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// `VICTORY_HOLE_BITS`: 0 off, 1 on, 2 in turn ([`hole_bits`]). The bits
+/// are kept whenever it is not 0, so that a turn begins with them right.
+fn hole_bits_mode() -> u8 {
+    #[cfg(test)]
+    if HOLE_BITS_HERE.get() {
+        return 1;
+    }
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_HOLE_BITS").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    })
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Tests: this thread's checks keep and use the bits ([`hole_bits`]).
+    static HOLE_BITS_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs noted in [`Guards::quiet_ends`] past which all bits are let go (a
+/// walk then looks the holes up again and notes them anew).
+const QUIET_MOST: usize = 1 << 16;
+
+/// Since the last frame line ([`hole_bits_line`]): checks answered by the
+/// clean and quiet bits alone, and absent blocks noted quiet.
+static HOLE_BITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// With the frame line, while `VICTORY_HOLE_BITS` is on or in turn.
+pub(crate) fn hole_bits_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [checks, marked] = [0, 1].map(|i| HOLE_BITS[i].swap(0, Relaxed) as f64 / frames);
+    if hole_bits_mode() == 0 {
+        return;
+    }
+    tracing::info!(
+        "guards per frame: {checks:.0} checks answered by the bits of clean blocks and of absent ones inside known holes alone, \
+         {marked:.0} absent blocks noted inside known holes (VICTORY_HOLE_BITS)"
+    );
+}
+
+/// The absent blocks of `[from, to)` lie inside a hole Windows said at
+/// millisecond `ms`: noted quiet ([`hole_bits`]) until that answer is no
+/// longer fresh ([`quiet_expire`]).
+fn quiet_mark(g: &mut Guards, from: usize, to: usize, ms: u64) {
+    if hole_bits_mode() == 0 || from >= to || g.absent.is_empty() {
+        return;
+    }
+    if g.quiet_ends.len() >= QUIET_MOST {
+        quiet_clear(g);
+    }
+    let added = g.quiet.insert_and(&g.absent, from, to);
+    if added > 0 {
+        HOLE_BITS[1].fetch_add(added as u64, std::sync::atomic::Ordering::Relaxed);
+        g.quiet_ends.push(std::cmp::Reverse((ms, from, to)));
+    }
+}
+
+/// No block is quiet any more.
+fn quiet_clear(g: &mut Guards) {
+    g.quiet = Blocks::new();
+    g.quiet_ends.clear();
+}
+
+/// At millisecond `now`: the quiet blocks of answers no longer fresh
+/// ([`fresh`]) are quiet no longer, but where a fresher hole holds them.
+fn quiet_expire(g: &mut Guards, now: u64) {
+    let keep = hole_keep();
+    while let Some(&std::cmp::Reverse((ms, from, to))) = g.quiet_ends.peek() {
+        if keep > 0 && now.saturating_sub(ms) < keep {
+            break;
+        }
+        g.quiet_ends.pop();
+        g.quiet.remove_range(from, to);
+        // What holes said again since hold.
+        quiet_mark_fresh(g, from, to, now);
+    }
+}
+
+/// Notes quiet the absent blocks of `[from, to)` that lie inside a hole
+/// fresh at millisecond `now` (each with its hole's answer).
+fn quiet_mark_fresh(g: &mut Guards, from: usize, to: usize, now: u64) {
+    let keep = hole_keep();
+    if hole_bits_mode() == 0 || keep == 0 || from >= to || g.holes.is_empty() {
+        return;
+    }
+    let before = g.holes.range(..from).next_back().filter(|(_, h)| h.end > from);
+    let fresher: Vec<(usize, usize, u64)> = before
+        .into_iter()
+        .chain(g.holes.range(from..to))
+        .filter(|(_, h)| fresh(h, 0, now, keep))
+        .map(|(&s, h)| (s.max(from), h.end.min(to), h.ms))
+        .collect();
+    for (a, b, ms) in fresher {
+        quiet_mark(g, a, b, ms);
+    }
 }
 
 /// Ends the walk's run of blocks to guard again at `to` ([`protect`]).
@@ -2332,15 +2535,21 @@ fn note_hole(g: &mut Guards, block: usize, end: usize, mapped: bool) {
     if end > block {
         if g.holes.len() >= HOLES_MOST {
             g.holes.clear();
+            quiet_clear(g);
         }
         let hole = Hole { end, mapped, frame: crate::frame::current(), ms: crate::host::now_ms() };
         g.holes.insert(block, hole);
+        quiet_mark(g, block, end, hole.ms);
     }
 }
 
 /// Blocks `[from, to)` may have been committed: [`Guards::holes`] keeps
-/// only what it said of the blocks beside them.
+/// only what it said of the blocks beside them (and none of these is quiet,
+/// [`hole_bits`]).
 fn forget_holes(g: &mut Guards, from: usize, to: usize) {
+    if !g.quiet.is_empty() {
+        g.quiet.remove_range(from, to);
+    }
     if g.holes.is_empty() || from >= to {
         return;
     }
@@ -3409,6 +3618,82 @@ mod tests {
         }
     }
 
+    /// With the bits of absent blocks inside known holes ([`hole_bits`]),
+    /// ranges holding unmapped blocks are answered as without them.
+    #[test]
+    fn unmapped_blocks_are_reported_with_hole_bits_as_without() {
+        HOLE_BITS_HERE.set(true);
+        unmapped_blocks_are_reported_once_until_mapped();
+        a_range_that_begins_in_an_unmapped_block_is_guarded();
+        HOLE_BITS_HERE.set(false);
+    }
+
+    /// With [`hole_bits`]: the absent blocks of a range inside a hole
+    /// Windows said are quiet, and a check of clean and quiet blocks alone
+    /// says nothing written; a commit takes a block out (it is reported
+    /// once, then absent and quiet again), and so does the answer growing
+    /// old (the next check finds the hole fresh and notes it again).
+    #[test]
+    fn absent_blocks_inside_known_holes_are_bits() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER, MEM_RESERVE_PLACEHOLDER, MapViewOfFile3,
+            PAGE_NOACCESS, UnmapViewOfFile2, VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        if hole_keep() == 0 {
+            return;
+        }
+        HOLE_BITS_HERE.set(true);
+        const BLOCKS: usize = 4;
+        // SAFETY: a fresh placeholder of four blocks; its first block shows
+        // a pagefile section's.
+        let (p, section, view) = unsafe {
+            let p = VirtualAlloc2(GetCurrentProcess(), std::ptr::null(), BLOCKS * BLOCK, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0) as usize;
+            assert_ne!(p, 0);
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            VirtualFree(p as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+            let view = MapViewOfFile3(section, GetCurrentProcess(), p as *const _, 0, BLOCK, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0);
+            assert_eq!(view.Value as usize, p);
+            (p, section, view)
+        };
+        let (b, pages) = (p / BLOCK, |block: usize| (p + block * BLOCK) / PAGE..(p + (block + 1) * BLOCK) / PAGE);
+        let quiet = |blocks: std::ops::Range<usize>| {
+            let g = guards_shared();
+            blocks.map(|k| g.quiet.contains(b + k)).collect::<Vec<bool>>()
+        };
+        assert_eq!(guard(p, p + BLOCKS * BLOCK), Some((0..BLOCKS).flat_map(pages).collect()));
+        assert_eq!(quiet(0..BLOCKS), [false, true, true, true], "the absent blocks, not the mapped one");
+        assert_eq!(guard(p, p + BLOCKS * BLOCK), Some(Vec::new()), "nothing written since");
+        // Committed by someone who says so: reported once, then absent again.
+        title_memory_committed(p + 2 * BLOCK, BLOCK);
+        assert_eq!(quiet(0..BLOCKS), [false, true, false, true]);
+        assert_eq!(guard(p, p + BLOCKS * BLOCK), Some(pages(2).collect()));
+        assert_eq!(guard(p, p + BLOCKS * BLOCK), Some(Vec::new()));
+        assert_eq!(quiet(0..BLOCKS), [false, true, true, true], "found in the hole again");
+        // Every answer grown old: no block quiet until a check finds the
+        // hole fresh again (the clock of the answers is the process's).
+        quiet_expire(&mut guards(), u64::MAX / 2);
+        assert_eq!(quiet(0..BLOCKS), [false; BLOCKS]);
+        assert_eq!(guard(p, p + BLOCKS * BLOCK), Some(Vec::new()));
+        assert_eq!(quiet(0..BLOCKS), [false, true, true, true]);
+        // A mapping there: the block is new, reported, and no longer quiet.
+        title_memory_remapped(p + 3 * BLOCK, BLOCK);
+        assert_eq!(quiet(0..BLOCKS), [false, true, true, false]);
+        assert_eq!(guard(p, p + BLOCKS * BLOCK), Some(pages(3).collect()));
+        HOLE_BITS_HERE.set(false);
+        title_memory_remapped(p, BLOCKS * BLOCK);
+        assert_eq!(quiet(0..BLOCKS), [false; BLOCKS]);
+        // SAFETY: our view and placeholder.
+        unsafe {
+            UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
+            for block in 0..BLOCKS {
+                VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+    }
+
     /// A pagefile section mapped twice: two views of the same physical
     /// pages, the second left for the test; the section handle, the two
     /// addresses.
@@ -4285,6 +4570,21 @@ mod blocks_tests {
         set.remove_range(top, usize::MAX.div_ceil(BLOCK));
         assert!(!set.contains(top));
         assert_eq!(set.len, 3);
+    }
+
+    /// `insert_and` sets what the other set holds in the range, across
+    /// chunks, and counts only blocks new to it.
+    #[test]
+    fn the_blocks_another_set_holds_in_a_range() {
+        let other: Blocks = [3, 64, 65, CHUNK - 1, CHUNK, CHUNK + 70, 3 * CHUNK].into_iter().collect();
+        let mut set: Blocks = [65, 2 * CHUNK].into_iter().collect();
+        assert_eq!(set.insert_and(&other, 4, CHUNK + 70), 3, "64, CHUNK - 1 and CHUNK; 65 was set");
+        assert_eq!(set.iter_in(0, 4 * CHUNK).collect::<Vec<_>>(), [64, 65, CHUNK - 1, CHUNK, 2 * CHUNK]);
+        assert_eq!(set.len, 5);
+        assert_eq!(set.insert_and(&other, 0, 4 * CHUNK), 3, "3, CHUNK + 70, 3 * CHUNK");
+        assert_eq!(set.insert_and(&other, 0, 4 * CHUNK), 0);
+        assert_eq!(set.insert_and(&Blocks::new(), 0, 4 * CHUNK), 0);
+        assert_eq!(set.len, 8);
     }
 
     /// A small generator of numbers for the tests below.

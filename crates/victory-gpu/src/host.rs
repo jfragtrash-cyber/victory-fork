@@ -8468,6 +8468,9 @@ struct Presenter {
     /// present in the air, and the submission it last flew as (it is used
     /// again once that one has finished).
     ahead: Vec<(HostList, u64)>,
+    /// The pass that draws a second presented plane over the first, made
+    /// when a title first presents two.
+    compose: Option<crate::compose::Composer>,
     hwnd: HWND,
     meter: Meter,
 }
@@ -8812,16 +8815,30 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// as frame `frame` (saved if captures are on), with `over`, a second
+    /// plane in its own state, drawn over it if the title presents two.
+    /// `None` if nothing was shown; else, in diagnostics builds, whether
+    /// the frame was black.
+    pub(crate) fn present(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        over: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         let showing = std::time::Instant::now();
-        let shown = self.present_now(texture, state, frame);
+        let shown = self.present_now(texture, state, over, frame);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
         shown
     }
 
-    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    fn present_now(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        over: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -8897,26 +8914,68 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
-                    &back,
-                    D3D12_RESOURCE_STATE_PRESENT,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
-            // The frame rate, into the corner of what is shown (not of the
-            // title's own frame, which the lines below read back).
-            crate::fpsbox::draw(self, list, &back, (width, height, format));
+            // Two planes: the second drawn over the first, both scaled to
+            // the back buffer; else the first copied.
+            if over.is_some()
+                && p.compose.as_ref().is_none_or(|c| c.format() != format)
+            {
+                p.compose = crate::compose::Composer::new(self, format)
+                    .inspect_err(|e| tracing::warn!(error = %e, "no pass to draw two planes as one"))
+                    .ok();
+            }
+            let composing = over.zip(p.compose.as_mut());
+            let composing_drew = composing.is_some();
+            if let Some(((over, over_state), compose)) = composing {
+                let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                let over_state = D3D12_RESOURCE_STATES(over_state as i32);
+                let mut to_read = vec![transition(&back, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)];
+                to_read.extend((state != read).then(|| transition(texture, state, read)));
+                to_read.extend((over_state != read).then(|| transition(over, over_state, read)));
+                list.ResourceBarrier(&to_read);
+                let slot = slot.map_or(0, |i| i + 1);
+                if let Err(e) = compose.record(self, slot, list, [texture, over], &back, (width, height)) {
+                    tracing::warn!(error = %e, "two planes not drawn");
+                }
+                let mut back_again = vec![
+                    transition(&back, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST),
+                    transition(texture, read, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                ];
+                back_again.extend((over_state != read).then(|| transition(over, read, over_state)));
+                list.ResourceBarrier(&back_again);
+            } else {
+                list.ResourceBarrier(&[
+                    transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_PRESENT,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    ),
+                ]);
+                list.CopyResource(&back, texture);
+            }
+            // What is read back: the title's frame, or with two planes
+            // the back buffer they were drawn into.
+            #[cfg(feature = "diagnostics")]
+            let seen = if composing_drew { &back } else { texture };
+            #[cfg(feature = "diagnostics")]
+            if composing_drew {
+                list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            }
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
+                .then(|| crate::capture::read_back(&self.device, list, seen))
                 .flatten();
             #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, seen) };
+            #[cfg(feature = "diagnostics")]
+            if composing_drew {
+                list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            }
             #[cfg(not(feature = "diagnostics"))]
-            let _ = frame;
+            let _ = (frame, composing_drew);
+            // The frame rate, into the corner of what is shown (not of the
+            // title's own frame, read back above).
+            crate::fpsbox::draw(self, list, &back, (width, height, format));
             list.ResourceBarrier(&[
                 transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
                 transition(
@@ -8991,6 +9050,7 @@ impl Host {
                 format,
                 copy,
                 ahead: Vec::new(),
+                compose: None,
                 hwnd,
                 meter: Meter::new(),
             })

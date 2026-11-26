@@ -60,8 +60,14 @@ enum Held {
     Running,
     /// With [`present_behind`]: the title's present of a frame, due after
     /// what the queue holds before it: the host texture shown, the state
-    /// the title's lists leave it in, and the frame's number.
-    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64),
+    /// the title's lists leave it in, the second plane's ([`overlay`]),
+    /// and the frame's number.
+    Present(
+        windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        u32,
+        Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
+        u64,
+    ),
     /// With `crate::pagemap::on`: a page-mapping batch of the title's
     /// ([`copy_page_mappings`]). When the line gets to it, it is handed to
     /// the thread that applies batches and stays at the head until done:
@@ -181,9 +187,10 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
     crate::resource::host_transition(resource, state);
     let texture = texture.clone();
+    let over = overlay(planes, plane_parameters, resource);
     let sent = hold(this, || {
         PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
-        Held::Present(texture, state, frame)
+        Held::Present(texture, state, over, frame)
     });
     if sent {
         PRESENTS_BEHIND.fetch_add(1, Ordering::Relaxed);
@@ -956,10 +963,11 @@ fn release_held_now(all: bool) {
                             }
                         }
                     }
-                    Held::Present(texture, state, frame) => {
+                    Held::Present(texture, state, over, frame) => {
                         let show = || {
                             if let Some(host) = crate::host::host() {
-                                let _ = host.present(&texture, state, frame);
+                                let over = over.as_ref().map(|(o, s)| (o, *s));
+                                let _ = host.present(&texture, state, over, frame);
                             }
                         };
                         if all {
@@ -1210,6 +1218,76 @@ pub(crate) struct Plane {
     count: u32,
     resources: *const This,
 }
+
+/// A plane as the title passes them: [`Plane`], then source rectangles and
+/// destination pointers, a color space and seven option words; 72 bytes.
+#[cfg(windows)]
+#[repr(C)]
+struct WholePlane {
+    start: Plane,
+    source_rects: *const (),
+    destination: *const (),
+    color_space: u32,
+    options: [u32; 7],
+}
+#[cfg(windows)]
+const _: () = assert!(size_of::<WholePlane>() == 72);
+
+/// The second plane's first resource, if the title presents two planes
+/// (Series S: the interface over the scene) and it is a texture of ours
+/// other than `base`; with the state the title's lists recorded so far
+/// leave it in. Read from title memory, so a layout other than
+/// [`WholePlane`] shows the first plane alone.
+#[cfg(windows)]
+fn overlay(
+    planes: u32,
+    plane_parameters: *const Plane,
+    base: This,
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
+    if planes < 2 || plane_parameters.is_null() {
+        return None;
+    }
+    let second = plane_parameters.cast::<WholePlane>().wrapping_add(1).cast::<u8>();
+    let mut start = [0; size_of::<Plane>()];
+    if !crate::host::read_into(second, &mut start) {
+        return None;
+    }
+    // SAFETY: the bytes of a `Plane`, copied.
+    let plane = unsafe { start.as_ptr().cast::<Plane>().read_unaligned() };
+    let mut pointer = [0; size_of::<This>()];
+    if plane.count == 0 || plane.resources.is_null() || !crate::host::read_into(plane.resources.cast(), &mut pointer) {
+        return None;
+    }
+    let resource = usize::from_ne_bytes(pointer) as This;
+    if resource == base || !crate::resource::is_resource(resource) {
+        return None;
+    }
+    let texture = crate::resource::host_resource(resource)?.clone();
+    const COPY_SOURCE: u32 = 0x800;
+    let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+    crate::resource::host_transition(resource, state);
+    static TOLD: AtomicBool = AtomicBool::new(false);
+    if !TOLD.swap(true, Ordering::Relaxed) {
+        // SAFETY: live textures of ours.
+        let (over, under) = unsafe { (texture.GetDesc(), crate::resource::host_resource(base).map(|t| t.GetDesc())) };
+        let color_space = |p: *const u8| {
+            let mut word = [0; 4];
+            crate::host::read_into(p.wrapping_add(std::mem::offset_of!(WholePlane, color_space)), &mut word)
+                .then(|| u32::from_ne_bytes(word))
+        };
+        tracing::info!(
+            under_format = under.map(|d| d.Format.0),
+            under_size = ?under.map(|d| (d.Width, d.Height)),
+            under_colors = ?color_space(plane_parameters.cast()),
+            over_format = over.Format.0,
+            over_size = ?(over.Width, over.Height),
+            over_colors = ?color_space(second),
+            "the title presents two planes: the second is drawn over the first"
+        );
+    }
+    Some((texture, state))
+}
+
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -1493,7 +1571,8 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        let over = overlay(planes, plane_parameters, resource);
+        let shown = host.present(texture, state, over.as_ref().map(|(o, s)| (o, *s)), frame);
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);

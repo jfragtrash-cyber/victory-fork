@@ -128,17 +128,31 @@ impl Card {
     /// [`Card::sides`] for title memory `[from, to)`: the locks of its
     /// blocks, in the order of their places (one block, every caller's
     /// case, is one lock).
-    fn side(&self, from: usize, to: usize) -> Vec<std::sync::MutexGuard<'_, ()>> {
+    fn side(&self, from: usize, to: usize) -> Side<'_> {
         // One lock a block wherever several threads merge into one copy:
         // the relay's landing (`VICTORY_RELAY_WIDE`), or the title's bytes
         // put in under flights' writes ([`merge_wide`]).
         let wide = relay_wide() > 1 || merge_wide();
-        let mut places: Vec<usize> =
-            (from / PIECE..=to.saturating_sub(1).max(from) / PIECE).map(|b| if wide { b % SIDES } else { 0 }).collect();
+        let (first, last) = (from / PIECE, to.saturating_sub(1).max(from) / PIECE);
+        // One block (the merge's pages, the relay's pieces): one lock and
+        // nothing allocated (two vectors a page were most of the merge's
+        // allocations, run AY).
+        if !wide || first == last {
+            let i = if wide { first % SIDES } else { 0 };
+            return Side::One(self.sides[i].lock().unwrap_or_else(|e| e.into_inner()));
+        }
+        let mut places: Vec<usize> = (first..=last).map(|b| b % SIDES).collect();
         places.sort_unstable();
         places.dedup();
-        places.into_iter().map(|i| self.sides[i].lock().unwrap_or_else(|e| e.into_inner())).collect()
+        Side::Many(places.into_iter().map(|i| self.sides[i].lock().unwrap_or_else(|e| e.into_inner())).collect())
     }
+}
+
+/// The locks [`Card::side`] holds, until dropped.
+#[allow(dead_code)]
+enum Side<'a> {
+    One(std::sync::MutexGuard<'a, ()>),
+    Many(Vec<std::sync::MutexGuard<'a, ()>>),
 }
 
 /// How many threads merge what the card wrote into title memory when the
@@ -2298,25 +2312,35 @@ fn back_piece(
 /// compared, changed runs put in, and their bytes.
 static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+thread_local! {
+    /// Each thread's vector of changed runs for [`Shadow::merge_page`],
+    /// reused page after page ([`changed_runs_into`]).
+    static RUNS: std::cell::Cell<Vec<(usize, usize)>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
 /// [`MERGED`], taken.
 pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
 /// `runs` (in order) with those a gap of `gap` bytes or fewer apart made
-/// one run, the gap's bytes included.
-fn joined_over(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
+/// one run, the gap's bytes included, in the vector itself.
+fn join_in_place(runs: &mut Vec<(usize, usize)>, gap: usize) {
     if gap == 0 || runs.len() < 2 {
-        return runs;
+        return;
     }
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
-    for (at, n) in runs {
-        match out.last_mut() {
-            Some(last) if at - (last.0 + last.1) <= gap => last.1 = at + n - last.0,
-            _ => out.push((at, n)),
+    let mut kept = 0;
+    for i in 1..runs.len() {
+        let (at, n) = runs[i];
+        let last = runs[kept];
+        if at - (last.0 + last.1) <= gap {
+            runs[kept].1 = at + n - last.0;
+        } else {
+            kept += 1;
+            runs[kept] = (at, n);
         }
     }
-    out
+    runs.truncate(kept + 1);
 }
 
 /// The gap, in bytes, over which the title bytes put into a copy in the
@@ -2649,11 +2673,22 @@ fn changed_chunks(now: &[u8], was: &[u8], chunk: usize) -> Vec<(usize, usize)> {
 /// under ranges shaders write (`Shadow::merge_under_writes`) spent 2.4 ms
 /// a frame of the submitting thread here, most of a page differing where
 /// the title had rewritten it.
+#[cfg(test)]
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    changed_runs_into(now, was, &mut runs);
+    runs
+}
+
+/// [`changed_runs`] into `runs` (emptied first): the merge's pages reuse one
+/// per thread ([`merge_page`](Shadow::merge_page)). A new vector a page,
+/// grown run by run, was ~6 ms a frame of the submitting thread waiting in
+/// the system heap's `realloc` (run AY).
+fn changed_runs_into(now: &[u8], was: &[u8], runs: &mut Vec<(usize, usize)>) {
     const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
     const HIGH: u64 = !LOW;
     let n = now.len().min(was.len());
-    let mut runs = Vec::with_capacity(16);
+    runs.clear();
     // Where the run being walked began.
     let mut open: Option<usize> = None;
     let byte = |at: usize, differs: bool, runs: &mut Vec<(usize, usize)>, open: &mut Option<usize>| {
@@ -2683,25 +2718,39 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
         // seven bits and 0x7f make at most 0xfe).
         let differ = ((x & LOW).wrapping_add(LOW) | x) & HIGH;
         if differ == 0 || differ == HIGH {
-            byte(i, differ != 0, &mut runs, &mut open);
+            byte(i, differ != 0, runs, &mut open);
         } else {
             for k in 0..8 {
-                byte(i + k, differ >> (8 * k + 7) & 1 != 0, &mut runs, &mut open);
+                byte(i + k, differ >> (8 * k + 7) & 1 != 0, runs, &mut open);
             }
         }
         i += 8;
     }
     while i < n {
-        byte(i, now[i] != was[i], &mut runs, &mut open);
+        byte(i, now[i] != was[i], runs, &mut open);
         i += 1;
     }
-    byte(n, false, &mut runs, &mut open);
-    runs
+    byte(n, false, runs, &mut open);
 }
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{PIECE, back_piece, changed_chunks, changed_runs};
+    use super::{PIECE, back_piece, changed_chunks, changed_runs, changed_runs_into, join_in_place};
+
+    /// Runs a small gap apart are joined in place, gap included; a reused
+    /// vector starts empty.
+    #[test]
+    fn runs_join_over_small_gaps_in_place() {
+        let mut runs = vec![(0, 2), (4, 1), (40, 3), (44, 1), (100, 1)];
+        join_in_place(&mut runs, 2);
+        assert_eq!(runs, [(0, 5), (40, 5), (100, 1)]);
+        let mut same = vec![(0, 2), (10, 1)];
+        join_in_place(&mut same, 0);
+        assert_eq!(same, [(0, 2), (10, 1)]);
+        let mut reused = vec![(7, 7)];
+        changed_runs_into(&[1, 2, 3], &[1, 0, 3], &mut reused);
+        assert_eq!(reused, [(1, 1)]);
+    }
 
     #[test]
     fn changed_chunks_hold_every_changed_byte() {
@@ -4040,16 +4089,20 @@ impl Shadow {
             // only the submission being prepared writes, here a page
             // (one block of title memory) under that block's lock.
             let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-            let runs = joined_over(changed_runs(title, held), merge_gap());
+            let mut runs = RUNS.with(std::cell::Cell::take);
+            changed_runs_into(title, held, &mut runs);
+            join_in_place(&mut runs, merge_gap());
             if !take(runs.len()) {
+                RUNS.with(|r| r.set(runs));
                 return false;
             }
-            for (r, m) in runs {
+            for &(r, m) in &runs {
                 held[r..r + m].copy_from_slice(&title[r..r + m]);
                 self.card_changed(at + r, at + r + m);
                 MERGED[1].fetch_add(1, Ordering::Relaxed);
                 MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
             }
+            RUNS.with(|r| r.set(runs));
         } else {
             let Some(snapshot) = before.as_mut().and_then(|b| b.as_mut()) else {
                 return false;
@@ -4058,7 +4111,9 @@ impl Shadow {
             // bytes at the copy's offsets (`writing`), and these
             // are in a declared range.
             let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-            for (r, m) in changed_runs(title, held) {
+            let mut runs = RUNS.with(std::cell::Cell::take);
+            changed_runs_into(title, held, &mut runs);
+            for &(r, m) in &runs {
                 // SAFETY: inside the copy's mapping. The card may be
                 // writing the copy beside these bytes; they are
                 // written here and nothing around them.
@@ -4067,6 +4122,7 @@ impl Shadow {
                 MERGED[1].fetch_add(1, Ordering::Relaxed);
                 MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
             }
+            RUNS.with(|r| r.set(runs));
         }
         drop(before);
         drop(side);

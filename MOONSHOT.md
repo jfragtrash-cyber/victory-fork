@@ -546,3 +546,14 @@ already reach.
   the landing. The switch stays, off, for measuring; the hashing of card
   copies a group a piece (`VICTORY_CARD_HASH_WIDE=1`) joins the best set
   (card time -11 ms a frame, pictures right in AW).
+- 2026-11-26, morning. Branch perf-guards, second part, merged: the
+  journal answers only pages written after a copy's oldest page (20,000
+  answers 14 ms -> 0.55 ms in its microbenchmark), and
+  `VICTORY_GUARD_UNLOCKED=1` lets the guards' lock go while Windows makes
+  blocks read-only (the title's threads waited ~6 ms a frame in `on_write`).
+  Run AY (bit sets alone, no capture): 91-124 ms, most ~100. Run AZ (all of
+  it, captured, the same keys as AW): pictures right; usual frames 77.7 ms
+  against AW's 83.8 at more draws (3,908 / 3,681), the submitting thread
+  52 ms against 60. The merge's pages no longer allocate (a vector of runs
+  reused per thread, one block's lock without a vector): run AY had ~11 ms
+  a frame of the submitting thread in the heap for them.

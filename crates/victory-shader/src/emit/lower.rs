@@ -1395,7 +1395,9 @@ pub(super) enum LegacyMul {
 ///   +0 is +0, any other product is rounded once, as the multiply alone rounds it, and with
 ///   a finite non-zero K no 0 × ∞ arises. Where FMad is not fused, a product that rounds to
 ///   -0 (an underflow) comes out +0. 18% of the time-weighted legacy multiplies have such a
-///   constant (one instruction instead of three).
+///   constant (one instruction instead of three). **Not exact on the RTX 3090's driver**:
+///   it folds the `+ 0` away, so K × -0 gives -0 there, where the rule says +0 (the valu
+///   test, run on the card, 2026-11-26). Off for that.
 /// - `plain`: [`LegacyMul::Plain`]. **Inexact**: 0 × ∞ and 0 × NaN give NaN (the
 ///   normalisation of a zero vector), and a zero product keeps its sign. For a timing run
 ///   only, which tells what the rule costs: if nothing moves, the host's compiler already

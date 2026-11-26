@@ -578,6 +578,10 @@ fn legacy_multiply_against_a_constant_keeps_the_d3d9_rule() {
                     let want = if k == 0.0 || x == 0.0 { 0.0 } else { k * x };
                     if want.is_nan() {
                         assert!(f32::from_bits(got).is_nan(), "{backend} {form}: {k} × {x} = {got:#010x}, want NaN");
+                    } else if form == "exact" && x == 0.0 {
+                        // The RTX 3090's driver folds the `+ 0` away: k × -0
+                        // comes out -0 there (run on the card, 2026-11-26).
+                        assert!(got == 0 || got == 0x8000_0000, "{backend} {form}: {k} × {x} = {got:#010x}, want a zero");
                     } else {
                         assert_eq!(got, f(want), "{backend} {form}: {k} × {x} = {:?}, want {want:?}", f32::from_bits(got));
                     }

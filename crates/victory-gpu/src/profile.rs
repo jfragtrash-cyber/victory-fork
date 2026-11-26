@@ -228,10 +228,11 @@ pub(crate) enum Role {
     Pipelines,
     TitleMain,
     Busy,
+    Relay,
 }
 
 impl Role {
-    const ALL: [Role; 7] = [
+    const ALL: [Role; 8] = [
         Role::Submit,
         Role::Record,
         Role::Late,
@@ -239,6 +240,7 @@ impl Role {
         Role::Pipelines,
         Role::TitleMain,
         Role::Busy,
+        Role::Relay,
     ];
 
     /// As `VICTORY_PROFILE_THREADS` and the stacks file name it.
@@ -251,6 +253,7 @@ impl Role {
             Role::Pipelines => "pipelines",
             Role::TitleMain => "title-main",
             Role::Busy => "busy",
+            Role::Relay => "relay",
         }
     }
 
@@ -263,6 +266,7 @@ impl Role {
             Role::Pipelines => "PIPELINE WORKERS (victory-pipelines-N)",
             Role::TitleMain => "TITLE MAIN (title-main)",
             Role::Busy => "OTHER BUSY THREADS (the busiest threads with none of the roles above)",
+            Role::Relay => "RELAY (victory-relay and victory-relay-merge-N: land what shaders wrote)",
         }
     }
 
@@ -276,6 +280,8 @@ impl Role {
             Some(Role::Late)
         } else if name == "title-main" {
             Some(Role::TitleMain)
+        } else if name.starts_with("victory-relay") {
+            Some(Role::Relay)
         } else {
             None
         }
@@ -304,7 +310,7 @@ struct Config {
     most: usize,
     busy: usize,
     /// The roles followed, by `Role as usize`.
-    roles: [bool; 7],
+    roles: [bool; 8],
     /// Whether calls the compiler inlined are shown as frames of their own.
     inline: bool,
     /// Whether a thread that used no cycles since the last look is taken
@@ -335,7 +341,7 @@ impl Config {
             stack: 128 << 10,
             most: 24,
             busy: 6,
-            roles: [true; 7],
+            roles: [true; 8],
             inline: true,
             reuse: true,
             budget: 0.03,

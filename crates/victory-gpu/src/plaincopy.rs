@@ -45,6 +45,28 @@ core::arch::global_asm!(
     "    mov rdi, r10",
     "    xor eax, eax",
     "    ret",
+    // The same copy into title memory ([`copy_to_title`]): a fault at its
+    // instruction, read or write, ends it with 0.
+    ".globl victory_copy_to_title",
+    ".globl victory_copy_to_title_at",
+    ".globl victory_copy_to_title_fault",
+    "victory_copy_to_title:",
+    "    mov r9, rsi",
+    "    mov r10, rdi",
+    "    mov rdi, rcx",
+    "    mov rsi, rdx",
+    "    mov rcx, r8",
+    "victory_copy_to_title_at:",
+    "    rep movsb",
+    "    mov rsi, r9",
+    "    mov rdi, r10",
+    "    mov eax, 1",
+    "    ret",
+    "victory_copy_to_title_fault:",
+    "    mov rsi, r9",
+    "    mov rdi, r10",
+    "    xor eax, eax",
+    "    ret",
 );
 
 #[cfg(target_arch = "x86_64")]
@@ -52,6 +74,9 @@ unsafe extern "C" {
     fn victory_copy_guarded(to: *mut u8, from: *const u8, len: usize) -> u32;
     static victory_copy_guarded_at: u8;
     static victory_copy_guarded_fault: u8;
+    fn victory_copy_to_title(to: *mut u8, from: *const u8, len: usize) -> u32;
+    static victory_copy_to_title_at: u8;
+    static victory_copy_to_title_fault: u8;
 }
 
 /// Whether copies of title memory into host memory are made in place
@@ -74,14 +99,16 @@ pub(crate) fn on() -> bool {
 /// Copies made in place, their bytes, the copies that met a page that was
 /// not there (and went to the kernel's copy), and the copies not tried in
 /// place because their source faulted lately ([`RECENT`]) or they were
-/// under [`LEAST`] bytes, since the last line ([`count`]).
-static COUNT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// under [`LEAST`] bytes; then writes into title memory made in place
+/// ([`copy_to_title`]), their bytes, and those that met a page not there or
+/// not writable; since the last line ([`count`]).
+static COUNT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 thread_local! {
     /// This thread's part of [`COUNT`] not added yet, and the copies since
     /// it was last added.
-    static TALLY: ([std::cell::Cell<u64>; 5], std::cell::Cell<u32>) = const {
-        ([const { std::cell::Cell::new(0) }; 5], std::cell::Cell::new(0))
+    static TALLY: ([std::cell::Cell<u64>; 8], std::cell::Cell<u32>) = const {
+        ([const { std::cell::Cell::new(0) }; 8], std::cell::Cell::new(0))
     };
 }
 
@@ -93,7 +120,7 @@ thread_local! {
 fn count(i: usize, n: u64) {
     TALLY.with(|(tally, copies)| {
         tally[i].set(tally[i].get() + n);
-        if i != 1 {
+        if i != 1 && i != 6 {
             copies.set(copies.get() + 1);
         }
         if copies.get() >= 256 {
@@ -171,6 +198,18 @@ fn install() {
         // SAFETY: the system passes the exception being dispatched and the
         // context it will continue with.
         let (r, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
+        // The copy into title memory: any fault there, read or write (a page
+        // the title unmapped), ends it with 0 ([`copy_to_title`]).
+        if context.Rip == (&raw const victory_copy_to_title_at) as u64 {
+            if r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION
+                || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR
+                || r.ExceptionCode == EXCEPTION_GUARD_PAGE
+            {
+                context.Rip = (&raw const victory_copy_to_title_fault) as u64;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
         // Only at the copy's own instruction.
         if context.Rip != (&raw const victory_copy_guarded_at) as u64 {
             return EXCEPTION_CONTINUE_SEARCH;
@@ -270,17 +309,70 @@ fn copy_from(to: *mut u8, from: *const u8, len: usize, least: usize) -> bool {
     whole
 }
 
+/// Whether bytes put into title memory (what shaders wrote, landed by the
+/// relay: `crate::host::write_mapped`) are copied in place
+/// (`VICTORY_WRITE_PLAIN`; on with [`on`] unless `0`).
+///
+/// Every piece went through the kernel (`NtWriteVirtualMemory`), which
+/// leaves a page that is not there alone: run AF's copy-back wrote some
+/// 54 MB a frame in about 11,700 stretches of 4 KiB, one system call each,
+/// and the relay's landing stayed at ~52 ms a frame with its merge on four
+/// threads.
+fn write_plain() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_PLAIN").is_none_or(|v| v != "0"))
+}
+
+/// With [`on`] and [`write_plain`]: copies host memory at `from` into title
+/// memory at `to` in place; false if off or a page of the destination was
+/// not there or not writable (then some of `to` may have been written, and
+/// the caller writes through the kernel, which leaves such pages alone).
+/// The caller opens the destination's guards first, as for the kernel's
+/// write (`crate::watch::writing`).
+pub(crate) fn copy_to_title(to: *mut u8, from: *const u8, len: usize) -> bool {
+    if !on() || !write_plain() || len == 0 {
+        return false;
+    }
+    let whole = to_title(to, from, len);
+    if whole {
+        count(6, len as u64);
+        count(5, 1);
+    } else {
+        count(7, 1);
+    }
+    whole
+}
+
+/// [`copy_to_title`]'s copy, whatever the switches.
+#[cfg(target_arch = "x86_64")]
+fn to_title(to: *mut u8, from: *const u8, len: usize) -> bool {
+    install();
+    // SAFETY: the source is host memory of `len` bytes; a destination page
+    // that is not there, or not writable, ends the copy with 0 instead of a
+    // fault ([`install`]).
+    unsafe { victory_copy_to_title(to, from, len) != 0 }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn to_title(_: *mut u8, _: *const u8, _: usize) -> bool {
+    false
+}
+
 /// With the frame line: what [`copy`] did per frame over `frames`.
 pub(crate) fn line(frames: f64) {
     if !on() {
         return;
     }
-    let [copies, bytes, gone, lately, small] = [0, 1, 2, 3, 4].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
+    let [copies, bytes, gone, lately, small, writes, written, refused] =
+        [0, 1, 2, 3, 4, 5, 6, 7].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
     tracing::info!(
         "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page \
          that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
-         faulted in the last two seconds, {small:.0} of under {LEAST} bytes",
-        bytes / 1e6
+         faulted in the last two seconds, {small:.0} of under {LEAST} bytes; writes into title memory in place \
+         (VICTORY_WRITE_PLAIN): {writes:.0}, {:.1} MB, {refused:.1} met a page not there or not writable and went to the \
+         kernel",
+        bytes / 1e6,
+        written / 1e6
     );
 }
 
@@ -331,6 +423,41 @@ mod tests {
         // And the registers the caller owns came back: this still works.
         assert!(guarded(to.as_mut_ptr(), base, PAGE));
         assert!(to[..PAGE].iter().all(|&b| b == 0xAB));
+        // SAFETY: the test's reservation.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// A copy into memory that is there is whole; one that meets a page not
+    /// there, or read-only, ends with false, the bytes before it written,
+    /// and the thread goes on.
+    #[test]
+    fn a_destination_that_is_not_there_or_read_only_ends_the_copy() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        // SAFETY: memory of the test's own.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 3 * PAGE, MEM_RESERVE, PAGE_NOACCESS) } as *mut u8;
+        assert!(!base.is_null());
+        // SAFETY: the first and third pages of that reservation.
+        assert!(!unsafe { VirtualAlloc(base.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        assert!(!unsafe { VirtualAlloc(base.wrapping_add(2 * PAGE).cast(), PAGE, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+        let from = vec![0xCDu8; 2 * PAGE];
+        assert!(to_title(base, from.as_ptr(), PAGE));
+        // SAFETY: committed and readable.
+        assert!(unsafe { std::slice::from_raw_parts(base, PAGE) }.iter().all(|&b| b == 0xCD));
+        // Into the hole: the half before it written.
+        // SAFETY: as above.
+        unsafe { std::slice::from_raw_parts_mut(base, PAGE) }.fill(0);
+        assert!(!to_title(base.wrapping_add(PAGE / 2), from.as_ptr(), PAGE));
+        // SAFETY: as above.
+        assert!(unsafe { std::slice::from_raw_parts(base.wrapping_add(PAGE / 2), PAGE / 2) }.iter().all(|&b| b == 0xCD));
+        // A read-only page (a guard not opened).
+        let mut old = 0;
+        // SAFETY: the third page, ours.
+        assert!(unsafe { VirtualProtect(base.wrapping_add(2 * PAGE).cast(), PAGE, PAGE_READONLY, &mut old) } != 0);
+        assert!(!to_title(base.wrapping_add(2 * PAGE), from.as_ptr(), 16));
+        // SAFETY: committed and readable.
+        assert!(unsafe { std::slice::from_raw_parts(base.wrapping_add(2 * PAGE), PAGE) }.iter().all(|&b| b == 0));
+        // The registers the caller owns came back: this still works.
+        assert!(to_title(base, from.as_ptr(), PAGE));
         // SAFETY: the test's reservation.
         unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
     }

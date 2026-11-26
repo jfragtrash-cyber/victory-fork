@@ -443,3 +443,21 @@ already reach.
   mappings): the loading screens deadlocked (a title access to a pending
   target waited 10 s for a batch that waited for it), then the title
   crashed; sent back for a fix.
+- 2026-11-26, night. Run AK (async page mappings after the fix, capture
+  on): no wait warning, loading and play right, pictures as run AE's (the
+  smudged face in the bar cutscene was in AE too: streaming, not this).
+  World frames of a second or more: 18 (AG 30, AJ 31); the worst 1.5 s
+  (AG 4.1 s, AJ 3.1 s). Play unchanged (75-79 ms usual frames, ~117 ms
+  with the capture's old-way presents). The relay's landing is still
+  ~60 ms a frame (AJ: 65.8 ms, 58 MB in ~11,700 kernel writes of 4 KiB):
+  it is now copied in place (`VICTORY_WRITE_PLAIN`, run AL).
+- 2026-11-26, night. Runs AL and AM (no capture; async page mappings,
+  copy-back writes in place, the profiler following the relay's threads):
+  play as run AJ, 100-110 ms a frame; world frames of a second or more 15
+  (AJ 31). Writing in place changed nothing measurable: only ~590 writes a
+  frame (26 MB) go through `write_mapped`, the other ~12,000 stretches go
+  through the own view (`VICTORY_BACK_OWN_VIEW`). The relay is busy ~53 ms
+  a frame and waits for the card the rest: 35 % in the merge loop itself,
+  15 % reading title bytes, 13 % writing them. The card is ~85 % busy
+  (title lists 57-62 ms, our send-and-hash 15 ms, compare 5.5 ms a frame),
+  so the card is near the limit again: run AN times the title's commands.

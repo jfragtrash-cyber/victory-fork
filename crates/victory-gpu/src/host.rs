@@ -8189,7 +8189,9 @@ pub(crate) fn write_mapped_plain(dst: *mut u8, src: *const u8, len: usize) {
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
-    if len == 0 || write(dst as usize, len) {
+    // In place first (`crate::plaincopy::copy_to_title`); through the kernel
+    // where a page is not there.
+    if len == 0 || crate::plaincopy::copy_to_title(dst, src, len) || write(dst as usize, len) {
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {

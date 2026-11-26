@@ -1187,8 +1187,73 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
 /// title places in that memory in another format shows ([`alias_of`]). A
 /// texture leaves the table before it is freed.
 #[cfg(windows)]
-static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static TARGETS_AT: std::sync::Mutex<ByAddress> = std::sync::Mutex::new(ByAddress::new());
+
+/// Textures by the address of their memory, several at one address, the
+/// newest made last ([`TARGETS_AT`]).
+///
+/// The table held one texture an address. A title that places the
+/// textures of a frame's passes in memory they share can make others at
+/// the address of a texture the card writes while it lives: the newest
+/// took its place, and when that one was freed the address had nothing at
+/// all, though the first was alive and the card still wrote it. A view
+/// placed there in another format then found no texture to copy from and
+/// was filled from title memory, which holds nothing the card wrote: black.
+/// (Found reading the code after run BV's black people; not yet seen
+/// happen in a run.) Now each texture is kept until it is freed, and
+/// [`ByAddress::find`] asks them newest first.
+#[cfg(any(windows, test))]
+#[derive(Default)]
+pub(crate) struct ByAddress(std::collections::BTreeMap<u64, Vec<usize>>);
+
+#[cfg(any(windows, test))]
+impl ByAddress {
+    pub(crate) const fn new() -> Self {
+        Self(std::collections::BTreeMap::new())
+    }
+
+    /// `texture` was made at `at`: the newest there.
+    pub(crate) fn insert(&mut self, at: u64, texture: usize) {
+        let here = self.0.entry(at).or_default();
+        here.retain(|&t| t != texture);
+        here.push(texture);
+    }
+
+    /// `texture` at `at` is freed: out of the table, the others there stay.
+    pub(crate) fn remove(&mut self, at: u64, texture: usize) {
+        if let Some(here) = self.0.get_mut(&at) {
+            here.retain(|&t| t != texture);
+            if here.is_empty() {
+                self.0.remove(&at);
+            }
+        }
+    }
+
+    /// The newest texture at `at` that `fits`; with `all` false only the
+    /// newest is asked, as the table of one texture an address did.
+    pub(crate) fn find(&self, at: u64, all: bool, fits: impl Fn(usize) -> bool) -> Option<usize> {
+        let mut newest_first = self.0.get(&at)?.iter().rev().copied();
+        if all {
+            newest_first.find(|&t| fits(t))
+        } else {
+            newest_first.next().filter(|&t| fits(t))
+        }
+    }
+}
+
+/// Whether a view placed in the memory of textures the card writes finds
+/// any of them that fits ([`ByAddress::find`]), and is copied again when
+/// the one it finds is another than the one it was copied from last in the
+/// list (`crate::texture::alias`). On by default: both are plain bug fixes
+/// (the second from victory-fork-main, where a probe atlas the card wrote
+/// was read stale). `VICTORY_ALIAS_SOURCES=0`: the newest texture at the
+/// address alone, and copies as the list's states say, as before (but for
+/// a texture freed: the one made before it is the newest again).
+#[cfg(windows)]
+pub(crate) fn alias_sources() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_SOURCES").is_none_or(|v| v != "0"))
+}
 
 /// For `this`, a texture made for a view the title placed in memory
 /// ([`texture_at`]): the title texture the host writes that lies in the
@@ -1236,19 +1301,20 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
     }
     // Under the table's lock: a texture leaves it before it is freed.
     let targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-    let other = *targets.get(&(r.data() as u64))? as This;
-    let o = resource(other);
     const DEPTH: u32 = 0x2;
-    let same = one(&o.desc)
-        && o.desc.dimension == r.desc.dimension
-        && o.desc.width == r.desc.width
-        && o.desc.height == r.desc.height
-        && o.desc.mip_levels == r.desc.mip_levels
-        && o.desc.depth_or_array_size == r.desc.depth_or_array_size
-        && o.desc.flags & DEPTH == 0
-        && target_format(o.desc.format) == o.desc.format
-        && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format));
-    same.then_some(other)
+    let same = |other: usize| {
+        let o = resource(other as This);
+        one(&o.desc)
+            && o.desc.dimension == r.desc.dimension
+            && o.desc.width == r.desc.width
+            && o.desc.height == r.desc.height
+            && o.desc.mip_levels == r.desc.mip_levels
+            && o.desc.depth_or_array_size == r.desc.depth_or_array_size
+            && o.desc.flags & DEPTH == 0
+            && target_format(o.desc.format) == o.desc.format
+            && element(o.desc.format).is_some_and(|e| e.1 == 1 && Some(e) == element(r.desc.format))
+    };
+    targets.find(r.data() as u64, alias_sources(), same).map(|other| other as This)
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -2333,11 +2399,10 @@ impl Drop for Resource {
         if self.desc.dimension != BUFFER {
             textures().remove(&(std::ptr::from_ref::<Resource>(self) as usize));
             if !fills(&self.desc) {
-                let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
-                let at = self.data() as u64;
-                if targets.get(&at) == Some(&(std::ptr::from_ref::<Resource>(self) as usize)) {
-                    targets.remove(&at);
-                }
+                TARGETS_AT
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(self.data() as u64, std::ptr::from_ref::<Resource>(self) as usize);
             }
         }
         let made = self
@@ -2830,6 +2895,41 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// Textures made at one address while another lives there are all
+    /// found, newest first, and freeing one leaves the others
+    /// ([`ByAddress`]).
+    #[test]
+    fn textures_at_one_address_outlive_each_other() {
+        let mut table = ByAddress::new();
+        // The card's light texture, then a texture of another pass made in
+        // the same memory.
+        table.insert(0x1000, 1);
+        table.insert(0x1000, 2);
+        table.insert(0x2000, 3);
+        let light = |t: usize| t == 1;
+        assert_eq!(table.find(0x1000, true, |_| true), Some(2));
+        assert_eq!(table.find(0x1000, true, light), Some(1));
+        // The newest alone, as the table of one texture an address had it.
+        assert_eq!(table.find(0x1000, false, light), None);
+        // The other pass's texture freed: the light texture is still there
+        // (the old table had nothing left at the address).
+        table.remove(0x1000, 2);
+        assert_eq!(table.find(0x1000, false, light), Some(1));
+        // Made again: newest again, once.
+        table.insert(0x1000, 2);
+        table.insert(0x1000, 1);
+        assert_eq!(table.find(0x1000, false, |_| true), Some(1));
+        table.remove(0x1000, 1);
+        assert_eq!(table.find(0x1000, true, light), None);
+        table.remove(0x1000, 2);
+        assert_eq!(table.find(0x1000, true, |_| true), None);
+        assert_eq!(table.find(0x2000, true, |_| true), Some(3));
+        // Freeing what is not there changes nothing.
+        table.remove(0x3000, 3);
+        table.remove(0x2000, 9);
+        assert_eq!(table.find(0x2000, true, |_| true), Some(3));
+    }
 
     type Release = extern "system" fn(This) -> u32;
     type Map = extern "system" fn(This, u32, *const c_void, *mut *mut u8) -> HRESULT;

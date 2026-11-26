@@ -325,6 +325,13 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         }
     };
     let first = list.first_use(placed as usize);
+    // Another texture the host writes than the one copied in last in this
+    // list (the textures at that memory changed): its first use records no
+    // change of state, so the states below would not tell (ported from
+    // victory-fork-main, where a probe atlas the card wrote was read
+    // stale). `crate::resource::alias_sources`.
+    let new_source = crate::resource::alias_sources()
+        && list.alias_source_changed(placed as usize, source as usize);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -339,7 +346,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
+    if !first && !new_source && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);

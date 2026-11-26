@@ -579,3 +579,12 @@ already reach.
   4,627 draws (BA 86-95 at 4,262); the fence's way 59 ms = 32 to the line
   + 19 the card + 7.5 landing (BA 84). The frame no longer follows the
   fence's way one for one: what the title's own threads do comes next.
+- 2026-11-26, morning. Run BD (spread fills, captured, against BB): the
+  pictures right; usual frames 78.4 ms against 76.9, the fence's way 70.5
+  against 71.3: BC's shorter way was the scene. The switch stays off.
+  Where the night ends: play 86-95 ms a frame (~11 fps) without capture,
+  from 100-110 at its start and 250-335 on the merged defaults; the
+  submitting thread's preparing is the limit (BA: 48 ms of its own work a
+  frame); next are the copies' askings (write watch and `VirtualProtect`,
+  ~8 ms), the fills of upload memory (~6 ms) and, once the card is the
+  limit again, the translator's group merge.

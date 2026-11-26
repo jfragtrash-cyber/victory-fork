@@ -701,3 +701,22 @@ already reach.
   0.3 ms shorter in all; off by default. Agents' builds during a run
   starve the texture threads (BN's loading lacked textures): runs now
   wait for no cargo or rustc.
+- 2026-11-26, late afternoon. A quiet campaign (no agent running; every
+  run Series S with the host upscaler, one alt switch each, a fit of the
+  usual frames on draws and phase; ms a frame, ON against off):
+  `VICTORY_GATHER_FILLS` (run BS: the card gathers ~8,500 constant fills
+  a frame from the copies that hold them) submitting thread -10.9
+  (+-6.5), frame -12.7 (+-10.2), the means 80.2 against 94.6;
+  `VICTORY_REFRESH_AHEAD` (BW) -4.3 (+-2.0), frame -1.7 (+-2.6), BR's
+  -4.2 again; `VICTORY_FILL_ONCE` (BT) -2.1 (+-2.7), frame -2.0;
+  `VICTORY_HOLE_BITS` (BX) -1.9 (+-1.6), frame -1.8;
+  `VICTORY_GUARD_REST` (BV) -1.0, frame -4.0 (+-2.4) (BQ, with agents
+  at work, +2.9); `VICTORY_ASK_EXACT` (BY) +0.4 (+-0.8), frame -0.7;
+  `VICTORY_COPY_STREAM` (BU) too noisy, BO nothing. Run BY (no one
+  walking): 67 ms a frame, 15 fps. The picture: characters turn to black
+  silhouettes in some places (the barred corridor, the smoky common
+  room) and come back a few steps on; the ops of a black frame and of a
+  normal one drop the same four programs, so some lighting data is read
+  stale there. Fog covers people's upper bodies and a dark wedge crosses
+  a foggy room while the camera moves; lips do not move when people
+  speak.

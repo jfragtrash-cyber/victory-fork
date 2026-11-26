@@ -1573,6 +1573,7 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         if crate::capture::listed(frame) {
             crate::capture::dump_targets(frame);
         }
+        crate::capture::save_snaps(frame);
     }
     #[cfg(windows)]
     if !sent_behind

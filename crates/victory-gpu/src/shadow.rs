@@ -132,7 +132,9 @@ impl Card {
         // One lock a block wherever several threads merge into one copy:
         // the relay's landing (`VICTORY_RELAY_WIDE`), or the title's bytes
         // put in under flights' writes ([`merge_wide`]).
-        let wide = relay_wide() > 1 || merge_wide();
+        // (By the threads asked for, not those of this moment: with `alt`
+        // every merge takes the same locks whichever turn it falls in.)
+        let wide = relay_threads().0 > 1 || merge_wide();
         let (first, last) = (from / PIECE, to.saturating_sub(1).max(from) / PIECE);
         // One block (the merge's pages, the relay's pieces): one lock and
         // nothing allocated (two vectors a page were most of the merge's
@@ -157,7 +159,8 @@ enum Side<'a> {
 
 /// How many threads merge what the card wrote into title memory when the
 /// relay lands flights (`VICTORY_RELAY_WIDE`: unset or 0, one, as before;
-/// 1, four; 2 to 8, that many). The thread that lands flights is one of
+/// 1, four; 2 to 8, that many; `alt`, four and one in turn, twenty seconds
+/// each). The thread that lands flights is one of
 /// them; the others are kept for it alone, so the submitting thread's work
 /// on the wide threads ([`wide`]) never waits behind a landing's.
 ///
@@ -181,11 +184,34 @@ enum Side<'a> {
 /// it, ~4 ms sooner. Measured by the relay line ("landing in all") and the
 /// frame line's "copying back".
 pub(crate) fn relay_wide() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| match std::env::var("VICTORY_RELAY_WIDE").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
-        None | Some(0) => 1,
-        Some(1) => 4,
-        Some(n) => n.min(8),
+    let (n, alt) = relay_threads();
+    if !alt {
+        return n;
+    }
+    // `alt`: four threads for twenty seconds, one for twenty, in turn, each
+    // change said in the log.
+    let on = (crate::host::now_us() / 20_000_000) % 2 == 1;
+    static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+        tracing::info!(
+            "the landing's merges from now (VICTORY_RELAY_WIDE=alt): {}",
+            if on { "WIDE, on four threads" } else { "on the landing thread alone, as usual" }
+        );
+    }
+    if on { n } else { 1 }
+}
+
+/// `VICTORY_RELAY_WIDE` as asked: the threads, and whether in turn (`alt`).
+fn relay_threads() -> (usize, bool) {
+    static N: std::sync::OnceLock<(usize, bool)> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("VICTORY_RELAY_WIDE").as_deref().map(str::trim) {
+        Ok("alt") => (4, true),
+        Ok(v) => match v.parse::<usize>() {
+            Ok(0) | Err(_) => (1, false),
+            Ok(1) => (4, false),
+            Ok(n) => (n.min(8), false),
+        },
+        Err(_) => (1, false),
     })
 }
 
@@ -953,20 +979,63 @@ fn merge_piece_counted(now: &[u8], held: &mut [u8], title: &mut [u8]) -> (bool, 
     const STRETCH: usize = 4 << 10;
     let (mut changed, mut bytes, mut stretches) = (false, 0usize, 0usize);
     for ((now, held), title) in now.chunks(STRETCH).zip(held.chunks_mut(STRETCH)).zip(title.chunks_mut(STRETCH)) {
-        let (mut differs, mut wrote_here) = (0u8, 0u32);
-        for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
-            let wrote = if *n != *h { 0xffu8 } else { 0 };
-            let merged = (*t & !wrote) | (*n & wrote);
-            differs |= merged ^ *t;
-            *t = merged;
-            *h = (*h & !wrote) | (*n & wrote);
-            wrote_here += u32::from(wrote & 1);
-        }
-        changed |= differs != 0;
-        bytes += wrote_here as usize;
+        let (differs, wrote_here) = merge_stretch(now, held, title);
+        changed |= differs;
+        bytes += wrote_here;
         stretches += usize::from(wrote_here != 0);
     }
     (changed, bytes, stretches)
+}
+
+/// A stretch of [`merge_piece_counted`]: where the card's bytes `now`
+/// differ from those kept, `held`, the card wrote: `title` and `held` take
+/// them (`held` is `now` after, wherever). Whether a byte of `title`
+/// changed, and the bytes the card wrote.
+///
+/// Sixteen bytes at a time (SSE2, part of x86-64): sixteen the card did not
+/// write cost one compare. Byte by byte it was 20 ms a frame of the
+/// landing thread in run BA, which works 56 ms of a ~80 ms frame, and the
+/// title's fences wait for its landings.
+fn merge_stretch(now: &[u8], held: &mut [u8], title: &mut [u8]) -> (bool, usize) {
+    let n = now.len().min(held.len()).min(title.len());
+    let (mut differs, mut wrote) = (false, 0usize);
+    let mut i = 0;
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{
+            _mm_and_si128, _mm_andnot_si128, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_or_si128,
+            _mm_storeu_si128,
+        };
+        while i + 16 <= n {
+            // SAFETY: SSE2 is part of x86-64; 16 bytes inside each slice
+            // (`i + 16 <= n`), unaligned loads and stores.
+            unsafe {
+                let a = _mm_loadu_si128(now.as_ptr().add(i).cast());
+                let h = _mm_loadu_si128(held.as_ptr().add(i).cast());
+                let same = _mm_cmpeq_epi8(a, h);
+                let kept = _mm_movemask_epi8(same) as u32;
+                if kept != 0xffff {
+                    let t = _mm_loadu_si128(title.as_ptr().add(i).cast());
+                    // The card's byte where it wrote, the title's elsewhere.
+                    let merged = _mm_or_si128(_mm_and_si128(same, t), _mm_andnot_si128(same, a));
+                    differs |= _mm_movemask_epi8(_mm_cmpeq_epi8(merged, t)) != 0xffff;
+                    _mm_storeu_si128(title.as_mut_ptr().add(i).cast(), merged);
+                    _mm_storeu_si128(held.as_mut_ptr().add(i).cast(), a);
+                    wrote += (!kept & 0xffff).count_ones() as usize;
+                }
+            }
+            i += 16;
+        }
+    }
+    for k in i..n {
+        if now[k] != held[k] {
+            differs |= title[k] != now[k];
+            title[k] = now[k];
+            held[k] = now[k];
+            wrote += 1;
+        }
+    }
+    (differs, wrote)
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
@@ -1454,7 +1523,54 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod difference_tests {
-    use super::{first_difference, last_difference};
+    use super::{first_difference, last_difference, merge_piece_counted};
+
+    /// The merge by sixteen bytes gives what the merge byte by byte gave
+    /// (title, kept bytes, and the counts), whatever the length and
+    /// wherever the card wrote.
+    #[test]
+    fn merges_are_as_byte_by_byte() {
+        fn by_bytes(now: &[u8], held: &mut [u8], title: &mut [u8]) -> (bool, usize, usize) {
+            let (mut changed, mut bytes, mut stretches) = (false, 0usize, 0usize);
+            for ((now, held), title) in now.chunks(4096).zip(held.chunks_mut(4096)).zip(title.chunks_mut(4096)) {
+                let (mut differs, mut wrote_here) = (0u8, 0usize);
+                for ((n, h), t) in now.iter().zip(held.iter_mut()).zip(title.iter_mut()) {
+                    let wrote = if *n != *h { 0xffu8 } else { 0 };
+                    let merged = (*t & !wrote) | (*n & wrote);
+                    differs |= merged ^ *t;
+                    *t = merged;
+                    *h = (*h & !wrote) | (*n & wrote);
+                    wrote_here += usize::from(wrote & 1);
+                }
+                changed |= differs != 0;
+                bytes += wrote_here;
+                stretches += usize::from(wrote_here != 0);
+            }
+            (changed, bytes, stretches)
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for len in [0, 1, 15, 16, 17, 100, 4095, 4096, 4097, 9000, 3 * 4096 + 33] {
+            for density in [0u64, 1, 8, 64] {
+                let held: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+                // The card writes a byte with odds `density` in 64, some of
+                // them the value already there; the title wrote others.
+                let now: Vec<u8> = held.iter().map(|&h| if next() % 64 < density { next() as u8 } else { h }).collect();
+                let title: Vec<u8> = held.iter().map(|&h| if next() % 16 == 0 { next() as u8 } else { h }).collect();
+                let (mut h1, mut t1) = (held.clone(), title.clone());
+                let (mut h2, mut t2) = (held.clone(), title.clone());
+                let a = merge_piece_counted(&now, &mut h1, &mut t1);
+                let b = by_bytes(&now, &mut h2, &mut t2);
+                assert_eq!(a, b, "len {len} density {density}");
+                assert!(t1 == t2 && h1 == h2, "len {len} density {density}");
+            }
+        }
+    }
 
     /// The chunk searches agree with a byte-wise scan across chunk boundaries.
     #[test]

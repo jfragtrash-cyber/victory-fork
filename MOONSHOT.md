@@ -651,3 +651,18 @@ already reach.
   recording handed to threads of ours (THIN, their 75 -> 68 ms), the
   written 4 KiB parts of a page copied alone (PAGE_PARTS), faults that
   open one view and leave a block open 3 ms (GUARD_REST).
+- 2026-11-26, morning. The landing thread worked 56 ms of a ~80 ms frame
+  (run BA), 46 of them merging the card's pieces on that thread alone,
+  20 in a byte-by-byte merge. The merge now compares sixteen bytes at a
+  time (SSE2; a run the card did not write costs one compare; the bytes
+  kept become the card's, wherever). `VICTORY_RELAY_WIDE=alt` (four
+  merging threads and one in turn; every merge takes the per-block
+  locks whichever turn it falls in). Run BJ (captured, the cell window as
+  BI): the fence's way 64.8 ms = 32.3 to the line + 25.0 the card + 8.0
+  landing (BI 74.0 = 34.2 + 27.5 + 13.0); the relay's copy-back 32.0 ms a
+  frame (BI 44.4; 39.0 with one merging thread, 24.6 with four); play
+  75.5 ms a frame at 3,740 draws (BI 77.4 at 3,723). Four merging threads
+  make the frame no shorter (per 1,000 draws 20.78 ms against 20.10 with
+  one): `VICTORY_RELAY_WIDE` stays off. Of 72 MB fetched a frame, 52.7
+  are written back to title memory (first to last byte that differs) and
+  31 MB were changed by the card: writing the card's words alone is next.

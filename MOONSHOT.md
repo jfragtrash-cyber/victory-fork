@@ -433,3 +433,13 @@ already reach.
   (staging pool back on): 100-108 ms a frame; run AF (card hashes a group a
   piece, the relay merging on four threads): 109-114 ms, no gain while the
   submitting thread is the limit.
+- 2026-11-26, night. Two more branches merged: the descriptor heap pass
+  beside the preparing and the merge under flights on the wide pool (both
+  on), shared askings for a wide refresh (off), and the GPU's page-mapping
+  copies applied by a thread of ours in queue order
+  (`VICTORY_ASYNC_PAGE_MAPPINGS`, off). Run AG: play at 100-106 ms a frame,
+  preparing 68-84 ms. Run AI (`VICTORY_WIDE_REFRESH=alt`): no difference
+  between the phases in play (100-115 ms either way). Run AH (async page
+  mappings): the loading screens deadlocked (a title access to a pending
+  target waited 10 s for a batch that waited for it), then the title
+  crashed; sent back for a fix.

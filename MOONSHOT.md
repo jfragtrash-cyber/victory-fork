@@ -491,3 +491,19 @@ already reach.
   instructions, and it splits multiply-add chains); (3) wave64 programs run
   as two waves with two barriers per exchange; (4) a signed-zero fix-up on
   every min/max, half of them against a non-zero constant.
+- 2026-11-26, night. Run AQ (`VICTORY_QUEUE2=3`, title bytes up through
+  the copy queue): our send-and-hash lists 12-13 ms against ~15, frames as
+  before. Run AR (`VICTORY_CARD_HASH_WIDE=alt`, same scene both ways, play
+  only): wide hashing takes our lists from 18.1 to 7.2 ms of card time a
+  frame and leaves the title's lists alone (58.6 / 58.9 ms; run AF's higher
+  title time was something else), the card idles 33 ms a frame instead of
+  21 -- and the frame stays at 104 ms. **The card is not the limit of the
+  frame**: the chain on the CPU is (the submitting thread prepares 74-81 ms
+  a frame; a fence is set 1.2 frames after the title's Signal). Card-side
+  work (the translator's changes too) pays only once that chain is shorter.
+  The submitting thread waits ~9 ms a frame for landings and ~6 ms inside
+  the system heap (`realloc` under `changed_runs`; the wide threads ~31 ms):
+  `VICTORY_HEAP=mimalloc` gives our memory a heap per thread (run AS).
+- 2026-11-26, night. Run AS (mimalloc for our memory): no gain, rather
+  worse (108-112 ms against 105-108; the submitting thread's user time 53
+  ms a frame against 35). Taken out again; the system heap stays.

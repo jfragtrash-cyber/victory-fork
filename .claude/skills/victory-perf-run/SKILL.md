@@ -35,10 +35,11 @@ cd /d/victory-data/data/7952987A && B=/d/victory-data/saves-backup-20261125-afte
 The title's executable is the one `.exe` in `D:/victory-data/game/`
 (`ls D:/victory-data/game/*.exe`). Never write its file name into the tree.
 
-Best known switch set (2026-11-26; run AD, 100-108 ms a frame in play; the staging pool stays on):
+Best known switch set (2026-11-26; runs AD/AL, 100-110 ms a frame in play; the staging pool stays on;
+`VICTORY_ASYNC_PAGE_MAPPINGS=1` halves the cutscene low points, runs AK/AL):
 
 ```bash
-BEST="VICTORY_VIEW_KNOWN=1 VICTORY_ASYNC_PRESENT=1 VICTORY_LEVELS_ON_DEMAND=1 VICTORY_ASYNC_SUBMIT=1 \
+BEST="VICTORY_ASYNC_PAGE_MAPPINGS=1 VICTORY_STAGING_POOL_MB=1024 VICTORY_VIEW_KNOWN=1 VICTORY_ASYNC_PRESENT=1 VICTORY_LEVELS_ON_DEMAND=1 VICTORY_ASYNC_SUBMIT=1 \
 VICTORY_QUEUE2=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_TEXTURE_NO_WAIT=1 VICTORY_MERGE_GAP=64 \
 VICTORY_MERGE_RUNS=4096 VICTORY_COPY_PLAIN=1 VICTORY_JOIN_PARTS=1 \
 VICTORY_BACK_OWN_VIEW=1 VICTORY_INDIRECT_GATHER=1 VICTORY_CARD_REHASH_RUNS=1"
@@ -57,6 +58,11 @@ victory-cap-X.log) and say which build and switches it had.
 Input (`VICTORY_KEYS=<seconds>:<key>[:<hold>]`, focus or not):
 - `30:Enter` presses A at the title screen; `35:X` skips the opening video.
   Without them the run waits at "press A" forever (and the video plays).
+  On a busy machine the title screen (13 draws a frame) can come after
+  80 s: then repeat the pair, e.g.
+  `30:Enter,35:X,50:Enter,55:X,70:Enter,75:X,90:Enter,95:X,110:Enter,115:X,130:Enter,135:X`.
+  If the copied exe is named otherwise, look for it by that name
+  (`tasklist | grep -i victory`), not `victory.exe`.
 - Sticks: W A S D (move), I J K L (camera); Z / C triggers. Holds in
   seconds: `140:W:5` holds W five seconds at 140 s. Gameplay starts about
   280 frames after the world (`first frame of 500 draws`). Walking to the

@@ -145,8 +145,16 @@ impl Askings {
     /// were ever noted).
     fn after(&self, first: usize, last: usize, since: u64) -> Vec<(usize, u64)> {
         let mut found = Vec::new();
+        self.after_into(first, last, since, &mut found);
+        found
+    }
+
+    /// [`Askings::after`], added to `found` (the refreshes' own buffer,
+    /// [`writes_after_into`]: run BA's play had 0.7 ms a frame of the
+    /// submitting thread growing a new vector for each answer).
+    fn after_into(&self, first: usize, last: usize, since: u64, found: &mut Vec<(usize, u64)>) {
         if first >= last {
-            return found;
+            return;
         }
         let (lo_chunk, hi_chunk) = (first >> ASK_SHIFT, (last - 1) >> ASK_SHIFT);
         let start = self.chunks.partition_point(|c| c.at < lo_chunk);
@@ -165,7 +173,6 @@ impl Askings {
                 }
             }
         }
-        found
     }
 
     /// Tests: forgets pages `[first, last)`.
@@ -691,7 +698,8 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
-    writes_as(start, end, guarded, shared_asks(), 0)
+    let mut written = Vec::new();
+    writes_as(start, end, guarded, shared_asks(), 0, &mut written).map(|now| (now, written))
 }
 
 /// [`writes`], with the pages last found written at or before asking
@@ -702,26 +710,37 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// compared page by page with the copy's, was 3.4 ms a frame of the
 /// submitting thread in run AM.
 pub(crate) fn writes_after(start: usize, end: usize, guarded: bool, since: u64) -> Option<(u64, Vec<(usize, u64)>)> {
-    writes_as(start, end, guarded, shared_asks(), since)
+    let mut written = Vec::new();
+    writes_as(start, end, guarded, shared_asks(), since, &mut written).map(|now| (now, written))
 }
 
-/// [`writes_after`]; with `shared`, an asking that changes nothing is
-/// answered under the shared locks ([`writes_shared`]).
-fn writes_as(start: usize, end: usize, guarded: bool, shared: bool, since: u64) -> Option<(u64, Vec<(usize, u64)>)> {
+/// [`writes_after`] into `written` (emptied first), the caller's buffer
+/// kept from one refresh to the next: the asking's number, or `None` as
+/// [`writes_after`] says (`written` is then empty).
+pub(crate) fn writes_after_into(start: usize, end: usize, guarded: bool, since: u64, written: &mut Vec<(usize, u64)>) -> Option<u64> {
+    written.clear();
+    writes_as(start, end, guarded, shared_asks(), since, written)
+}
+
+/// [`writes_after`] into `written` (left as it is if `None`); with
+/// `shared`, an asking that changes nothing is answered under the shared
+/// locks ([`writes_shared`]).
+fn writes_as(start: usize, end: usize, guarded: bool, shared: bool, since: u64, written: &mut Vec<(usize, u64)>) -> Option<u64> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     // Copies of physical pages there whose source was written are taken
     // again first: their own write watch then says so (`crate::alias`).
     crate::alias::pull(start, end);
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    if shared && let Some(answer) = writes_shared(first, last, guarded, since) {
-        return Some(answer);
+    if shared && let Some(now) = writes_shared(first, last, guarded, since, written) {
+        return Some(now);
     }
     let mut j = journal();
     let j = &mut *j;
     // Asked ahead with the submission's other ranges: the journal has it.
     if j.ahead.holds(first, last) {
-        return Some((j.ahead_asked, j.written.after(first, last, since)));
+        j.written.after_into(first, last, since, written);
+        return Some(j.ahead_asked);
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -786,7 +805,8 @@ fn writes_as(start: usize, end: usize, guarded: bool, shared: bool, since: u64) 
     for page in guarded {
         j.written.set(page, now);
     }
-    Some((now, j.written.after(first, last, since)))
+    j.written.after_into(first, last, since, written);
+    Some(now)
 }
 
 /// Whether an asking that would change nothing is answered under shared
@@ -847,13 +867,13 @@ pub(crate) fn shared_line(frames: f64) {
 /// guards take after the look is found by the next asking, as after any.
 /// Its number is a new one, taken with the journal held: every write
 /// noted before is older, every one noted after (alone) newer.
-fn writes_shared(first: usize, last: usize, guarded: bool, since: u64) -> Option<(u64, Vec<(usize, u64)>)> {
+fn writes_shared(first: usize, last: usize, guarded: bool, since: u64, written: &mut Vec<(usize, u64)>) -> Option<u64> {
     use std::sync::atomic::Ordering::Relaxed;
-    let answer = |j: &Journal, now: u64| (now, j.written.after(first, last, since));
     let j = journal_shared();
     if j.ahead.holds(first, last) {
         SHARED[0].fetch_add(1, Relaxed);
-        return Some(answer(&j, j.ahead_asked));
+        j.written.after_into(first, last, since, written);
+        return Some(j.ahead_asked);
     }
     // (With the kernel to be asked anyway, as `known_view` has it.)
     if !guarded || views_asked() {
@@ -881,7 +901,8 @@ fn writes_shared(first: usize, last: usize, guarded: bool, since: u64) -> Option
         slow(us);
     }
     let now = j.next_asking();
-    Some(answer(&j, now))
+    j.written.after_into(first, last, since, written);
+    Some(now)
 }
 
 /// Whether [`guard`] of blocks `[first, last)` would change nothing and
@@ -3022,6 +3043,10 @@ mod tests {
                 let (_, after) = writes_after(range.0, range.1, guarded, since).unwrap();
                 let older: Vec<(usize, u64)> = all.iter().copied().filter(|&(_, w)| w > since).collect();
                 assert_eq!(after, older, "after asking {since} (guarded: {guarded})");
+                // Into a buffer that held an answer before: the same list.
+                let mut into = vec![(usize::MAX, u64::MAX); 3];
+                assert!(writes_after_into(range.0, range.1, guarded, since, &mut into).is_some());
+                assert_eq!(into, older, "into a buffer, after asking {since} (guarded: {guarded})");
                 assert_eq!(after.is_empty(), all.iter().all(|&(_, w)| w <= since));
             }
         }
@@ -3811,6 +3836,18 @@ mod shared_tests {
     use windows_sys::Win32::System::Memory::{
         CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
     };
+
+    /// [`super::writes_as`] with its answer in a vector of its own.
+    fn writes_as(start: usize, end: usize, guarded: bool, shared: bool, since: u64) -> Option<(u64, Vec<(usize, u64)>)> {
+        let mut written = Vec::new();
+        super::writes_as(start, end, guarded, shared, since, &mut written).map(|now| (now, written))
+    }
+
+    /// [`super::writes_shared`] with its answer in a vector of its own.
+    fn writes_shared(first: usize, last: usize, guarded: bool, since: u64) -> Option<(u64, Vec<(usize, u64)>)> {
+        let mut written = Vec::new();
+        super::writes_shared(first, last, guarded, since, &mut written).map(|now| (now, written))
+    }
 
     /// A pagefile view of `blocks` blocks, unmapped (and its guards
     /// forgotten) when dropped.

@@ -4536,11 +4536,25 @@ impl Shadow {
     /// [`Shadow::update`] of `[from, to)` (inside the buffer) where no
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
+        thread_local! {
+            /// The answers of this thread's refreshes, one after another
+            /// in the same vector (`crate::watch::writes_after_into`; taken
+            /// out while used, so a refresh inside one gets one of its own).
+            static WRITTEN: std::cell::Cell<Vec<(usize, u64)>> = const { std::cell::Cell::new(Vec::new()) };
+        }
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             let since = self.taken_since(from, to);
-            if let Some((now, written)) = crate::watch::writes_after(from, to, true, since) {
+            let mut written = WRITTEN.take();
+            let asked = crate::watch::writes_after_into(from, to, true, since, &mut written);
+            let copied = asked.map(|now| {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written, since, !refresh_check_on());
+                self.copy_stale(from, to, now, &written, since, !refresh_check_on())
+            });
+            // A big answer's room is not kept.
+            if written.capacity() <= 1 << 16 {
+                WRITTEN.set(written);
+            }
+            if let Some(copied) = copied {
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {

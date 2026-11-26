@@ -2225,12 +2225,7 @@ impl Filled {
 /// the steps), the recording thread a scratch allocation, and the card's
 /// upload memory its bytes again.
 fn fill_once() -> bool {
-    static MODE: OnceLock<u8> = OnceLock::new();
-    match *MODE.get_or_init(|| match std::env::var("VICTORY_FILL_ONCE").as_deref() {
-        Ok("1") => 1,
-        Ok("alt") => 2,
-        _ => 0,
-    }) {
+    match fill_once_mode() {
         0 => false,
         1 => true,
         _ => {
@@ -2245,6 +2240,16 @@ fn fill_once() -> bool {
             on
         }
     }
+}
+
+/// [`fill_once`]'s switch: 0 off, 1 on, 2 in turn.
+fn fill_once_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_FILL_ONCE").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    })
 }
 
 /// Since the last frame-rate line: fills of upload memory recorded through
@@ -7131,13 +7136,18 @@ impl HostList {
     /// write title memory, holds them already: with [`fill_once`] its
     /// memory is given again and nothing more is copied.
     pub(crate) fn fill(&self, src: usize, len: u64) -> Option<u64> {
-        if let Some(gpu) = self.deferred().filled.earlier(src, len as usize, fill_once) {
+        // With the switch off the fills are noted only to be counted, in
+        // diagnostics builds (and tests, which set the recording's way).
+        let noted = cfg!(any(test, feature = "diagnostics")) || fill_once_mode() != 0;
+        if noted && let Some(gpu) = self.deferred().filled.earlier(src, len as usize, fill_once) {
             return Some(gpu);
         }
         let (gpu, to) = self.scratch(len)?;
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Fill(to as usize, src, len as usize));
-        deferred.filled.made(src, len as usize, gpu);
+        if noted {
+            deferred.filled.made(src, len as usize, gpu);
+        }
         Some(gpu)
     }
 

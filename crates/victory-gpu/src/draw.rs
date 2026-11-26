@@ -707,6 +707,71 @@ pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
 /// Slots the pass found up to date already: their texture is uploaded by
 /// the draws that read it through a table (it has a staging buffer).
 pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
+
+/// Since the start, with [`index_alias`]: slots picked by index found to be
+/// views the title placed in the memory of a texture the card writes
+/// (`crate::resource::alias_of`; once a write of the slot), and copies
+/// made again into such slots at later frames.
+pub(crate) static HEAP_TEXTURES_ALIASED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The `mapped` mark of a slot picked by index that [`index_alias`] keeps
+/// due: no partial upload has so few bytes mapped (they count whole pages).
+/// (The queue's census counts such slots as uploaded in part.)
+const ALIAS_KEPT: u64 = 1;
+
+/// Whether a texture picked by index that is a view placed in the memory of
+/// a texture the card writes is copied from that texture again at every
+/// frame (`VICTORY_INDEX_ALIAS=1`; `alt`: on and off by turns of 20
+/// seconds, logged, so that one run shows both; off by default).
+///
+/// Without it such a slot gets the one copy `readable` makes the first time
+/// the slot is due, and is then done: nothing in title memory changes when
+/// the card writes the texture again (its writes stay on the host), so the
+/// slot is due again only when the title writes the descriptor, and every
+/// shader that picks it by index reads the texels the card wrote that
+/// frame for the rest of the slot's life. A table read copies at each list
+/// that reads it (`crate::texture::alias`); a read by index did not. The
+/// title packs the light of its sky and probes as R9G9B9E5 in R32_UINT
+/// textures it writes with compute and reads through such views. Looked
+/// for after run BV, where people went black over 30 frames in the barred
+/// corridor and came back over 16 after it, with the walls around them lit
+/// as they should be: light that follows where one stands, from textures
+/// the card writes. Not measured yet: the info line below says whether
+/// the title picks any such view by index at all.
+/// With it the slot stays due (marked [`ALIAS_KEPT`]) and is copied in the
+/// first list of each frame whose pass reaches it: at most a frame behind
+/// the card. What it costs is a texture copy per such slot per frame;
+/// [`HEAP_TEXTURES_ALIASED`] counts them.
+/// None: off; Some(alternating): `1` (false) or `alt` (true).
+fn index_alias() -> Option<bool> {
+    static MODE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_INDEX_ALIAS").as_deref() {
+        Ok("1") => Some(false),
+        Ok("alt") => Some(true),
+        _ => None,
+    })
+}
+
+/// Whether [`index_alias`] copies now: always with `1`, in the odd turns of
+/// 20 seconds with `alt` (each change logged).
+fn index_alias_now() -> bool {
+    match index_alias() {
+        None => false,
+        Some(false) => true,
+        Some(true) => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "textures picked by index that are views of textures the card writes are copied again at every frame from now (VICTORY_INDEX_ALIAS=alt): {}",
+                    if on { "ON" } else { "off, as they were first copied" }
+                );
+            }
+            on
+        }
+    }
+}
 /// The queue of textures picked by index at the last pass
 /// (`TextureQueue::census`): slots in it, due, waiting for their memory,
 /// uploaded in part, and the frames the oldest due one has waited.
@@ -2295,6 +2360,16 @@ impl State {
                 host.texture_slot_done(index, write, None);
                 continue;
             }
+            // A view placed in the memory of a texture the card writes
+            // ([`index_alias`]): a slot it keeps due is passed over in the
+            // turns `alt` leaves it off, holding its last copy as it would
+            // without the switch.
+            let aliased = index_alias().is_some() && crate::resource::alias_of(resource).is_some();
+            let kept = aliased && host.texture_slot_mapped(index) == ALIAS_KEPT;
+            if kept && !index_alias_now() {
+                host.texture_slot_done(index, write, Some((frame + 1, ALIAS_KEPT)));
+                continue;
+            }
             // A texture that has a staging buffer now is one draws read
             // through a table: they upload it, and check it at every
             // submission that samples it.
@@ -2312,6 +2387,26 @@ impl State {
                 tracing::error!(why, slot = index, "the host device went while textures picked by index were made ready; last: {text}");
                 crate::host::log_removal_context();
                 return;
+            }
+            // `readable` copied the card's texels into it (nothing staged:
+            // a copy it could not make uploads title memory, as before);
+            // due again next frame for the next copy.
+            if aliased && !crate::texture::is_staged(resource) {
+                if kept {
+                    HEAP_TEXTURES_ALIASED[1].fetch_add(1, Ordering::Relaxed);
+                } else {
+                    let n = HEAP_TEXTURES_ALIASED[0].fetch_add(1, Ordering::Relaxed);
+                    if n < 16 || n.is_multiple_of(256) {
+                        tracing::info!(
+                            slot = index,
+                            found = n + 1,
+                            copies_again = HEAP_TEXTURES_ALIASED[1].load(Ordering::Relaxed),
+                            "a texture picked by index is a view placed in the memory of a texture the card writes: copied from it again at every frame (VICTORY_INDEX_ALIAS)"
+                        );
+                    }
+                }
+                host.texture_slot_done(index, write, Some((frame + 1, ALIAS_KEPT)));
+                continue;
             }
             let (bytes, whole) = crate::texture::staged(resource).unwrap_or((0, true));
             // Not all of it there: looked at again next frame, and from
@@ -3994,8 +4089,21 @@ fn describe(view: Option<&View>) -> String {
     };
     match view {
         None => "no view".into(),
-        Some(v @ View::Shader(r, _)) => texture(*r as This)
-            .unwrap_or_else(|| format!("buffer {:?}", crate::descriptor::host::buffer_range(v))),
+        // "buffer None" said the same of a null view and of a resource the
+        // layer cannot read as a buffer and has no host texture of (run
+        // BV: the lighting passes' per-frame list was one of the two in the
+        // frame where people were black, a buffer in the frame where they
+        // were not): now which, with the view's first words.
+        Some(v @ View::Shader(r, desc)) => texture(*r as This).unwrap_or_else(|| {
+            match crate::descriptor::host::buffer_range(v) {
+                Some(range) => format!("buffer {:?}", Some(range)),
+                None if *r == 0 => "buffer None (a null view)".into(),
+                None => format!(
+                    "buffer None (resource {r:#x}: no buffer, no host texture; view {:?})",
+                    desc.map(|d| [d[0], d[1], d[2]])
+                ),
+            }
+        }),
         Some(v @ View::Unordered(r, ..)) => match texture(*r as This) {
             Some(t) => format!("uav texture {t}"),
             None => format!(

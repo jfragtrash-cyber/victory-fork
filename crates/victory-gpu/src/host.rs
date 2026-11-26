@@ -7682,6 +7682,21 @@ mod beside_tests {
 /// turn, each change said in the log (run 112 measured the switch worse,
 /// copies 52 -> 68 ms, in a build whose copies went through the kernel one
 /// by one; they are plain copies with one asking ahead now).
+///
+/// What kept the threads in line: a refresh's time is nearly all its
+/// asking (run AB: 20.3 of 21.2 ms a frame in `crate::watch::writes`, 15.5
+/// of them in the guards' check of view memory), and every asking held the
+/// journal alone for all of it. With the switch the askings that change
+/// nothing are answered side by side (`crate::watch::shared_asks`, on with
+/// it), and the biggest refreshes go first, so that no thread takes a big
+/// one when the others are done. Each refresh copies where it runs: on the
+/// kept threads no spreading stands, so a refresh there never waits for
+/// pieces of its own; the submitting thread, which runs refreshes too while
+/// it waits, takes every job left in the line before it waits for the rest
+/// (`crate::shadow::wide_run`), so no job waits for work only a waiting
+/// thread could do. Measured by the frame line's "copies" (the flush's wall
+/// time, not the threads' sum) and the line of askings answered side by
+/// side.
 fn wide_refresh() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: OnceLock<u8> = OnceLock::new();
@@ -7925,6 +7940,8 @@ impl Batch {
             for (shadow, from, to) in &self.refreshes {
                 Self::brought(&mut self.current, shadow, *from, *to);
             }
+            // The biggest first: the threads' line takes jobs in order.
+            self.refreshes.sort_unstable_by_key(|r| std::cmp::Reverse(r.2 - r.1));
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
@@ -8385,6 +8402,7 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::shadow::lookup_line(frames);
         crate::descriptor::sync_line(frames);
+        crate::watch::shared_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);

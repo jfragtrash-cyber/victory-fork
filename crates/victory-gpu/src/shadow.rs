@@ -2527,6 +2527,9 @@ mod merge_wide_tests {
         let taken = shadow.copied.lock().unwrap().iter().map(|&c| c != 0).collect();
         let snapshot = shadow.before.lock().unwrap().clone();
         drop(shadow);
+        // Nothing of it stays known once the system may put other memory there.
+        crate::watch::forget_written(title, title + LEN);
+        crate::watch::title_memory_remapped(title, LEN);
         // SAFETY: our allocation, no copy of it left.
         unsafe { VirtualFree(title as *mut _, 0, MEM_RELEASE) };
         let reference = snapshot.unwrap_or_else(|| data.clone());

@@ -1948,6 +1948,121 @@ pub(crate) fn copy_spread(copies: &[(usize, usize, usize)], per: usize) {
     wait_wide(&left);
 }
 
+/// The bytes of a piece of [`hash_wide`].
+const HASH_PIECE: usize = 256 << 10;
+
+/// Whether [`hash_wide`] hashes by pieces on the kept threads
+/// (`VICTORY_HASH_WIDE`; on by default, `0` hashes on the caller alone;
+/// `alt`: twenty seconds with, twenty without, in turn, each change said in
+/// the log). Either way a texture's hash is of one function while it lasts:
+/// with `alt` a texture hashed by the other is read again once.
+fn hash_wide_on() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_HASH_WIDE").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = (crate::host::now_us() / 20_000_000) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "texture hashes from now (VICTORY_HASH_WIDE=alt): {}",
+                    if on { "WIDE, by pieces on the kept threads" } else { "on the caller alone, as before" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// The items of one [`spread_own`]: the next to take, and each one's
+/// answer with the number done.
+struct Spread<T> {
+    next: std::sync::atomic::AtomicUsize,
+    done: Mutex<(Vec<Option<T>>, usize)>,
+    all: std::sync::Condvar,
+}
+
+/// `f(0)`, ..., `f(n - 1)` on the kept threads and this one, the answers in
+/// that order. This thread runs only items of its own (it may hold locks,
+/// the journal of write watch or the title memory for reading, that
+/// another's job could wait for), and waits for the items, not for the kept
+/// threads: one that comes to its job after the last item was taken finds
+/// nothing to do and does not call `f`. `f` does not panic.
+pub(crate) fn spread_own<T: Send + 'static>(n: usize, f: &(dyn Fn(usize) -> T + Sync)) -> Vec<T> {
+    if n < 2 {
+        return (0..n).map(f).collect();
+    }
+    // SAFETY: `f` is called only for an item taken, and every item taken
+    // is done before this returns (below); after that a job reads `next`
+    // alone, in the `Arc`.
+    let f: &'static (dyn Fn(usize) -> T + Sync) = unsafe { std::mem::transmute(f) };
+    let take = move |spread: &Spread<T>| {
+        loop {
+            let i = spread.next.fetch_add(1, Ordering::Relaxed);
+            if i >= n {
+                return;
+            }
+            let answer = f(i);
+            let mut done = spread.done.lock().unwrap_or_else(|e| e.into_inner());
+            done.0[i] = Some(answer);
+            done.1 += 1;
+            if done.1 == n {
+                spread.all.notify_all();
+            }
+        }
+    };
+    let spread = Arc::new(Spread {
+        next: std::sync::atomic::AtomicUsize::new(0),
+        done: Mutex::new(((0..n).map(|_| None).collect(), 0)),
+        all: std::sync::Condvar::new(),
+    });
+    let workers = workers();
+    {
+        let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        for _ in 0..wide_count().min(n - 1) {
+            let spread = spread.clone();
+            jobs.push_back(Box::new(move || take(&spread)));
+        }
+    }
+    workers.more.notify_all();
+    take(&spread);
+    let mut done = spread.done.lock().unwrap_or_else(|e| e.into_inner());
+    while done.1 < n {
+        done = spread.all.wait(done).unwrap_or_else(|e| e.into_inner());
+    }
+    done.0.drain(..).map(|a| a.expect("every item is done")).collect()
+}
+
+/// A hash of `bytes`, the same for the same bytes: past two pieces of
+/// [`HASH_PIECE`], the hash of their length and of each piece's hash, the
+/// pieces hashed on the kept threads and this one ([`spread_own`]).
+/// Textures are hashed whole on their eighth-frame turn (`crate::texture`):
+/// some 15 MB a frame on the submitting thread in run BA, 3.9 ms of it in
+/// blake3 alone.
+pub(crate) fn hash_wide(bytes: &[u8]) -> blake3::Hash {
+    if bytes.len() < 2 * HASH_PIECE || !hash_wide_on() {
+        return blake3::hash(bytes);
+    }
+    let (at, len) = (bytes.as_ptr() as usize, bytes.len());
+    let hashes = spread_own(len.div_ceil(HASH_PIECE), &|i| {
+        let from = i * HASH_PIECE;
+        // SAFETY: inside `bytes`, borrowed until `spread_own` returns.
+        let piece = unsafe { std::slice::from_raw_parts((at + from) as *const u8, HASH_PIECE.min(len - from)) };
+        *blake3::hash(piece).as_bytes()
+    });
+    let mut whole = blake3::Hasher::new();
+    whole.update(&(len as u64).to_le_bytes());
+    for hash in &hashes {
+        whole.update(hash);
+    }
+    whole.finalize()
+}
+
 /// Hands `job` to the kept threads; `left` counts it until it is done.
 fn send_wide(job: Job, left: &Left) {
     let workers = workers();
@@ -2197,6 +2312,37 @@ mod wide_tests {
             wide(jobs);
             assert_eq!(ran.load(Ordering::Relaxed), n * (n + 1) / 2, "{n} jobs");
         }
+    }
+
+    /// Spread items give their answers in order, however many there are.
+    #[test]
+    fn spread_items_answer_in_order() {
+        for n in [0usize, 1, 2, 7, 300] {
+            let base = 5;
+            let answers = super::spread_own(n, &|i| i * i + base);
+            assert_eq!(answers, (0..n).map(|i| i * i + base).collect::<Vec<_>>(), "{n} items");
+        }
+    }
+
+    /// The wide hash is the same for the same bytes and differs when one
+    /// byte differs, in any piece, or the length does; under two pieces it
+    /// is blake3's.
+    #[test]
+    fn wide_hashes_follow_every_byte() {
+        use super::{HASH_PIECE, hash_wide};
+        let small: Vec<u8> = (0..HASH_PIECE + 7).map(|i| (i * 7) as u8).collect();
+        assert_eq!(hash_wide(&small), blake3::hash(&small));
+        let len = 5 * HASH_PIECE + 999;
+        let mut bytes: Vec<u8> = (0..len).map(|i| (i * 31 + i / 977) as u8).collect();
+        let first = hash_wide(&bytes);
+        assert_eq!(hash_wide(&bytes.clone()), first);
+        for at in [0, HASH_PIECE - 1, HASH_PIECE, 3 * HASH_PIECE + 5, len - 1] {
+            bytes[at] ^= 1;
+            assert_ne!(hash_wide(&bytes), first, "byte {at}");
+            bytes[at] ^= 1;
+        }
+        assert_eq!(hash_wide(&bytes), first);
+        assert_ne!(hash_wide(&bytes[..len - 1]), first);
     }
 
     /// Copies cut into jobs copy every byte once: long ones, short ones

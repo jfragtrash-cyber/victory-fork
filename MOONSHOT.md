@@ -588,3 +588,20 @@ already reach.
   frame); next are the copies' askings (write watch and `VirtualProtect`,
   ~8 ms), the fills of upload memory (~6 ms) and, once the card is the
   limit again, the translator's group merge.
+- 2026-11-26, morning. Textures are hashed whole on their eighth-frame
+  turn: some 15 MB a frame on the submitting thread, 3.9 ms of blake3 in
+  run BA. `crate::shadow::hash_wide` hashes them by pieces of 256 KiB on
+  the kept threads and the caller (the caller runs only its own pieces:
+  it may hold title memory for reading); `VICTORY_HASH_WIDE` on by
+  default, `0` as before, `alt` in turn. The submission's steps read the
+  clock only where they are timed (18,500 refreshes a frame read it for
+  nothing). Run BE (captured): pictures right; the scene went its own
+  way (the character followed the guard out of the cell), not comparable
+  with BB. Run BF (`VICTORY_ASK_WIDE=alt`: the kernel askings of a
+  submission's runs ahead made side by side on the kept threads): worse,
+  per 1,000 draws in play 21.7 ms a frame against 18.1, the submitting
+  thread 14.1 against 11.9 (the kernel does not take them side by side,
+  and they stand in line with the spread copies). The switch stays off.
+  BE and BF ended by themselves after 330-350 s with nothing in the log:
+  the window was likely closed or held from outside; `victory_hle=info`
+  in `VICTORY_LOG` says so next time.

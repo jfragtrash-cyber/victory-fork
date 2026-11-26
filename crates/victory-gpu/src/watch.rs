@@ -258,6 +258,8 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     AHEAD_VIEWS.fetch_add((all - pieces.len()) as u64, std::sync::atomic::Ordering::Relaxed);
     j.ahead_asked = j.next_asking();
     j.ahead.clear();
+    // The runs of pieces asked together: `[i, k)` of `pieces` each.
+    let mut runs = Vec::new();
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -270,9 +272,37 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        ask_run(j, &pieces[i..k]);
+        runs.push((i, k));
         i = k;
     }
+    if ask_wide() && runs.iter().filter(|r| r.1 - r.0 >= 2).count() >= 2 {
+        let answers = crate::shadow::spread_own(runs.len(), &|r| {
+            let (i, k) = runs[r];
+            let mut asked = Vec::new();
+            let pages = KERNEL_SCRATCH.with(|scratch| {
+                let mut scratch = scratch.take();
+                scratch.clear();
+                kernel_run(&pieces[i..k], &mut asked, &mut scratch);
+                let pages = scratch.clone();
+                KERNEL_SCRATCH.set(scratch);
+                pages
+            });
+            (asked, pages)
+        });
+        for (asked, pages) in answers {
+            note_ahead(j, &asked, &pages);
+        }
+        return;
+    }
+    for (i, k) in runs {
+        ask_run(j, &pieces[i..k]);
+    }
+}
+
+thread_local! {
+    /// The kernel's answers to [`kernel_run`] on a kept thread
+    /// ([`ask_wide`]), kept from one asking to the next.
+    static KERNEL_SCRATCH: std::cell::Cell<Vec<usize>> = const { std::cell::Cell::new(Vec::new()) };
 }
 
 /// Since the last frame line: the kernel askings that took a millisecond
@@ -358,6 +388,37 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     // such range asked again at each of its 70 flushes (run 76: 2,300
     // askings a frame with the switch on, as without it). They are asked
     // here, once; what is not write-watched stays with `writes`.
+    if ask_wide() {
+        let mut lone = Vec::new();
+        for &(start, end) in ranges {
+            if start >= end {
+                continue;
+            }
+            if known_view(start) {
+                #[cfg(feature = "diagnostics")]
+                AHEAD_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+            let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+            if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+                lone.push((first, last));
+            }
+        }
+        lone.sort_unstable();
+        lone.dedup();
+        let answers = crate::shadow::spread_own(lone.len(), &|r| {
+            let (first, last) = lone[r];
+            let mut pages = Vec::new();
+            kernel_pages(first, last, &mut pages).then_some(pages)
+        });
+        for (&range, pages) in lone.iter().zip(answers) {
+            if let Some(pages) = pages {
+                note_ahead(j, &[range], &pages);
+            }
+        }
+        j.kept = !j.ahead.is_empty();
+        return;
+    }
     for &(start, end) in ranges {
         if start >= end {
             continue;
@@ -440,38 +501,105 @@ pub(crate) fn wrote_own(page: usize, others: &[usize]) -> (u64, u64) {
 /// fails, as a run across two reservations or into memory that is not
 /// write-watched does. A piece alone is left to [`writes`].
 fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
+    let (mut asked, mut pages) = (Vec::new(), std::mem::take(&mut j.found));
+    pages.clear();
+    kernel_run(pieces, &mut asked, &mut pages);
+    note_ahead(j, &asked, &pages);
+    j.found = pages;
+}
+
+/// [`ask_run`]'s kernel askings alone: the ranges asked go to `asked`,
+/// the pages found written in them to `pages`.
+fn kernel_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, pages: &mut Vec<usize>) {
     if pieces.len() < 2 {
         return;
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
-    if ask_kernel(j, first, last) {
-        j.ahead.push((first, last));
+    if kernel_pages(first, last, pages) {
+        asked.push((first, last));
         return;
     }
     let (a, b) = pieces.split_at(pieces.len() / 2);
-    ask_run(j, a);
-    ask_run(j, b);
+    kernel_run(a, asked, pages);
+    kernel_run(b, asked, pages);
+}
+
+/// Notes ranges asked ahead and the pages found written in them, under the
+/// ahead asking.
+fn note_ahead(j: &mut Journal, asked: &[(usize, usize)], pages: &[usize]) {
+    j.ahead.extend_from_slice(asked);
+    let now = j.ahead_asked;
+    for &page in pages {
+        j.written.set(page, now);
+    }
+}
+
+/// Whether the kernel askings of a submission's ranges ahead are made side
+/// by side on the kept threads (`VICTORY_ASK_WIDE=1`; `alt`: twenty seconds
+/// with, twenty without, in turn, each change said in the log; off by
+/// default): they are of ranges apart from one another and need nothing of
+/// the journal, which notes their answers after. One that resets written
+/// pages costs 30-70 microseconds; run BA's submitting thread spent 3.7 ms
+/// a frame in them.
+fn ask_wide() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_ASK_WIDE").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = (crate::host::now_us() / 20_000_000) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "write-watch askings ahead from now (VICTORY_ASK_WIDE=alt): {}",
+                    if on { "WIDE, on the kept threads" } else { "one after the other, as usual" }
+                );
+            }
+            on
+        }
+    }
 }
 
 /// Asks the kernel for the written pages of pages `[first, last)` and notes
 /// them in the journal under the ahead asking; false (and nothing changed)
 /// if the range is not write-watched memory of one reservation.
 fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
+    let mut pages = std::mem::take(&mut j.found);
+    pages.clear();
+    let asked = kernel_pages(first, last, &mut pages);
+    if asked {
+        note_ahead(j, &[], &pages);
+    }
+    j.found = pages;
+    asked
+}
+
+/// Asks the kernel for the written pages of pages `[first, last)`, and
+/// resets them: their numbers go to `pages`. False (and nothing added) if
+/// the range is not write-watched memory of one reservation.
+fn kernel_pages(first: usize, last: usize, pages: &mut Vec<usize>) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
+    let at = pages.len();
+    // Room for every page, not filled: the kernel writes the entries it
+    // gives (a range of 1 GiB has room for 2 MB of them).
+    pages.reserve(count);
     let mut granularity = 0;
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
+    // SAFETY: the answer buffer has room for `count` entries past `at`.
     let failed = unsafe {
         GetWriteWatch(
             WRITE_WATCH_FLAG_RESET,
             (first * PAGE) as *const _,
             (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
+            pages.as_mut_ptr().add(at).cast(),
             &mut count,
             &mut granularity,
         )
@@ -486,10 +614,11 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }
-    let now = j.ahead_asked;
-    for k in 0..count {
-        let page = j.found[k] / PAGE;
-        j.written.set(page, now);
+    // SAFETY: the kernel wrote the `count` entries past `at`, no more than
+    // it had room for.
+    unsafe { pages.set_len(at + count) };
+    for page in &mut pages[at..] {
+        *page /= PAGE;
     }
     true
 }
@@ -2448,6 +2577,55 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// A run of pieces in two reservations is asked by halves; the pages
+    /// found come after what the answer held. Asked on the kept threads
+    /// (`spread_own`), range by range, they are the same.
+    #[test]
+    fn kernel_runs_split_at_reservations() {
+        let alloc = || {
+            // SAFETY: a fresh write-watched allocation, freed at the end.
+            let p = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+            assert_ne!(p, 0);
+            p
+        };
+        let (a, b) = (alloc(), alloc());
+        // Two pieces in each (a piece alone is left to `writes`).
+        let (a, b) = (a.min(b), a.max(b));
+        let pieces = [(a / PAGE, a / PAGE + 2), (a / PAGE + 2, a / PAGE + 4), (b / PAGE, b / PAGE + 2), (b / PAGE + 2, b / PAGE + 4)];
+        let ranges = [(a / PAGE, a / PAGE + 4), (b / PAGE, b / PAGE + 4)];
+        for wide in [false, true] {
+            // SAFETY: committed pages of ours.
+            unsafe {
+                ((a + PAGE) as *mut u8).write_volatile(1);
+                ((b + 2 * PAGE) as *mut u8).write_volatile(1);
+            }
+            let (mut asked, mut pages) = (Vec::new(), vec![7]);
+            if wide {
+                for found in crate::shadow::spread_own(2, &|r| {
+                    let mut pages = Vec::new();
+                    kernel_pages(ranges[r].0, ranges[r].1, &mut pages).then_some(pages)
+                }) {
+                    asked.push(());
+                    pages.extend(found.expect("write-watched"));
+                }
+            } else {
+                let mut run = Vec::new();
+                kernel_run(&pieces, &mut run, &mut pages);
+                assert_eq!(run, ranges);
+                asked.extend(run.iter().map(|_| ()));
+            }
+            assert_eq!(asked.len(), 2, "wide: {wide}");
+            assert_eq!(pages[0], 7);
+            let mut found = pages[1..].to_vec();
+            found.sort_unstable();
+            assert_eq!(found, [a / PAGE + 1, b / PAGE + 2], "wide: {wide}");
+        }
+        for p in [a, b] {
+            // SAFETY: our allocations.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        }
     }
 
     /// `writes_after` lists what `writes` lists, less the pages last written

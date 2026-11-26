@@ -7388,7 +7388,12 @@ impl HostList {
                 }
                 flush_fills(&mut fills);
             }
-            let started = std::time::Instant::now();
+            // The clock only for the steps timed below: of a frame's some
+            // 30,000 steps (run BA) most are refreshes, noted for the flush.
+            let timed = matches!(step, Step::Copy(..) | Step::Fill(..))
+                || cfg!(feature = "diagnostics") && matches!(step, Step::Run(_));
+            let started = timed.then(std::time::Instant::now);
+            let elapsed_us = || started.map_or(0, |s| s.elapsed().as_micros() as u64);
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -7436,7 +7441,7 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
-                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                        add(C::RunUs, elapsed_us());
                     }
                     continue;
                 }
@@ -7464,7 +7469,7 @@ impl HostList {
                     continue;
                 }
             };
-            preparing(0, started.elapsed().as_micros() as u64);
+            preparing(0, elapsed_us());
             preparing(1, copied as u64);
         }
         flush_fills(&mut fills);

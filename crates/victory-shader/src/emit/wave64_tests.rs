@@ -451,6 +451,55 @@ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
     Some(out[0][0])
 }
 
+/// A first-lane read with some lanes out of EXEC (a `v_cmpx`, no branch) in a wave64 program
+/// run as two host waves (the `v_mbcnt` makes it cross halves): whether each half has a lane
+/// in EXEC and the halves' values go through one exchange with `VICTORY_EXCHANGE_BATCH`, two
+/// group barriers fewer; on the card, the console's first lane in EXEC either way.
+#[test]
+fn a_guarded_first_lane_read_exchanges_its_two_values_at_once() {
+    let words = [
+        0xD765_0001, 0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        0xD766_0001, 0x0002_02C1, // v_mbcnt_hi_u32_b32 v1, -1, v1
+        0x7DA2_0000, // v_cmpx_lt_u32 exec, s0, v0 (the lanes above s0)
+        0x7E18_0500, // v_readfirstlane_b32 s12, v0
+        0xBEFE_04C1, // s_mov_b64 exec, -1
+        0x7E00_020C, // v_mov_b32 v0, s12
+        0x38 << 26 | 0x1C << 18,
+        0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let build = |batch: bool| {
+        let was = (
+            lower::TEST_EXCHANGE_BATCH.replace(Some(batch)),
+            super::census::TEST_ON.replace(true),
+        );
+        let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+        lower::TEST_EXCHANGE_BATCH.set(was.0);
+        super::census::TEST_ON.set(was.1);
+        let census = super::census::take(&shader.dxil).expect("a census");
+        let barrier = super::census::KINDS.iter().position(|k| *k == "barrier").expect("kind");
+        (shader, census.counts[barrier])
+    };
+    let ((one, n_one), (two, n_two)) = (build(true), build(false));
+    assert_eq!(n_one + 2, n_two, "barriers: {n_one} batched, {n_two} one value at a time");
+    for shader in [&one, &two] {
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // (s0) -> the first lane above s0, 0 when there is none (the console reads lane 0)
+    for (s0, expected) in [(0u32, 1u32), (30, 31), (31, 32), (40, 41), (63, 0)] {
+        for (form, shader) in [("batched", &one), ("one at a time", &two)] {
+            let Some(got) = on_the_card(shader, [s0, 0]) else { return };
+            assert_eq!(got, expected, "{form}: s0 = {s0}");
+        }
+    }
+    eprintln!("ran on the hardware device: a guarded first-lane read, batched and not");
+}
+
 /// A 32-lane console wave. A register holds a lane mask on one path (the lanes below s0)
 /// and a number on the other, and is read as a number after the join, as the trace programs
 /// keep their lanes' masks and their node numbers on one stack

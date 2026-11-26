@@ -1289,6 +1289,8 @@ thread_local! {
     pub(super) static TEST_LEGACY_MUL: std::cell::Cell<Option<LegacyMul>> = const { std::cell::Cell::new(None) };
     /// A test's [`group_merge`], for its thread only.
     pub(super) static TEST_GROUP_MERGE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// A test's [`exchange_batch`], for its thread only.
+    pub(super) static TEST_EXCHANGE_BATCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 /// `VICTORY_GROUP_MERGE=<k>` (2 or 4; anything else: off): a compute program whose thread
@@ -1324,6 +1326,28 @@ fn group_merge() -> u32 {
         Some("4") => 4,
         _ => 1,
     })
+}
+
+/// `VICTORY_EXCHANGE_BATCH=1`: in a console wave64 program run as two host waves of 32, two
+/// values the halves exchange one right after the other (a first-lane read where some lane
+/// may be out of EXEC: whether each half has a lane, then the values; the two dwords of a
+/// 64-bit wave sum) go through one exchange of two group barriers instead of two of two
+/// each. Exact (the same stores and loads); costs two more LDS dwords a console wave. The
+/// 2.4 ms probe-allocation program of run AN met 34 times a thread, 4 of them saved so. Off
+/// until the wave64 tests have run on a card with it.
+fn exchange_batch() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_EXCHANGE_BATCH.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_EXCHANGE_BATCH").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// LDS dwords each console wave of a program run as two host waves exchanges through: a
+/// pair (its halves' values) for each value one exchange carries.
+fn exchange_dwords() -> u32 {
+    if exchange_batch() { 4 } else { 2 }
 }
 
 /// The most VGPRs a program whose groups merge ([`group_merge`]) has on the console. Two
@@ -1687,9 +1711,10 @@ impl<'a> Lower<'a> {
                             split_lds = s.lds_dwords > 0 && group > 32;
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
-                                // numbers go through two exchange dwords past the program's LDS
+                                // numbers go through exchange dwords past the program's LDS
+                                // ([`exchange_dwords`] a console wave)
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                s.lds_dwords += exchange_dwords() * group.div_ceil(64);
                             }
                         }
                     }
@@ -2397,8 +2422,7 @@ impl<'a> Lower<'a> {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
             }
-            let (lo0, lo1) = self.exchange_halves(self.cur, r_lo);
-            let (hi0, hi1) = self.exchange_halves(self.cur, r_hi);
+            let [(lo0, lo1), (hi0, hi1)] = self.exchange_two(self.cur, r_lo, r_hi);
             let c = self.cur;
             let d0 = self
                 .s
@@ -4167,46 +4191,74 @@ impl<'a> Lower<'a> {
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
     /// (lower half's, upper half's). A group with no upper half gets 0 for it.
     fn exchange_halves(&mut self, at: usize, mine: V) -> (V, V) {
+        self.exchange_many(at, [mine])[0]
+    }
+
+    /// [`Lower::exchange_halves`] for each of `mine`. With `VICTORY_EXCHANGE_BATCH=1`
+    /// ([`exchange_batch`]) two values go through one exchange (two group barriers) where
+    /// they went through two (four barriers); the same stores and loads, so the same values.
+    fn exchange_two(&mut self, at: usize, a: V, b: V) -> [(V, V); 2] {
+        if exchange_batch() {
+            return self.exchange_many(at, [a, b]);
+        }
+        [self.exchange_halves(at, a), self.exchange_halves(at, b)]
+    }
+
+    /// The exchange of `N` values (at most [`exchange_dwords`] / 2) in one round: each half
+    /// stores its values, the waves meet, both load them all, the waves meet again.
+    fn exchange_many<const N: usize>(&mut self, at: usize, mine: [V; N]) -> [(V, V); N] {
         let Some((slot, small, _)) = self.exchange.as_ref().map(|(a, b, _)| (*a, *b, ())) else {
             let z = self.s.m.i32(0);
-            return (mine, z);
+            return mine.map(|m| (m, z));
         };
         if small {
             let z = self.s.m.i32(0);
-            return (mine, z);
+            return mine.map(|m| (m, z));
         }
         if self.local {
             // each host wave on its own: its half holds `mine`, the other nothing
             let cl = self.console_lane();
             let (k32, z) = (self.s.m.i32(32), self.s.m.i32(0));
             let upper = self.s.m.cmp(at, pred::IUGE, cl, k32);
-            let lo = self.s.m.select(at, upper, z, mine);
-            let hi = self.s.m.select(at, upper, mine, z);
-            return (lo, hi);
+            return mine.map(|m| {
+                let lo = self.s.m.select(at, upper, z, m);
+                let hi = self.s.m.select(at, upper, m, z);
+                (lo, hi)
+            });
         }
-        // the pair of dwords of this thread's console wave: its half's, then both
+        assert!(2 * N as u32 <= exchange_dwords(), "more values than exchange dwords");
+        // the dwords of this thread's console wave: a pair for each value, its half's, then both
         let pair = self.exchange_pair(slot);
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
-        let index = self.s.m.bin(at, Bin::Add, pair, half);
         let lds = self.s.lds();
-        let ptr = self.s.m.element(at, lds, index);
-        self.s.m.store(at, ptr, mine);
+        let pairs = std::array::from_fn::<V, N, _>(|n| {
+            let k = self.s.m.i32(2 * n as u32);
+            self.s.m.bin(at, Bin::Add, pair, k)
+        });
+        for (&p, &m) in pairs.iter().zip(&mine) {
+            let index = self.s.m.bin(at, Bin::Add, p, half);
+            let ptr = self.s.m.element(at, lds, index);
+            self.s.m.store(at, ptr, m);
+        }
         self.group_sync(at);
         let one = self.s.m.i32(1);
-        let k1 = self.s.m.bin(at, Bin::Add, pair, one);
-        let p0 = self.s.m.element(at, lds, pair);
-        let p1 = self.s.m.element(at, lds, k1);
-        let lo = self.s.m.load(at, p0);
-        let hi = self.s.m.load(at, p1);
+        let got = pairs.map(|p| {
+            let k1 = self.s.m.bin(at, Bin::Add, p, one);
+            let p0 = self.s.m.element(at, lds, p);
+            let p1 = self.s.m.element(at, lds, k1);
+            let lo = self.s.m.load(at, p0);
+            let hi = self.s.m.load(at, p1);
+            (lo, hi)
+        });
         // the slots are written again only after every thread read them
         self.group_sync(at);
-        (lo, hi)
+        got
     }
 
-    /// The first of the two exchange dwords of this thread's console wave (made in the entry
-    /// block): a group of several console waves has a pair for each.
+    /// The first of the exchange dwords of this thread's console wave (made in the entry
+    /// block): a group of several console waves has [`exchange_dwords`] for each.
     fn exchange_pair(&mut self, slot: u32) -> V {
         if let Some(v) = self.pair {
             return v;
@@ -4215,8 +4267,8 @@ impl<'a> Lower<'a> {
         let thread = self.console_thread();
         let six = self.s.m.i32(6);
         let wave = self.s.m.bin(e, Bin::LShr, thread, six);
-        let one = self.s.m.i32(1);
-        let twice = self.s.m.bin(e, Bin::Shl, wave, one);
+        let shift = self.s.m.i32(exchange_dwords().trailing_zeros());
+        let twice = self.s.m.bin(e, Bin::Shl, wave, shift);
         let base = self.s.m.i32(slot);
         let v = self.s.m.bin(e, Bin::Add, base, twice);
         self.pair = Some(v);
@@ -8087,8 +8139,7 @@ impl<'a> Lower<'a> {
                     } else {
                         let i32t = self.s.t.i32;
                         let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
-                        let (lo_has, hi_has) = self.exchange_halves(c, has);
-                        let (lo, hi) = self.exchange_halves(c, mine);
+                        let [(lo_has, hi_has), (lo, hi)] = self.exchange_two(c, has, mine);
                         let z = self.s.m.i32(0);
                         let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);
                         let in_hi = self.s.m.cmp(c, pred::NE, hi_has, z);

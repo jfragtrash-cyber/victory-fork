@@ -127,6 +127,9 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// The title's barrier groups recorded without that wait: none of their
+    /// barriers orders unordered access (`crate::list::groups_wait`).
+    GroupsWithoutWait,
     /// `watch::writes` kernel askings that failed (the range is not
     /// write-watched: view memory or not watchable).
     WatchFailed,
@@ -147,7 +150,7 @@ pub(crate) enum C {
     SpreadBytes,
     SpreadUs,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1317,10 +1320,11 @@ pub(crate) fn log(frames: f64) {
     );
     crate::draw::window_line(frames);
     tracing::info!(
-        "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
-         for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); barrier experiment {}",
+        "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups ({:.0} more \
+         groups recorded none: VICTORY_BARRIER_PRECISE), {:.0} for its barriers on buffers; {:.0} indirect \
+         commands bounded (a dispatch of ours between two such waits each); barrier experiment {}",
         c[C::WaitsForGroups as usize],
+        c[C::GroupsWithoutWait as usize],
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
         barrier_test()

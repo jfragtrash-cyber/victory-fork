@@ -1,8 +1,8 @@
 //! The title's page-mapping copies (`CopyPageMappingsBatchX`, how it
 //! streams textures) as queue work: applied by a thread of ours when the
 //! queue's line gets to them, while the title's thread goes on
-//! (`VICTORY_ASYNC_PAGE_MAPPINGS=1`; off by default, needs
-//! `VICTORY_ASYNC_SUBMIT=1`).
+//! (`VICTORY_ASYNC_PAGE_MAPPINGS`; on with `VICTORY_ASYNC_SUBMIT=1`, whose
+//! thread runs the lines, unless `0`).
 //!
 //! Why: the batches were applied on the title's thread, inside its call,
 //! one page a call to the runtime's mapper, each an unmap and a map: 120 to
@@ -116,16 +116,17 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Whether batches go behind their queue's line (`VICTORY_ASYNC_PAGE_MAPPINGS=1`;
-/// needs `VICTORY_ASYNC_SUBMIT=1`, whose thread runs the lines). Off by
-/// default: on once a cutscene run shows the title's thread freed of the
-/// remapping time with the picture right (the frame log's "page
-/// mappings").
+/// Whether batches go behind their queue's line (`VICTORY_ASYNC_PAGE_MAPPINGS`;
+/// on unless `0` where it can be: it needs `VICTORY_ASYNC_SUBMIT=1`, whose
+/// thread runs the lines). Runs AK and AL (2026-11-26): world frames of a
+/// second or more 15-18 against 30-31 without it, the worst 1.5 s against
+/// 3-4 s, play as before, the picture right.
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let asked = std::env::var_os("VICTORY_ASYNC_PAGE_MAPPINGS").is_some_and(|v| v == "1");
-        let on = asked && crate::queue::behind() && crate::resource::page_mapper().is_some();
+        let said = std::env::var_os("VICTORY_ASYNC_PAGE_MAPPINGS");
+        let asked = said.as_ref().is_some_and(|v| v == "1");
+        let on = said.is_none_or(|v| v != "0") && crate::queue::behind() && crate::resource::page_mapper().is_some();
         if asked && !on {
             tracing::warn!("VICTORY_ASYNC_PAGE_MAPPINGS=1 needs VICTORY_ASYNC_SUBMIT=1 (and its defaults): page mappings stay in the title's calls");
         }
@@ -133,7 +134,7 @@ pub(crate) fn on() -> bool {
             start();
             tracing::info!(
                 title_code = TITLE_CODE.get().is_some(),
-                "the title's page-mapping copies are applied by a thread of ours in order with their queue's work, not in its calls (VICTORY_ASYNC_PAGE_MAPPINGS=1)"
+                "the title's page-mapping copies are applied by a thread of ours in order with their queue's work, not in its calls (VICTORY_ASYNC_PAGE_MAPPINGS)"
             );
         }
         on

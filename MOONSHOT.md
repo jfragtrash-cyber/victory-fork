@@ -461,3 +461,33 @@ already reach.
   15 % reading title bytes, 13 % writing them. The card is ~85 % busy
   (title lists 57-62 ms, our send-and-hash 15 ms, compare 5.5 ms a frame),
   so the card is near the limit again: run AN times the title's commands.
+- 2026-11-26, night. Run AN (timing run, each list alone): the title's
+  commands take 57.5 ms of card time a frame in play, spread over 1,302
+  kinds: dispatches 30.5 ms in 3,844, indirect commands 19.1 ms in 5,109,
+  mesh 3.4 ms; the heaviest single dispatch 4.7 ms. No hot spot: whatever
+  makes the translated shaders slow is systematic (a translator review is
+  under way). Waits for every earlier shader write: ~710 a frame for the
+  title's barrier groups, ~420 around the ~210 bounded indirect commands.
+- 2026-11-26, night. Run AO: `VICTORY_PRESENTS_AHEAD=3` is worse (114-125
+  ms against ~105; the title's own threads take twice the CPU). The title
+  waits on no fence event of ours (`pace`: 0 waits a frame); a fence is set
+  ~123 ms (1.2 frames) after the title's Signal for it. A census of the
+  barrier groups (`VICTORY_BARRIER_CENSUS=1`): in menus most are buffer
+  copies (made on the CPU at submission) and render target <-> shader
+  resource layouts (moved by our own state tracking); in play most order
+  unordered access. `VICTORY_BARRIER_PRECISE=1` records the wait only for
+  groups that need it (run AP).
+- 2026-11-26, night. Run AP (`VICTORY_BARRIER_PRECISE=1`, captured):
+  pictures right; ~83 of ~710 group waits a frame left out in play (124 of
+  967 in the cutscene), the title's lists 55-60 ms of card time against
+  57-62: within the noise. Stays off. `VICTORY_ASYNC_PAGE_MAPPINGS` is now
+  on wherever `VICTORY_ASYNC_SUBMIT=1` is (runs AK, AL).
+- 2026-11-26, night. Translator review (static, the 50 programs of the 40
+  heaviest kinds): no local memory, no waterfall loops, 2.3 DXIL
+  instructions per console instruction. Systematic costs: (1) one-wave
+  thread groups: 58 % of that compute time runs 32-thread groups, and an
+  SM of this card holds 16 groups, so 16 of 48 warps; (2) the legacy
+  multiply's zero test (13 % of vector instructions, +17 % host
+  instructions, and it splits multiply-add chains); (3) wave64 programs run
+  as two waves with two barriers per exchange; (4) a signed-zero fix-up on
+  every min/max, half of them against a non-zero constant.

@@ -1991,9 +1991,19 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
 /// first, so only their ordering matters: one barrier on every shader
 /// write (the title's buffer barriers order compute passes).
 extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
+    #[cfg(windows)]
+    if count > 0 && barrier_precise() && !groups_wait(count, _groups) {
+        #[cfg(feature = "diagnostics")]
+        {
+            group_census(count, _groups);
+            crate::copystat::add(crate::copystat::C::GroupsWithoutWait, 1);
+        }
+        return;
+    }
     // Diagnostics: counted, and left out under `VICTORY_BARRIER_TEST=groups`.
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
+        group_census(count, _groups);
         crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
         if crate::copystat::barrier_test() & 1 != 0 {
             return;
@@ -2011,6 +2021,141 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     }
     #[cfg(not(windows))]
     let _ = (this, count);
+}
+
+/// Whether the title's barrier groups record a wait for earlier shader
+/// writes only when one of their barriers orders unordered access
+/// ([`groups_wait`]; `VICTORY_BARRIER_PRECISE=1`, off by default: every
+/// group waits, as before).
+///
+/// Why: every group recorded a wait for every earlier shader write, a
+/// drain of the card, some 710 a frame in play. A census of the groups
+/// (`VICTORY_BARRIER_CENSUS=1`, run AO) found most of them about buffer
+/// copies, which we make on the CPU when the list is submitted, and render
+/// target <-> shader resource layouts, which the host's own state tracking
+/// moves at the next use (`ensure_state`); the wait does neither.
+#[cfg(windows)]
+fn barrier_precise() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BARRIER_PRECISE").is_some_and(|v| v == "1"))
+}
+
+/// Whether barrier groups `(count, groups)` (the PC's enhanced barriers:
+/// `D3D12_BARRIER_GROUP` of 16 bytes, global barriers of 16, textures of
+/// 64, buffers of 40, each opening with sync before, sync after, access
+/// before, access after) need a wait for earlier shader writes: a barrier
+/// whose earlier access is unordered access, or the common access (any)
+/// after some work, or anything not understood.
+fn groups_wait(count: u32, groups: *const u8) -> bool {
+    const UNORDERED_ACCESS: u32 = 0x10;
+    const NO_ACCESS: u32 = 0x8000_0000;
+    const SYNC_CLEAR_UNORDERED_ACCESS_VIEW: u32 = 0x8000;
+    if groups.is_null() || count > 1024 {
+        return true;
+    }
+    for g in 0..count as usize {
+        // SAFETY: the title passes `count` groups of 16 bytes.
+        let (kind, n, at) = unsafe {
+            let group = groups.add(g * 16);
+            (
+                std::ptr::read_unaligned(group.cast::<u32>()),
+                std::ptr::read_unaligned(group.add(4).cast::<u32>()),
+                std::ptr::read_unaligned(group.add(8).cast::<*const u8>()),
+            )
+        };
+        let size = match kind {
+            0 => 16,
+            1 => 64,
+            2 => 40,
+            _ => return true,
+        };
+        if n == 0 {
+            continue;
+        }
+        if at.is_null() || n > 4096 {
+            return true;
+        }
+        for b in 0..n as usize {
+            // SAFETY: the group's `n` barriers of `size` bytes.
+            let [sync_before, _, access_before, access_after]: [u32; 4] =
+                unsafe { std::ptr::read_unaligned(at.add(b * size).cast::<[u32; 4]>()) };
+            // Nothing before to wait for.
+            if access_before & NO_ACCESS != 0 || sync_before == 0 {
+                continue;
+            }
+            // Shader writes before; reads before writes by shaders (buffers
+            // have one host state, so no transition orders those); a clear
+            // of an unordered view; the common access (any) after work.
+            if access_before & UNORDERED_ACCESS != 0
+                || access_after & UNORDERED_ACCESS != 0
+                || sync_before & SYNC_CLEAR_UNORDERED_ACCESS_VIEW != 0
+                || access_before == 0
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// With `VICTORY_BARRIER_CENSUS=1` (diagnostics): what the title's barrier
+/// groups hold, read as the PC's enhanced barriers (`D3D12_BARRIER_GROUP`:
+/// type, count, pointer; global barriers of 16 bytes, textures of 64,
+/// buffers of 40, each starting with sync before, sync after, access
+/// before, access after), counted by (type, those four), and said every
+/// 8,192 groups: which of the ~700 waits a frame order shader writes at
+/// all.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn group_census(count: u32, groups: *const u8) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_BARRIER_CENSUS").is_some_and(|v| v == "1")) || groups.is_null() {
+        return;
+    }
+    static SEEN: Mutex<(u64, Option<HashMap<[u32; 5], u64>>)> = Mutex::new((0, None));
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (calls, map) = &mut *seen;
+    let map = map.get_or_insert_with(HashMap::new);
+    for g in 0..count.min(64) as usize {
+        // SAFETY: the title passes `count` groups of 16 bytes.
+        let (kind, n, at) = unsafe {
+            let group = groups.add(g * 16);
+            (
+                std::ptr::read_unaligned(group.cast::<u32>()),
+                std::ptr::read_unaligned(group.add(4).cast::<u32>()),
+                std::ptr::read_unaligned(group.add(8).cast::<*const u8>()),
+            )
+        };
+        let size = match kind {
+            0 => 16,
+            1 => 64,
+            2 => 40,
+            _ => {
+                *map.entry([kind, n, 0, 0, 0]).or_default() += 1;
+                continue;
+            }
+        };
+        if at.is_null() {
+            continue;
+        }
+        for b in 0..n.min(256) as usize {
+            // SAFETY: as the title passes them.
+            let w: [u32; 4] = unsafe { std::ptr::read_unaligned(at.add(b * size).cast::<[u32; 4]>()) };
+            *map.entry([kind, w[0], w[1], w[2], w[3]]).or_default() += 1;
+        }
+    }
+    *calls += 1;
+    if *calls % 8192 == 0 {
+        let mut all: Vec<_> = map.drain().collect();
+        all.sort_by_key(|e| std::cmp::Reverse(e.1));
+        let text: Vec<String> = all
+            .iter()
+            .take(40)
+            .map(|([kind, sb, sa, ab, aa], n)| format!("{n}x type {kind} sync {sb:#x}->{sa:#x} access {ab:#x}->{aa:#x}"))
+            .collect();
+        tracing::info!("the title's barrier groups, the last 8192 calls, by barrier: {}", text.join("; "));
+    }
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
@@ -2228,6 +2373,62 @@ static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// A barrier group as the title passes it: type, count, pointer.
+    fn group(kind: u32, barriers: &[u8]) -> [u8; 16] {
+        let mut g = [0u8; 16];
+        g[..4].copy_from_slice(&kind.to_le_bytes());
+        let size = [16, 64, 40][kind as usize];
+        g[4..8].copy_from_slice(&((barriers.len() / size) as u32).to_le_bytes());
+        g[8..].copy_from_slice(&(barriers.as_ptr() as u64).to_le_bytes());
+        g
+    }
+
+    /// `n` barriers of `size` bytes, each opening with sync before and
+    /// after and access before and after.
+    fn barriers(size: usize, each: &[[u32; 4]]) -> Vec<u8> {
+        let mut v = vec![0u8; size * each.len()];
+        for (b, words) in each.iter().enumerate() {
+            for (i, w) in words.iter().enumerate() {
+                v[b * size + 4 * i..b * size + 4 * i + 4].copy_from_slice(&w.to_le_bytes());
+            }
+        }
+        v
+    }
+
+    /// The census's kinds (run AO): buffer copies, render target <->
+    /// shader resource layouts and first uses need no wait; unordered access
+    /// before or after (reads before shader writes), the common access after
+    /// work, a clear of an unordered view and unknown group types do.
+    #[test]
+    fn only_unordered_access_before_waits() {
+        let copy_then_read = barriers(40, &[[0x200, 0x1000, 0x400, 0x80], [0x1000, 0x200, 0x80, 0x400]]);
+        let layouts = barriers(
+            64,
+            &[[0x1000, 0x40, 0x80, 0x8], [0x40, 0x1000, 0x8, 0x80], [0, 0x40, 0x8000_0000, 0x8], [0, 0x1000, 0x8000_0000, 0x10]],
+        );
+        let groups = [group(2, &copy_then_read), group(1, &layouts)];
+        assert!(!groups_wait(2, groups.as_ptr().cast()));
+        for words in [
+            [0x1000, 0x1000, 0x10, 0x10],
+            [0x80, 0x800, 0x10, 0x200],
+            [0x1000, 0x1000, 0x80, 0x10],
+            [0x800, 0x1000, 0x200, 0x10],
+            [0x1, 0x1, 0, 0x80],
+            [0x8000, 0x80, 0x80, 0x80],
+        ] {
+            let one = barriers(16, &[words]);
+            let with = [group(2, &copy_then_read), group(0, &one)];
+            assert!(groups_wait(2, with.as_ptr().cast()), "{words:x?}");
+        }
+        // The common access before nothing (sync none) is a first use.
+        let first = barriers(16, &[[0, 0x80, 0, 0x80]]);
+        assert!(!groups_wait(1, [group(0, &first)].as_ptr().cast()));
+        let mut unknown = group(0, &first);
+        unknown[..4].copy_from_slice(&7u32.to_le_bytes());
+        assert!(groups_wait(1, [unknown].as_ptr().cast()));
+        assert!(groups_wait(1, std::ptr::null()));
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

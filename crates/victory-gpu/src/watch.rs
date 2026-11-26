@@ -1242,7 +1242,7 @@ impl std::ops::DerefMut for Held {
 }
 
 /// Whether [`guard`] lets the guards' lock go while Windows makes the blocks
-/// it guards again read-only (`VICTORY_GUARD_UNLOCKED=1`; off by default).
+/// it guards again read-only (`VICTORY_GUARD_UNLOCKED`; on unless `0`).
 ///
 /// The submitting thread holds the lock through each whole check, its
 /// system calls inside: run AM's frame has 3.4 ms of `VirtualProtect` and
@@ -1253,8 +1253,9 @@ impl std::ops::DerefMut for Held {
 /// stay under it). By hand (`bench_tests::faults_beside_a_check_that_guards_again`,
 /// a check guarding 256 runs again beside a thread whose writes fault): the
 /// longest wait of a write 400-560 us held, 113-180 us let go, and 1.7
-/// times the writes done meanwhile. On when a run shows the handler's wait
-/// gone and the pictures right.
+/// times the writes done meanwhile. Runs AZ and BA (2026-11-26): pictures
+/// right, no fault lost; with the rest of that branch the submitting thread
+/// 52 ms a frame against 60, the frame 93 ms against 96-100.
 ///
 /// Why the order stays right. Today the lock makes "make the run read-only,
 /// then note it guarded and clean" one step for every other holder. Let go,
@@ -1293,7 +1294,7 @@ impl std::ops::DerefMut for Held {
 /// letting the guards go and taking them again: it only asks Windows.
 fn guard_unlocked() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_UNLOCKED").is_some_and(|v| v == "1"));
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_UNLOCKED").is_none_or(|v| v != "0"));
     #[cfg(test)]
     let on = on || UNLOCKED_HERE.get();
     on

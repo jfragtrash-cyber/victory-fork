@@ -3231,6 +3231,8 @@ pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
         return false;
     }
     line.line.push(Late::Signal(fence, value));
+    #[cfg(feature = "diagnostics")]
+    crate::fence::pace::signal_lined(fence, value);
     LATE_STATS[14].fetch_add(1, Ordering::Relaxed);
     drop(line);
     // A signal alone (behind a settle under way) has no flight to wake
@@ -5221,7 +5223,11 @@ impl Host {
                     landed.push((flight.lists, flight.order));
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
-                Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
+                Late::Signal(fence, value) => {
+                    #[cfg(feature = "diagnostics")]
+                    crate::fence::pace::signal_taken(fence, value, landing);
+                    crate::fence::set(fence as crate::object::This, value)
+                }
             }
         }
         if last > 0 {

@@ -171,16 +171,22 @@ pub(crate) mod pace {
     }
 
     /// The title's `Signal` calls on a queue not yet at the fence:
-    /// fence, value, when, frame.
-    static QUEUED: Mutex<Vec<(usize, u64, Instant, u64)>> = Mutex::new(Vec::new());
+    /// fence, value, when, frame, when it went behind the flights in the air
+    /// (every submission before it prepared: [`signal_lined`]), when the
+    /// thread that lands flights took it (the card done with them:
+    /// [`signal_taken`]).
+    #[allow(clippy::type_complexity)]
+    static QUEUED: Mutex<Vec<(usize, u64, Instant, u64, Option<Instant>, Option<Instant>)>> = Mutex::new(Vec::new());
     /// The thread that presents.
     static RENDER: AtomicU32 = AtomicU32::new(0);
     /// Since the last line: waits already met; waits not met; of those,
     /// the render thread's; reached waits, their microseconds, their
     /// frames between; the render thread's reached waits and microseconds;
     /// signals set, their microseconds since the title's call, their
-    /// frames between.
-    static N: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+    /// frames between; signals set with all three times, and their
+    /// microseconds from the call to the line, from the line to the
+    /// landing thread's taking, from that to the setting.
+    static N: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
     static SAID: AtomicU64 = AtomicU64::new(0);
     static LINE_AT: AtomicU64 = AtomicU64::new(0);
 
@@ -224,7 +230,24 @@ pub(crate) mod pace {
     pub(crate) fn signal_called(fence: usize, value: u64) {
         let mut queued = QUEUED.lock().unwrap_or_else(|e| e.into_inner());
         if queued.len() < 4096 {
-            queued.push((fence, value, Instant::now(), crate::queue::presented()));
+            queued.push((fence, value, Instant::now(), crate::queue::presented(), None, None));
+        }
+    }
+
+    /// The signal went behind the flights in the air (`crate::host::late_signal`).
+    pub(crate) fn signal_lined(fence: usize, value: u64) {
+        let mut queued = QUEUED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(q) = queued.iter_mut().find(|q| q.0 == fence && q.1 == value && q.4.is_none()) {
+            q.4 = Some(Instant::now());
+        }
+    }
+
+    /// The thread that lands flights took the signal at `taken`, with the
+    /// flights before it.
+    pub(crate) fn signal_taken(fence: usize, value: u64, taken: Instant) {
+        let mut queued = QUEUED.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(q) = queued.iter_mut().find(|q| q.0 == fence && q.1 == value && q.5.is_none()) {
+            q.5 = Some(taken);
         }
     }
 
@@ -233,8 +256,15 @@ pub(crate) mod pace {
         let render = RENDER.load(Ordering::Relaxed);
         {
             let mut queued = QUEUED.lock().unwrap_or_else(|e| e.into_inner());
-            queued.retain(|&(f, v, at, called)| {
+            queued.retain(|&(f, v, at, called, lined, taken)| {
                 let done = f == fence as usize && v <= value;
+                if done && let (Some(lined), Some(taken)) = (lined, taken) {
+                    let us = |a: Instant, b: Instant| b.saturating_duration_since(a).as_micros() as u64;
+                    N[11].fetch_add(1, Ordering::Relaxed);
+                    N[12].fetch_add(us(at, lined), Ordering::Relaxed);
+                    N[13].fetch_add(us(lined, taken), Ordering::Relaxed);
+                    N[14].fetch_add(us(taken, Instant::now()), Ordering::Relaxed);
+                }
                 if done {
                     N[8].fetch_add(1, Ordering::Relaxed);
                     N[9].fetch_add(at.elapsed().as_micros() as u64, Ordering::Relaxed);
@@ -288,7 +318,9 @@ pub(crate) mod pace {
         let per = |a: f64, b: f64| if b > 0.0 { a / b } else { 0.0 };
         tracing::info!(
             "pace, per frame: fence waits already met {:.2}, not met {:.2} (the render thread's {:.2}); a wait is met {:.1} ms and {:.2} frames after it was asked \
-             (the render thread's: {:.1} ms, {:.1} ms a frame); the title's queue signals: {:.2} a frame, a fence is set {:.1} ms and {:.2} frames after the title's Signal call",
+             (the render thread's: {:.1} ms, {:.1} ms a frame); the title's queue signals: {:.2} a frame, a fence is set {:.1} ms and {:.2} frames after the title's Signal call; \
+             of {:.2} a frame timed throughout: {:.1} ms until it went behind the flights (everything before it prepared), {:.1} ms more until the \
+             landing thread took it (the card done), {:.1} ms landing",
             n[0] / frames,
             n[1] / frames,
             n[2] / frames,
@@ -299,6 +331,10 @@ pub(crate) mod pace {
             n[8] / frames,
             per(n[9], n[8]) / 1e3,
             per(n[10], n[8]),
+            n[11] / frames,
+            per(n[12], n[11]) / 1e3,
+            per(n[13], n[11]) / 1e3,
+            per(n[14], n[11]) / 1e3,
         );
     }
 }

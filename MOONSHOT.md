@@ -507,3 +507,15 @@ already reach.
 - 2026-11-26, night. Run AS (mimalloc for our memory): no gain, rather
   worse (108-112 ms against 105-108; the submitting thread's user time 53
   ms a frame against 35). Taken out again; the system heap stays.
+- 2026-11-26, night. The guards' block sets are bits now (branch
+  perf-guards, merged): one frame of checks of 2,000 clean blocks 13-18 ms
+  -> 0.09 ms in its microbenchmark. Run AT (agents compiling beside it,
+  the card itself ~8 % slower than in run AL): the submitting thread's
+  `guard` 6.5 -> 4.3 ms a frame and `hole_end` 1.6 -> 0 over the whole run;
+  the frame within the noise (108-125 ms).
+- 2026-11-26, night. Run AU times a fence's way (`pace`, new): of the
+  ~107 ms from the title's Signal to the fence set, ~52 ms until it goes
+  behind the flights (the submitting thread still preparing what came
+  before it), ~45 ms more until the landing thread takes it (the card done
+  with those submissions), ~10.5 ms landing. Both the preparing and the
+  card are on the way.

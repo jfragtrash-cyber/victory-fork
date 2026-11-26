@@ -573,3 +573,9 @@ already reach.
   is ~75 % busy (title lists 47-66 ms a frame): it becomes the limit again
   once the preparing is ~20 ms shorter, and then the translator's switches
   (`VICTORY_GROUP_MERGE`, once a same-scene run clears it) are next.
+- 2026-11-26, morning. Run BC (`VICTORY_SPREAD_FILLS=1`: a list's fills
+  of upload memory that follow one another made on the kept threads, 32 a
+  job, waited for before the next other step): play 92-96 ms a frame at
+  4,627 draws (BA 86-95 at 4,262); the fence's way 59 ms = 32 to the line
+  + 19 the card + 7.5 landing (BA 84). The frame no longer follows the
+  fence's way one for one: what the title's own threads do comes next.

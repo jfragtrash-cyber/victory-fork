@@ -1925,6 +1925,29 @@ fn spread_later(shadow: &Shadow, from: usize, to: usize) -> bool {
     })
 }
 
+/// Makes the copies `(destination, source, bytes)` of title memory into
+/// host memory, `per` of them a job on the kept threads, the last ones on
+/// this thread, and waits for all ([`crate::host`]'s fills of upload
+/// memory: `VICTORY_SPREAD_FILLS`).
+pub(crate) fn copy_spread(copies: &[(usize, usize, usize)], per: usize) {
+    let per = per.max(1);
+    if copies.len() <= per {
+        copy_piece(copies);
+        return;
+    }
+    let left: Left = Arc::new((Mutex::new(0), std::sync::Condvar::new()));
+    let mut chunks = copies.chunks(per);
+    let last = chunks.next_back();
+    for chunk in chunks {
+        let piece = chunk.to_vec();
+        send_wide(Box::new(move || copy_piece(&piece)), &left);
+    }
+    if let Some(last) = last {
+        copy_piece(last);
+    }
+    wait_wide(&left);
+}
+
 /// Hands `job` to the kept threads; `left` counts it until it is done.
 fn send_wide(job: Job, left: &Left) {
     let workers = workers();

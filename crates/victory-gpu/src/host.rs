@@ -7362,7 +7362,32 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        // Fills one after another, made side by side (`spread_fills`).
+        let mut fills: Vec<(usize, usize, usize)> = Vec::new();
+        let flush_fills = |fills: &mut Vec<(usize, usize, usize)>| {
+            if fills.is_empty() {
+                return;
+            }
+            let started = std::time::Instant::now();
+            crate::shadow::copy_spread(fills, 32);
+            preparing(0, started.elapsed().as_micros() as u64);
+            preparing(1, fills.iter().map(|f| f.2 as u64).sum());
+            fills.clear();
+        };
         for step in &self.deferred().copies {
+            if spread_fills() {
+                if let &Step::Fill(dst, src, len) = step {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        add(C::Copies, 1);
+                        add(C::CopyBytes, len as u64);
+                        fill_check::runs(src, len);
+                    }
+                    fills.push((dst, src, len));
+                    continue;
+                }
+                flush_fills(&mut fills);
+            }
             let started = std::time::Instant::now();
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
@@ -7442,7 +7467,21 @@ impl HostList {
             preparing(0, started.elapsed().as_micros() as u64);
             preparing(1, copied as u64);
         }
+        flush_fills(&mut fills);
     }
+}
+
+/// Whether a list's fills of upload memory that follow one another (with
+/// no step between them that writes title memory or reads what they
+/// write) are made side by side on the kept threads, 32 a job, and waited
+/// for before the next other step (`VICTORY_SPREAD_FILLS=1`; off).
+///
+/// Run BA: ~16,000 fills a frame (8.5 MB, a few hundred bytes each), 6.3
+/// ms a frame of the submitting thread in `copy_mapped`, mostly each
+/// copy's own cost rather than its bytes.
+fn spread_fills() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPREAD_FILLS").is_some_and(|v| v == "1"))
 }
 
 /// Whether the pass over the title's placed descriptor heaps at a

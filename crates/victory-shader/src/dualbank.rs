@@ -23,15 +23,19 @@
 //! - Lane-identity instructions are rewritten: `v_readlane`/`v_writelane`/`v_readfirstlane`
 //!   pick the bank by bit 5 of the lane, `v_mbcnt_lo`/`_hi` count the other bank's bits,
 //!   `ds_bpermute` reads both banks and picks by bit 5 of the lane it names, and branches on
-//!   EXEC or VCC being zero test both halves of the pair. None of the added code writes SCC
-//!   or VCC.
+//!   EXEC or VCC being zero test both halves of the pair. The added code leaves SCC and VCC
+//!   as they were (a far jump it writes for a branch the longer code puts out of reach saves
+//!   SCC and gives it back).
+//! - A program of more than 124 VGPRs has no room for bank 1 in the machine word's 256: its
+//!   bank 1 instructions name bank 0's numbers and say so in [`Banks`], which the IR applies
+//!   (bank 1 is then `K` up in the IR's wider VGPR numbers, the scratch VGPRs at `2K`).
 //!
 //! Refused (with a reason), for this first version: thread groups whose dimensions are not
-//! powers of two, more than 124 VGPRs, no spare SGPRs, program-counter instructions
-//! (`s_getpc_b64`...: inserted code moves the program), scratch memory and LDS loads from
-//! buffers (per-lane addresses the two banks would share), `ds_permute_b32`,
-//! `ds_append`/`ds_consume`/ordered counts/GWS, `*_addtid`, and SDWA or DPP forms of the
-//! instructions bank 1 has to rewrite (VOPC, VOP2 with an implicit VCC).
+//! powers of two, more than 249 VGPRs, no spare SGPRs, program-counter instructions other
+//! than far jumps (`s_getpc_b64` of a table: inserted code moves the program), scratch
+//! memory and LDS loads from buffers (per-lane addresses the two banks would share),
+//! `ds_permute_b32`, `ds_append`/`ds_consume`/ordered counts/GWS, `*_addtid`, and SDWA or
+//! DPP forms of the instructions bank 1 has to rewrite (VOPC, VOP2 with an implicit VCC).
 //! shortcut: host waves are taken to hold 32 consecutive threads of a one-dimensional
 //! group (the host group here is `[n, 1, 1]`), as every GPU this ran on does.
 
@@ -41,6 +45,31 @@ use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
 
 /// Why a program is not rewritten.
 type Why = &'static str;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: every branch written as a far jump ([`branch`]), as one the rewrite has put out of
+    /// its offset's reach is.
+    pub(crate) static ALL_FAR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests: any program numbered as one of more than 124 VGPRs is ([`Banks`]).
+    pub(crate) static ALL_WIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Every branch written as a far jump ([`ALL_FAR`]).
+fn all_far() -> bool {
+    #[cfg(test)]
+    return ALL_FAR.get();
+    #[cfg(not(test))]
+    false
+}
+
+/// Every program numbered as one of more than 124 VGPRs ([`ALL_WIDE`]).
+fn all_wide() -> bool {
+    #[cfg(test)]
+    return ALL_WIDE.get();
+    #[cfg(not(test))]
+    false
+}
 
 const EXEC_LO: u32 = 126;
 const EXEC_HI: u32 = 127;
@@ -77,6 +106,82 @@ struct Regs {
 
 const SCRATCH_VGPRS: u32 = 7;
 
+/// The machine word's VGPR field of the first scratch VGPR in a program of more than 124
+/// ([`Banks`]): the fields from it up name the scratch VGPRs in every instruction.
+const SCRATCH_FIELD: u32 = 256 - SCRATCH_VGPRS;
+
+/// What the IR ([`crate::ir::build_banked`]) must know of a rewritten program: that it is one
+/// (its parked lane masks are pairs of bank dwords), and the VGPR numbering of one of more
+/// than 124 VGPRs (`wide`), whose bank 1 does not fit the machine word's 256 (the volumetric
+/// fog programs: 129 and 156). Those words name bank 1's registers by bank 0's numbers and
+/// the scratch VGPRs from [`SCRATCH_FIELD`]; the IR puts each instruction's VGPRs in place:
+/// bank 1's `K` up, the scratch ones at `2K`. DXIL has no register limit of its own: the
+/// host's compiler spills where it must.
+#[derive(Debug, Clone)]
+pub struct Banks {
+    /// Numbered past the machine word's VGPRs.
+    wide: bool,
+    /// The program's VGPRs (bank 1's offset).
+    k: u16,
+    /// Byte offsets of the instructions that name bank 1's registers, in order.
+    bank1: Vec<usize>,
+}
+
+impl Banks {
+    /// The VGPR numbers of the instruction at `offset` put in place.
+    pub(crate) fn remap(&self, offset: usize, fields: &mut gfx10::Fields) {
+        if !self.wide {
+            return;
+        }
+        let base = if self.bank1.binary_search(&offset).is_ok() {
+            self.k
+        } else {
+            0
+        };
+        let (k, scratch) = (self.k, SCRATCH_FIELD as u16);
+        vgprs_mut(fields, |reg| {
+            *reg = if *reg >= scratch {
+                2 * k + (*reg - scratch)
+            } else {
+                *reg + base
+            };
+        });
+    }
+}
+
+/// `f` on every VGPR number `fields` names.
+fn vgprs_mut(fields: &mut gfx10::Fields, f: impl Fn(&mut u16)) {
+    use gfx10::{Fields, Operand};
+    let mut each = |o: &mut Operand| {
+        if let Operand::Vector { reg, .. } = o {
+            f(reg);
+        }
+    };
+    match fields {
+        Fields::Sop { dst, src, .. } => dst.iter_mut().chain(src).for_each(&mut each),
+        Fields::Sopp { .. } | Fields::Smem { .. } => {}
+        Fields::Valu(v) => {
+            v.dst
+                .iter_mut()
+                .chain(&mut v.carry)
+                .chain(&mut v.src)
+                .for_each(&mut each);
+        }
+        Fields::Vintrp { dst, src, attr } => [dst, src, attr].into_iter().for_each(&mut each),
+        Fields::Ds {
+            dst, addr, data, ..
+        } => {
+            dst.iter_mut().chain(addr).chain(data).for_each(&mut each);
+        }
+        Fields::Buffer { data, addr, .. } => data.iter_mut().chain([addr]).for_each(&mut each),
+        Fields::Image { data, addr, .. } => [data].into_iter().chain(addr).for_each(&mut each),
+        Fields::Flat {
+            dst, addr, data, ..
+        } => dst.iter_mut().chain(addr).chain(data).for_each(&mut each),
+        Fields::Exp { src, .. } => src.iter_mut().flatten().for_each(&mut each),
+    }
+}
+
 fn op(encoding: Encoding, name: &str) -> Result<u32, Why> {
     gfx10::opcode(encoding, name)
         .map(u32::from)
@@ -96,10 +201,17 @@ struct Out {
     words: Vec<u32>,
     /// Bank whose EXEC real EXEC holds now (`None`: unknown).
     real: Option<u32>,
+    /// Bank whose registers the instructions pushed now name (for [`Banks`]).
+    bank: u32,
+    /// Words where an instruction of bank 1 starts.
+    bank1: Vec<usize>,
 }
 
 impl Out {
     fn push(&mut self, w: &[u32]) {
+        if self.bank == 1 {
+            self.bank1.push(self.words.len());
+        }
         self.words.extend_from_slice(w);
     }
     fn sop1(&mut self, name: &str, sdst: u32, ssrc0: u32) -> Result<(), Why> {
@@ -143,6 +255,9 @@ impl Out {
     }
     /// Real EXEC to `exec` (a scalar code); the bank it belongs to, if any, for [`Out::real`].
     fn exec(&mut self, exec: u32, bank: Option<u32>) -> Result<(), Why> {
+        if let Some(b) = bank {
+            self.bank = b;
+        }
         if bank.is_some() && self.real == bank {
             return Ok(());
         }
@@ -156,12 +271,33 @@ impl Out {
     }
 }
 
-/// The program rewritten for dual-bank execution, or why not.
-pub fn transform(native: &NativeProgram) -> Result<NativeProgram, ShaderError> {
+/// The program rewritten for dual-bank execution, and what the IR must know of it ([`Banks`];
+/// build it with [`crate::spill::build_banked`]); or why not.
+pub fn transform(native: &NativeProgram) -> Result<(NativeProgram, Banks), ShaderError> {
     rewrite(native).map_err(|what| ShaderError::Unsupported { offset: 0, what })
 }
 
-fn rewrite(native: &NativeProgram) -> Result<NativeProgram, Why> {
+/// [`rewrite_with`] until every branch reaches: the rewrite about doubles the code, and a
+/// branch whose 16-bit offset no longer reaches its target is written as a far jump in the next
+/// round (the cascaded shadows' 169 KB compute program has such branches).
+fn rewrite(native: &NativeProgram) -> Result<(NativeProgram, Banks), Why> {
+    let mut long = std::collections::HashSet::new();
+    loop {
+        let mut too_far = Vec::new();
+        match rewrite_with(native, &long, &mut too_far) {
+            Err(_) if !too_far.is_empty() => long.extend(too_far),
+            r => return r,
+        }
+    }
+}
+
+/// The rewrite, with the branches of the instructions in `long` written as far jumps; the
+/// others that do not reach are added to `too_far`.
+fn rewrite_with(
+    native: &NativeProgram,
+    long: &std::collections::HashSet<usize>,
+    too_far: &mut Vec<usize>,
+) -> Result<(NativeProgram, Banks), Why> {
     if native.stage != HwStage::Cs || !native.wave64 {
         return Err("dual-bank: not a console wave64 compute program");
     }
@@ -176,9 +312,12 @@ fn rewrite(native: &NativeProgram) -> Result<NativeProgram, Why> {
     }
     let group = x * y * z;
     let k = u32::from(native.vgprs).max(3);
-    if 2 * k + SCRATCH_VGPRS > 256 {
-        return Err("dual-bank: more than 124 VGPRs");
+    // past 124 VGPRs, bank 1 by bank 0's numbers and the scratch VGPRs at the top ([`Banks`])
+    let wide = 2 * k + SCRATCH_VGPRS > 256 || all_wide();
+    if wide && k > SCRATCH_FIELD {
+        return Err("dual-bank: more than 249 VGPRs");
     }
+    let (field_k, scratch) = if wide { (0, SCRATCH_FIELD) } else { (k, 2 * k) };
     let insts = gfx10::decode(&native.code).map_err(|_| "dual-bank: code that does not decode")?;
     // the spare SGPRs: past every SGPR the program names (and the ones the hardware sets)
     // (the trap temporaries ttmp0-6 first: compute code never names them, and the
@@ -208,15 +347,15 @@ fn rewrite(native: &NativeProgram) -> Result<NativeProgram, Why> {
         e
     };
     let r = Regs {
-        k,
+        k: field_k,
         e,
-        vx: 2 * k,
-        vy: 2 * k + 1,
-        vp: 2 * k + 2,
-        vq: 2 * k + 3,
-        vz: 2 * k + 4,
-        vr0: 2 * k + 5,
-        vr1: 2 * k + 6,
+        vx: scratch,
+        vy: scratch + 1,
+        vp: scratch + 2,
+        vq: scratch + 3,
+        vz: scratch + 4,
+        vr0: scratch + 5,
+        vr1: scratch + 6,
         st: e + 2,
         sz: e + 4,
         sa: e + 5,
@@ -225,6 +364,8 @@ fn rewrite(native: &NativeProgram) -> Result<NativeProgram, Why> {
     let mut out = Out {
         words: Vec::new(),
         real: None,
+        bank: 0,
+        bank1: Vec::new(),
     };
     prologue(&mut out, &r, cs, group)?;
     // instruction index by byte offset, for branch targets
@@ -233,12 +374,26 @@ fn rewrite(native: &NativeProgram) -> Result<NativeProgram, Why> {
         .enumerate()
         .map(|(n, i)| (i.offset, n))
         .collect();
-    let targets: std::collections::HashSet<usize> =
-        insts.iter().filter_map(branch_target).collect();
+    let far = far_jumps(&insts, native.code.len(), &index_of)?;
+    let targets: std::collections::HashSet<usize> = insts
+        .iter()
+        .filter_map(branch_target)
+        .chain(far.iter().map(|j| insts[j.target].offset))
+        .collect();
     let mut starts = Vec::with_capacity(insts.len());
-    // (word of a branch in `out`, the instruction index it goes to)
-    let mut fixups: Vec<(usize, usize)> = Vec::new();
+    // (word of a branch in `out`, the instruction index it goes to, its own index)
+    let mut fixups: Vec<(usize, usize, usize)> = Vec::new();
+    // branches written as far jumps: (word of the `s_getpc_b64`, of the literal, the target)
+    let mut jumps: Vec<(usize, usize, usize)> = Vec::new();
+    // far jumps: (word of the `s_getpc_b64`, word of the addition's literal) by far jump
+    let mut far_words: Vec<(Option<usize>, Option<usize>)> = vec![(None, None); far.len()];
     for (n, i) in insts.iter().enumerate() {
+        if let Some(j) = far.iter().position(|j| j.getpc == n) {
+            far_words[j].0 = Some(out.words.len());
+        }
+        if let Some(j) = far.iter().position(|j| j.add == n) {
+            far_words[j].1 = Some(out.words.len() + 1);
+        }
         if targets.contains(&i.offset) {
             out.real = None;
         }
@@ -281,18 +436,20 @@ fn rewrite(native: &NativeProgram) -> Result<NativeProgram, Why> {
                             "s_cbranch_execz"
                         };
                         let o = op(Encoding::Sopp, to)?;
-                        fixups.push((out.words.len(), t));
-                        out.push(&[0xBF80_0000 | o << 16]);
+                        let word = 0xBF80_0000 | o << 16;
+                        let how = (long.contains(&n) || all_far(), &mut fixups, &mut jumps);
+                        branch(&mut out, &r, to, word, (n, t), how)?;
                     }
                     n if n.starts_with("s_cbranch_cdbg") || n == "s_setkill" => {
                         return Err("dual-bank: a debug or kill branch");
                     }
-                    _ => {
-                        if let Some(t) = target {
-                            fixups.push((out.words.len(), t));
+                    _ => match target {
+                        Some(t) => {
+                            let how = (long.contains(&n) || all_far(), &mut fixups, &mut jumps);
+                            branch(&mut out, &r, name, i.words[0], (n, t), how)?;
                         }
-                        out.push(&i.words);
-                    }
+                        None => out.push(&i.words),
+                    },
                 }
                 if target.is_some() {
                     out.real = None;
@@ -344,22 +501,50 @@ fn rewrite(native: &NativeProgram) -> Result<NativeProgram, Why> {
             Encoding::Scratch => return Err("dual-bank: scratch memory"),
             Encoding::Vintrp | Encoding::Exp => return Err("dual-bank: not a compute instruction"),
         }
-        if name == "s_getpc_b64"
-            || name == "s_setpc_b64"
+        let far_jump = far.iter().any(|j| j.getpc == n || j.setpc == n);
+        if (name == "s_getpc_b64" || name == "s_setpc_b64") && !far_jump
             || name == "s_swappc_b64"
             || name.starts_with("s_call")
         {
             return Err("dual-bank: program-counter instructions");
         }
+        if name == "s_setpc_b64" {
+            out.real = None;
+        }
+    }
+    // far jumps: the literal is the distance from the `s_getpc_b64`'s next word to the target
+    let far_words = far_words
+        .iter()
+        .zip(&far)
+        .map(|(&(pc, lit), j)| match (pc, lit) {
+            (Some(pc), Some(lit)) => Ok((pc, lit, j.target, j.subtract)),
+            _ => Err("dual-bank: a far jump out of order"),
+        });
+    let jumps = jumps.iter().map(|&(pc, lit, t)| Ok((pc, lit, t, false)));
+    for jump in far_words.chain(jumps) {
+        let (pc, lit, t, subtract) = jump?;
+        let to = 4 * (starts[t] as i64 - (pc as i64 + 1));
+        let to = if subtract { -to } else { to };
+        out.words[lit] = i32::try_from(to).map_err(|_| "dual-bank: a far jump too far")? as u32;
     }
     // branch offsets in dwords from the word after the branch
-    for (at, t) in fixups {
+    for (at, t, n) in fixups {
         let to = starts[t] as i64 - (at as i64 + 1);
-        let imm = i16::try_from(to).map_err(|_| "dual-bank: a branch too far after the rewrite")?;
-        out.words[at] = out.words[at] & 0xFFFF_0000 | u32::from(imm as u16);
+        match i16::try_from(to) {
+            Ok(imm) => out.words[at] = out.words[at] & 0xFFFF_0000 | u32::from(imm as u16),
+            Err(_) => too_far.push(n),
+        }
+    }
+    if !too_far.is_empty() {
+        return Err("dual-bank: a branch too far after the rewrite");
     }
     let host = group.div_ceil(64) * 32;
-    Ok(NativeProgram {
+    let banks = Banks {
+        wide,
+        k: k as u16,
+        bank1: out.bank1.iter().map(|w| 4 * w).collect(),
+    };
+    let program = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
         vgprs: (2 * k + SCRATCH_VGPRS) as u16,
@@ -370,7 +555,123 @@ fn rewrite(native: &NativeProgram) -> Result<NativeProgram, Why> {
             threads: [host, 1, 1],
         }),
         code: out.words.iter().flat_map(|w| w.to_le_bytes()).collect(),
-    })
+    };
+    Ok((program, banks))
+}
+
+/// A far jump: `s_getpc_b64 s[n:n+1]`, `s_add_u32` (or `s_sub_u32`) `sn, sn, literal`, a carry
+/// into `s(n+1)`, `s_setpc_b64 s[n:n+1]`, the form the console's compiler gives a branch past
+/// the reach of a 16-bit offset (seen in one compute program of the cascaded shadows, 169 KB
+/// of code, as the early-out to its end). By instruction index.
+struct FarJump {
+    getpc: usize,
+    add: usize,
+    setpc: usize,
+    target: usize,
+    subtract: bool,
+}
+
+/// The far jumps among `insts` (as [`gfx10::control`] resolves them). The rewrite keeps the
+/// four instructions in order and in one piece, and gives the addition the literal that
+/// reaches the target's rewritten code.
+fn far_jumps(
+    insts: &[Instruction],
+    len: usize,
+    index_of: &std::collections::HashMap<usize, usize>,
+) -> Result<Vec<FarJump>, Why> {
+    let mut out = Vec::new();
+    for (setpc, i) in insts.iter().enumerate() {
+        if i.name() != Some("s_setpc_b64") {
+            continue;
+        }
+        let before = |at: usize| insts[..insts.partition_point(|i| i.offset < at)].last();
+        let Ok(gfx10::Flow::Jump(t)) = gfx10::control(i, len, before) else {
+            continue;
+        };
+        let target = *index_of
+            .get(&t)
+            .ok_or("dual-bank: a far jump into an instruction")?;
+        let n = i.words[0] & 0xFF;
+        let (mut getpc, mut add) = (None, None);
+        for k in (setpc.saturating_sub(4)..setpc).rev() {
+            let w = insts[k].words[0];
+            match insts[k].name() {
+                Some(op @ ("s_add_u32" | "s_sub_u32"))
+                    if w >> 16 & 0x7F == n && w & 0xFF == n && w >> 8 & 0xFF == LITERAL =>
+                {
+                    add = add.or(Some((k, op == "s_sub_u32")));
+                }
+                Some("s_getpc_b64") if w >> 16 & 0x7F == n => {
+                    getpc = Some(k);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let (Some(getpc), Some((add, subtract))) = (getpc, add) else {
+            return Err("dual-bank: a far jump of another form");
+        };
+        if add < getpc {
+            return Err("dual-bank: a far jump of another form");
+        }
+        out.push(FarJump {
+            getpc,
+            add,
+            setpc,
+            target,
+            subtract,
+        });
+    }
+    Ok(out)
+}
+
+/// A branch (SOPP `word`, of instruction `at.0`, to instruction `at.1`): as it is, its offset
+/// filled in once the code is laid out; or with `far.0` as a far jump through the scratch pair,
+/// SCC kept through it (a scratch SGPR holds it), a conditional one stepping over it on the
+/// reverse condition.
+#[allow(clippy::type_complexity)]
+fn branch(
+    out: &mut Out,
+    r: &Regs,
+    name: &str,
+    word: u32,
+    at: (usize, usize),
+    far: (
+        bool,
+        &mut Vec<(usize, usize, usize)>,
+        &mut Vec<(usize, usize, usize)>,
+    ),
+) -> Result<(), Why> {
+    let ((n, t), (long, fixups, jumps)) = (at, far);
+    if !long {
+        fixups.push((out.words.len(), t, n));
+        out.push(&[word]);
+        return Ok(());
+    }
+    let reverse = match name {
+        "s_branch" => None,
+        "s_cbranch_scc0" => Some("s_cbranch_scc1"),
+        "s_cbranch_scc1" => Some("s_cbranch_scc0"),
+        "s_cbranch_execz" => Some("s_cbranch_execnz"),
+        "s_cbranch_execnz" => Some("s_cbranch_execz"),
+        _ => return Err("dual-bank: a branch too far after the rewrite"),
+    };
+    if let Some(reverse) = reverse {
+        // over the 7 words below
+        out.push(&[0xBF80_0000 | op(Encoding::Sopp, reverse)? << 16 | 7]);
+    }
+    out.sop2("s_cselect_b32", r.sa, int(1), int(0))?;
+    let pc = out.words.len();
+    out.sop1("s_getpc_b64", r.st, 0)?;
+    out.sop2("s_add_u32", r.st, r.st, LITERAL)?;
+    jumps.push((pc, out.words.len(), t));
+    out.push(&[0]);
+    let high = if t > n { int(0) } else { MINUS_ONE };
+    out.sop2("s_addc_u32", r.st + 1, r.st + 1, high)?;
+    let cmp = op(Encoding::Sopc, "s_cmp_lg_u32")?;
+    out.push(&[0xBF00_0000 | cmp << 16 | int(0) << 8 | r.sa]);
+    out.sop1("s_setpc_b64", 0, r.st)?;
+    Ok(())
 }
 
 /// The byte offset a SOPP branch goes to.
@@ -426,6 +727,7 @@ fn scalars(i: &Instruction) -> Vec<(u32, u32)> {
 /// Console thread ids for both banks, and the console EXEC of the lanes the group has.
 fn prologue(out: &mut Out, r: &Regs, cs: ComputeIo, group: u32) -> Result<(), Why> {
     out.all_lanes()?;
+    out.bank = 0;
     // host thread h (v0) is console thread (h & ~31) * 2 + (h & 31) in bank 0, + 32 in bank 1
     out.push(&[0x1B << 25 | r.vz << 17 | LITERAL, 0xFFFF_FFE0]); // v_and_b32 vz, ~31, v0 (vsrc1 v0)
     out.push(&[0x25 << 25 | r.vr0 << 17 | (256 + r.vz)]); // v_add_nc_u32 vr0, vz, v0 (vsrc1 v0)
@@ -439,6 +741,7 @@ fn prologue(out: &mut Out, r: &Regs, cs: ComputeIo, group: u32) -> Result<(), Wh
     let (lx, ly) = (x.trailing_zeros(), y.trailing_zeros());
     let ids = cs.thread_id_vgprs();
     for (b, lin) in [(0, r.vr0), (1, r.vr1)] {
+        out.bank = b;
         let base = b * r.k;
         if ids >= 2 {
             // v1 = (lin >> lx) & (y - 1)
@@ -584,6 +887,7 @@ fn read_lane(out: &mut Out, r: &Regs, v: u32, lane: u32, dst: u32) -> Result<(),
     if (128..=192).contains(&lane) {
         let l = lane - 128;
         let bank = l >> 5;
+        out.bank = bank;
         out.vop3(
             "v_readlane_b32",
             dst,
@@ -594,7 +898,9 @@ fn read_lane(out: &mut Out, r: &Regs, v: u32, lane: u32, dst: u32) -> Result<(),
         return Ok(());
     }
     out.all_lanes()?;
+    out.bank = 0;
     out.vop3("v_readlane_b32", r.sa, [256 + v, lane, 0], None, None)?;
+    out.bank = 1;
     out.vop3("v_readlane_b32", r.sb, [256 + v + r.k, lane, 0], None, None)?;
     bit5(out, r, lane)?;
     out.vop1("v_mov_b32", r.vx, r.sa)?;
@@ -689,6 +995,7 @@ fn bpermute(out: &mut Out, r: &Regs, i: &Instruction) -> Result<(), Why> {
     };
     out.all_lanes()?;
     // each bank's data, 0 where its lane is outside the console EXEC
+    out.bank = 0;
     out.vop3(
         "v_cndmask_b32",
         r.vx,
@@ -696,6 +1003,7 @@ fn bpermute(out: &mut Out, r: &Regs, i: &Instruction) -> Result<(), Why> {
         None,
         None,
     )?;
+    out.bank = 1;
     out.vop3(
         "v_cndmask_b32",
         r.vy,
@@ -704,6 +1012,7 @@ fn bpermute(out: &mut Out, r: &Regs, i: &Instruction) -> Result<(), Why> {
         None,
     )?;
     for (b, result) in [(0u32, r.vr0), (1, r.vr1)] {
+        out.bank = b;
         let a = addr + b * r.k;
         bperm(out, r.vp, a, r.vx);
         bperm(out, r.vq, a, r.vy);
@@ -776,6 +1085,7 @@ fn vector(out: &mut Out, r: &Regs, i: &Instruction, name: &str) -> Result<(), Wh
             if (128..=192).contains(&lane) {
                 let l = lane - 128;
                 out.all_lanes()?;
+                out.bank = l >> 5;
                 out.vop3(
                     "v_writelane_b32",
                     vd + (l >> 5) * r.k,
@@ -787,12 +1097,15 @@ fn vector(out: &mut Out, r: &Regs, i: &Instruction, name: &str) -> Result<(), Wh
                 return Ok(());
             }
             out.all_lanes()?;
+            out.bank = 0;
             out.vop1("v_mov_b32", r.vx, 256 + vd)?;
+            out.bank = 1;
             out.vop1("v_mov_b32", r.vy, 256 + vd + r.k)?;
             out.vop3("v_writelane_b32", r.vx, [value, lane, 0], None, lit)?;
             out.vop3("v_writelane_b32", r.vy, [value, lane, 0], None, lit)?;
             bit5(out, r, lane)?;
             // bank 0 takes the write where the lane is in bank 0 (bit 5 clear)
+            out.bank = 0;
             out.vop3(
                 "v_cndmask_b32",
                 vd,
@@ -800,6 +1113,7 @@ fn vector(out: &mut Out, r: &Regs, i: &Instruction, name: &str) -> Result<(), Wh
                 None,
                 None,
             )?;
+            out.bank = 1;
             out.vop3(
                 "v_cndmask_b32",
                 vd + r.k,
@@ -1212,7 +1526,7 @@ fn dump_rewrite_around() {
         .into_iter()
         .find(|p| p.stage == HwStage::Cs)
         .expect("compute");
-    let dual = rewrite(&native).expect("rewrite");
+    let (dual, _) = rewrite(&native).expect("rewrite");
     for i in gfx10::decode(&dual.code).expect("decode") {
         if i.offset + 0x80 >= at && i.offset <= at + 0x40 {
             println!(

@@ -19,7 +19,7 @@ pub enum Operand {
         dwords: u8,
     },
     Vector {
-        reg: u8,
+        reg: u16,
         dwords: u8,
     },
     /// Inline constant or read-only special source, by operand code
@@ -670,7 +670,7 @@ fn scalar(code: u8, dwords: u8) -> Operand {
 
 fn vector(reg: u32, dwords: u8) -> Operand {
     Operand::Vector {
-        reg: reg as u8,
+        reg: reg as u8 as u16,
         dwords,
     }
 }

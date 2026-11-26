@@ -2299,3 +2299,272 @@ fn src_scc_reads_as_zero_or_one() {
         });
     }
 }
+
+/// The 64-bit result `body` leaves in `v[5:6]` for each case, the doubles `a` in `v[1:2]` and
+/// `b` in `v[3:4]` (the root constants), on every host: `check(backend, a, b, bits)`.
+fn f64_results(body: &[u32], cases: &[(f64, f64)], mut check: impl FnMut(&str, f64, f64, u64)) {
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(a, b)| f64_inputs(a, b)).collect();
+    let mut halves: [Vec<(String, usize, u32)>; 2] = [Vec::new(), Vec::new()];
+    for (h, half) in halves.iter_mut().enumerate() {
+        let mut words = body.to_vec();
+        words.push(vop1(0x001, 0, vgpr(5 + h as u8))); // v_mov_b32 v0, v5 (v6)
+        let shader = build_valu_cs(&words);
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            half.push((backend.to_owned(), i, got));
+        });
+    }
+    let [lo, hi] = halves;
+    assert_eq!(lo.len(), hi.len());
+    for ((backend, i, l), (_, _, h)) in lo.iter().zip(&hi) {
+        let (a, b) = cases[*i];
+        check(backend, a, b, u64::from(*l) | u64::from(*h) << 32);
+    }
+}
+
+/// The root constants that put `a` in `v[1:2]` and `b` in `v[3:4]`.
+fn f64_inputs(a: f64, b: f64) -> [u32; 4] {
+    let (a, b) = (a.to_bits(), b.to_bits());
+    [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32]
+}
+
+/// `got` is `want`, or both are NaN.
+fn same_double(backend: &str, what: &str, got: u64, want: f64) {
+    let g = f64::from_bits(got);
+    if want.is_nan() {
+        assert!(
+            g.is_nan(),
+            "{backend}: {what} = {g:e} ({got:#018x}), want NaN"
+        );
+    } else {
+        assert_eq!(
+            got,
+            want.to_bits(),
+            "{backend}: {what} = {g:e} ({got:#018x}), want {want:e}"
+        );
+    }
+}
+
+const F64_CASES: [(f64, f64); 12] = [
+    (1.0, 2.0),
+    (0.1, 0.2),
+    (-0.0, 0.0),
+    (0.0, -0.0),
+    (-0.0, -0.0),
+    (1.0e308, 1.0e308),
+    (5.0e-324, 5.0e-324),
+    (-3.5, 1.25),
+    (f64::NAN, 1.0),
+    (1.0, f64::NAN),
+    (f64::INFINITY, f64::NEG_INFINITY),
+    (std::f64::consts::PI, -std::f64::consts::E),
+];
+
+/// `v_add_f64` and `v_mul_f64` round once to nearest even and keep double denormals, with
+/// `abs` and `neg` on the sources, a scalar pair and an inline constant. (`v_add_f64` kept the
+/// volumetric fog programs from their dual-bank form.)
+#[test]
+fn v_add_and_mul_f64_are_ieee_double_operations() {
+    // v_add_f64 v[5:6], v[1:2], v[3:4]
+    f64_results(
+        &vop3(0x164, 5, vgpr(1), vgpr(3), 0),
+        &F64_CASES,
+        |backend, a, b, got| {
+            same_double(backend, &format!("{a:e} + {b:e}"), got, a + b);
+        },
+    );
+    // v_mul_f64 v[5:6], v[1:2], v[3:4]
+    f64_results(
+        &vop3(0x165, 5, vgpr(1), vgpr(3), 0),
+        &F64_CASES,
+        |backend, a, b, got| {
+            same_double(backend, &format!("{a:e} * {b:e}"), got, a * b);
+        },
+    );
+    // v_add_f64 v[5:6], |v[1:2]|, -v[3:4]
+    let body = vop3_mod(0x164, 5, vgpr(1), vgpr(3), 0, 1, 2, 0, false);
+    f64_results(&body, &F64_CASES, |backend, a, b, got| {
+        same_double(backend, &format!("|{a:e}| - {b:e}"), got, a.abs() - b);
+    });
+    // v_add_f64 v[5:6], v[1:2], s[2:3]
+    f64_results(
+        &vop3(0x164, 5, vgpr(1), sgpr(2), 0),
+        &F64_CASES,
+        |backend, a, b, got| {
+            same_double(backend, &format!("{a:e} + s {b:e}"), got, a + b);
+        },
+    );
+    // v_add_f64 v[5:6], v[1:2], 1.0
+    f64_results(
+        &vop3(0x164, 5, vgpr(1), 242, 0),
+        &F64_CASES,
+        |backend, a, _, got| {
+            same_double(backend, &format!("{a:e} + 1"), got, a + 1.0);
+        },
+    );
+    // v_add_f64 v[5:6], v[1:2], v[3:4] clamp: to [0, 1]
+    let body = vop3_mod(0x164, 5, vgpr(1), vgpr(3), 0, 0, 0, 0, true);
+    let cases = [(0.25, 0.5), (0.75, 0.5), (-3.0, 1.0), (-0.0, 0.0)];
+    f64_results(&body, &cases, |backend, a, b, got| {
+        same_double(
+            backend,
+            &format!("clamp({a:e} + {b:e})"),
+            got,
+            (a + b).clamp(0.0, 1.0),
+        );
+    });
+}
+
+/// `v_fma_f64` rounds once: `fma(a, b, -(a * b))` is the rounding error of the product, which
+/// a multiply and an add would give as zero.
+#[test]
+fn v_fma_f64_rounds_once() {
+    let mut body = vop3(0x165, 7, vgpr(1), vgpr(3), 0).to_vec(); // v_mul_f64 v[7:8], a, b
+    // v_fma_f64 v[5:6], v[1:2], v[3:4], -v[7:8]
+    body.extend(vop3_mod(
+        0x14c,
+        5,
+        vgpr(1),
+        vgpr(3),
+        vgpr(7),
+        0,
+        4,
+        0,
+        false,
+    ));
+    let cases = [
+        (1.0 + 2f64.powi(-30), 1.0 - 2f64.powi(-30)),
+        (0.1, 0.3),
+        (std::f64::consts::PI, std::f64::consts::E),
+        (3.0, 7.0),
+        (1.0e-300, 1.0e-20),
+    ];
+    f64_results(&body, &cases, |backend, a, b, got| {
+        let want = a.mul_add(b, -(a * b));
+        same_double(backend, &format!("fma({a:e}, {b:e}, -ab)"), got, want);
+    });
+}
+
+/// `v_min_f64` and `v_max_f64`: a NaN gives the other operand, and -0 orders below +0.
+#[test]
+fn v_min_and_max_f64_order_zeros_and_skip_nans() {
+    fn pick(max: bool, a: f64, b: f64) -> f64 {
+        match (a.is_nan(), b.is_nan()) {
+            (true, _) => b,
+            (_, true) => a,
+            _ if a == 0.0 && b == 0.0 => {
+                let negative = if max {
+                    a.is_sign_negative() && b.is_sign_negative()
+                } else {
+                    a.is_sign_negative() || b.is_sign_negative()
+                };
+                if negative { -0.0 } else { 0.0 }
+            }
+            _ if max => a.max(b),
+            _ => a.min(b),
+        }
+    }
+    for (op, max) in [(0x166u16, false), (0x167, true)] {
+        f64_results(
+            &vop3(op, 5, vgpr(1), vgpr(3), 0),
+            &F64_CASES,
+            |backend, a, b, got| {
+                let what = format!("{}({a:e}, {b:e})", if max { "max" } else { "min" });
+                same_double(backend, &what, got, pick(max, a, b));
+            },
+        );
+    }
+}
+
+/// The conversions between doubles and 32-bit integers and floats: exact into a double; out
+/// of one toward zero, clamped to the integer's range, a NaN to 0 (as Rust's `as` does).
+#[test]
+fn f64_conversions_match_the_isa() {
+    // v_cvt_f64_i32 / v_cvt_f64_u32 / v_cvt_f64_f32 v[5:6], v1
+    let words = [
+        0u32,
+        1,
+        0x8000_0000,
+        0xFFFF_FFFF,
+        0x3F80_0000,
+        0xC049_0FDB,
+        0x7F80_0000,
+    ];
+    let cases: Vec<(f64, f64)> = words
+        .iter()
+        .map(|&x| (f64::from_bits(u64::from(x)), 0.0))
+        .collect();
+    for (op, what) in [(0x004u16, "i32"), (0x016, "u32"), (0x010, "f32")] {
+        f64_results(&[vop1(op, 5, vgpr(1))], &cases, |backend, a, _, got| {
+            let x = a.to_bits() as u32;
+            let want = match what {
+                "i32" => f64::from(x as i32),
+                "u32" => f64::from(x),
+                _ => f64::from(f32::from_bits(x)),
+            };
+            // (a float denormal may reach the host's conversion flushed)
+            if what == "f32" && f32::from_bits(x).is_subnormal() && got << 1 == 0 {
+                return;
+            }
+            same_double(backend, &format!("{what} {x:#x} to f64"), got, want);
+        });
+    }
+    // v_cvt_i32_f64 / v_cvt_u32_f64 v0, v[1:2]
+    let values = [
+        0.0,
+        -0.75,
+        2.99,
+        -2.99,
+        2_147_483_647.5,
+        2_147_483_648.0,
+        -2_147_483_649.0,
+        4_294_967_295.9,
+        4.0e9,
+        1.0e20,
+        -1.0e20,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ];
+    let inputs: Vec<[u32; 4]> = values.iter().map(|&x| f64_inputs(x, 0.0)).collect();
+    for (op, signed) in [(0x003u16, true), (0x015, false)] {
+        let shader = build_valu_cs(&[vop1(op, 0, vgpr(1))]);
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let x = values[i];
+            let want = if signed { x as i32 as u32 } else { x as u32 };
+            assert_eq!(
+                got, want,
+                "{backend}: cvt({x:e}) = {got:#x}, want {want:#x}"
+            );
+        });
+    }
+}
+
+/// `v_cmp_*_f64`: ordered and unordered compares of doubles, into VCC.
+#[test]
+fn v_cmp_f64_compares_doubles() {
+    // v_cmp_<op>_f64 vcc, v[1:2], v[3:4]; v_mov_b32 v7, 1; v_cndmask_b32 v0, 0, v7, vcc
+    let ops: [(u32, &str, fn(f64, f64) -> bool); 5] = [
+        (0x21, "lt", |a, b| a < b),
+        (0x22, "eq", |a, b| a == b),
+        // ordered and unequal; unordered or less
+        (0x25, "lg", |a, b| {
+            a.partial_cmp(&b).is_some_and(|o| o.is_ne())
+        }),
+        (0x29, "nge", |a, b| {
+            a.partial_cmp(&b).is_none_or(|o| o.is_lt())
+        }),
+        (0x28, "u", |a, b| a.is_nan() || b.is_nan()),
+    ];
+    let inputs: Vec<[u32; 4]> = F64_CASES.iter().map(|&(a, b)| f64_inputs(a, b)).collect();
+    for (op, what, f) in ops {
+        let shader = build_valu_cs(&[
+            0x7C00_0000 | op << 17 | 3 << 9 | u32::from(vgpr(1)),
+            vop1(0x001, 7, 129),
+            0x01 << 25 | 7 << 9 | 128,
+        ]);
+        run_cases(&shader, &inputs, |backend, i, _, got| {
+            let (a, b) = F64_CASES[i];
+            assert_eq!(got, u32::from(f(a, b)), "{backend}: {a:e} {what} {b:e}");
+        });
+    }
+}

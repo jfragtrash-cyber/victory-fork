@@ -759,8 +759,8 @@ fn dual_bank_form(
             eprintln!("WAVE64-RETRY dual-bank: {e}");
         }
     };
-    let dual = crate::dualbank::transform(native).map_err(refused).ok()?;
-    let p = crate::spill::build(&dual).map_err(refused).ok()?;
+    let (dual, banks) = crate::dualbank::transform(native).map_err(refused).ok()?;
+    let p = crate::spill::build_banked(&dual, Some(&banks)).map_err(refused).ok()?;
     let lowered = |p: &ir::Program| -> Result<(HostShader, Option<u32>), ShaderError> {
         let st = structure::structure(p)?;
         let res = resource::track(p, &dual.layout, dual.stage, Some(&st))?;

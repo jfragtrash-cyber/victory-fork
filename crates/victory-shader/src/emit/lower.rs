@@ -2325,7 +2325,7 @@ impl<'a> Lower<'a> {
                         .bin(c, if signed { Bin::AShr } else { Bin::LShr }, x, left)
                 }
             };
-            self.write(inst, Reg::V(reg + k as u8), x, guard);
+            self.write(inst, Reg::V(reg + k as u16), x, guard);
         }
         Ok(())
     }
@@ -3558,7 +3558,7 @@ impl<'a> Lower<'a> {
             return Err("a global address not in VGPRs");
         };
         let word = |l: &mut Self, k: u8| -> Result<V, Why> {
-            let v = inst.read(Reg::V(areg + k)).ok_or("a global address")?;
+            let v = inst.read(Reg::V(areg + u16::from(k))).ok_or("a global address")?;
             l.i32_of(v)
         };
         let (lo, hi) = (word(self, 0)?, word(self, 1)?);
@@ -3594,7 +3594,7 @@ impl<'a> Lower<'a> {
             for k in 0..n {
                 let x = self.s.m.extract(c, r, u32::from(k));
                 let x = self.as_int(x);
-                self.write(inst, Reg::V(reg + k), x, guard);
+                self.write(inst, Reg::V(reg + u16::from(k)), x, guard);
             }
             return Ok(());
         }
@@ -3936,13 +3936,13 @@ impl<'a> Lower<'a> {
                 let x = self.src0.expect("checked");
                 self.as_float(x)
             }
-            Operand::Vector { reg, .. } | Operand::Scalar { code: reg, .. }
+            Operand::Vector { .. } | Operand::Scalar { .. }
                 if !matches!(op, Operand::Scalar { code: NULL, .. }) =>
             {
-                let r = if matches!(op, Operand::Vector { .. }) {
-                    Reg::V(reg)
-                } else {
-                    Reg::S(reg)
+                let r = match op {
+                    Operand::Vector { reg, .. } => Reg::V(reg),
+                    Operand::Scalar { code, .. } => Reg::S(code),
+                    _ => unreachable!(),
                 };
                 let val = inst.read(r).ok_or("an unread operand")?;
                 match self.floats.get(&val) {
@@ -5154,7 +5154,7 @@ impl<'a> Lower<'a> {
         };
         (0..n)
             .map(|k| {
-                let v = inst.read(Reg::V(reg + k)).ok_or("an unread operand")?;
+                let v = inst.read(Reg::V(reg + u16::from(k))).ok_or("an unread operand")?;
                 self.i32_of(v)
             })
             .collect()
@@ -7835,7 +7835,7 @@ impl<'a> Lower<'a> {
                 let indexed_src = name != "v_movreld_b32";
                 let value = if indexed_src {
                     let mut r = self.s.m.i32(0);
-                    for k in 0..=255u8.saturating_sub(sreg) {
+                    for k in 0..=511u16.saturating_sub(sreg) {
                         let Some(x) = inst.read(Reg::V(sreg + k)) else {
                             break;
                         };
@@ -7851,7 +7851,7 @@ impl<'a> Lower<'a> {
                 if name == "v_movrels_b32" {
                     return int(self, value);
                 }
-                for k in 0..=255u8.saturating_sub(dreg) {
+                for k in 0..=511u16.saturating_sub(dreg) {
                     let Some(_) = inst.write(Reg::V(dreg + k)) else {
                         break;
                     };
@@ -8282,6 +8282,9 @@ impl<'a> Lower<'a> {
                 let r = self.as_float(bits);
                 float(self, r)
             }
+            "v_add_f64" | "v_mul_f64" | "v_fma_f64" | "v_min_f64" | "v_max_f64"
+            | "v_cvt_f64_f32" | "v_cvt_f64_i32" | "v_cvt_f64_u32" | "v_cvt_i32_f64"
+            | "v_cvt_u32_f64" => self.valu_f64(inst, name, guard),
             "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
                 // Each source is f32, or with op_sel_hi the low (op_sel: high)
                 // f16 half; neg_hi is the absolute value here.
@@ -8718,6 +8721,159 @@ impl<'a> Lower<'a> {
             hi = self.s.m.bin(c, Bin::Xor, hi, sign);
         }
         Ok((lo, hi))
+    }
+
+    /// The double whose dwords are `lo` and `hi` (DXIL `MakeDouble`).
+    fn make_double(&mut self, lo: V, hi: V) -> V {
+        self.s.flags |= flags::DOUBLES;
+        let f64t = self.s.m.double();
+        self.s
+            .op(self.cur, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi])
+    }
+
+    /// The double constant `x`.
+    fn double_const(&mut self, x: f64) -> V {
+        let bits = x.to_bits();
+        let (lo, hi) = (self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32));
+        self.make_double(lo, hi)
+    }
+
+    /// The dwords (low, high) of the double `d` (DXIL `SplitDouble`).
+    fn split_double(&mut self, d: V) -> (V, V) {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let split_ty = self.s.m.named_struct("dx.types.splitdouble", vec![i32t, i32t]);
+        let split = self
+            .s
+            .op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[d]);
+        (self.s.m.extract(c, split, 0), self.s.m.extract(c, split, 1))
+    }
+
+    /// Operand `k` of a 64-bit float instruction as a double, with its input modifiers.
+    fn f64_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let (lo, hi) = self.f64_pair(inst, k)?;
+        Ok(self.make_double(lo, hi))
+    }
+
+    /// A double result: the output modifiers applied, its two dwords to `v[d:d+1]`.
+    fn write_f64(&mut self, inst: &Inst, d: V, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let c = self.cur;
+        let mut d = d;
+        if v.omod != 0 {
+            let factor = self.double_const([1.0, 2.0, 4.0, 0.5][usize::from(v.omod)]);
+            d = self.s.m.bin(c, Bin::Mul, d, factor);
+        }
+        if v.clamp {
+            // Saturate: to [0, 1], as the console's clamp does
+            let f64t = self.s.m.double();
+            d = self.s.op(c, "unary.f64", Attr::ReadNone, f64t, 7, &[d]);
+        }
+        let Some(Operand::Vector { reg, .. }) = v.dst else {
+            return Err("a 64-bit result outside VGPRs");
+        };
+        let (lo, hi) = self.split_double(d);
+        self.write(inst, Reg::V(reg), lo, guard);
+        self.write(inst, Reg::V(reg + 1), hi, guard);
+        Ok(())
+    }
+
+    /// The 64-bit float VALU operations, in host doubles (DXIL `double`, which a host with
+    /// `DoublePrecisionFloatShaderOps` runs, the RTX 3090 and WARP among them): rounded to
+    /// nearest even, denormals kept, as the console's default double mode does. Found as what
+    /// kept the volumetric fog programs from their dual-bank form: a wave sum of doubles
+    /// (`v_add_f64` over DPP moves and lane reads) that only the whole-wave recogniser lowered.
+    fn valu_f64(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Result<(), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() || v.opsel != 0 {
+            return Err("64-bit operand modifiers");
+        }
+        let c = self.cur;
+        let f64t = self.s.m.double();
+        let r = match name {
+            "v_add_f64" | "v_mul_f64" => {
+                let (a, b) = (self.f64_src(inst, 0)?, self.f64_src(inst, 1)?);
+                let op = if name == "v_add_f64" { Bin::Add } else { Bin::Mul };
+                self.s.m.bin(c, op, a, b)
+            }
+            "v_fma_f64" => {
+                let a = self.f64_src(inst, 0)?;
+                let b = self.f64_src(inst, 1)?;
+                let x = self.f64_src(inst, 2)?;
+                self.s.flags |= flags::DOUBLE_EXTENSIONS;
+                self.s
+                    .op(c, "tertiary.f64", Attr::ReadNone, f64t, 47, &[a, b, x])
+            }
+            "v_min_f64" | "v_max_f64" => {
+                let max = name == "v_max_f64";
+                let (al, ah) = self.f64_pair(inst, 0)?;
+                let (bl, bh) = self.f64_pair(inst, 1)?;
+                let (a, b) = (self.make_double(al, ah), self.make_double(bl, bh));
+                let op = if max { 35 } else { 36 };
+                let r = self.s.op(c, "binary.f64", Attr::ReadNone, f64t, op, &[a, b]);
+                // As `max_min`: of two zeros -0 orders below +0 (RDNA2 ISA), where DXIL's
+                // FMax/FMin give either.
+                let (rl, rh) = self.split_double(r);
+                let lows = self.s.m.bin(c, Bin::Or, al, bl);
+                let highs = self.s.m.bin(c, Bin::Or, ah, bh);
+                let magnitude = self.s.m.i32(0x7FFF_FFFF);
+                let highs = self.s.m.bin(c, Bin::And, highs, magnitude);
+                let either = self.s.m.bin(c, Bin::Or, lows, highs);
+                let zero = self.s.m.i32(0);
+                let zeros = self.s.m.cmp(c, pred::EQ, either, zero);
+                let op = if max { Bin::And } else { Bin::Or };
+                let sign = self.s.m.bin(c, op, ah, bh);
+                let rl = self.s.m.select(c, zeros, zero, rl);
+                let rh = self.s.m.select(c, zeros, sign, rh);
+                self.make_double(rl, rh)
+            }
+            "v_cvt_f64_f32" => {
+                let x = self.fsrc(inst, 0)?;
+                self.s.flags |= flags::DOUBLES;
+                self.s.m.cast(c, Cast::FpExt, x, f64t)
+            }
+            "v_cvt_f64_i32" | "v_cvt_f64_u32" => {
+                let x = self.src(inst, 0)?;
+                self.s.flags |= flags::DOUBLES | flags::DOUBLE_EXTENSIONS;
+                let op = if name == "v_cvt_f64_i32" {
+                    Cast::SiToFp
+                } else {
+                    Cast::UiToFp
+                };
+                self.s.m.cast(c, op, x, f64t)
+            }
+            _ => {
+                // v_cvt_i32_f64, v_cvt_u32_f64: toward zero, clamped to the integer's range,
+                // a NaN to 0 (RDNA2 ISA), where DXIL leaves values out of range undefined.
+                if v.clamp || v.omod != 0 {
+                    return Err("integer output modifiers");
+                }
+                let signed = name == "v_cvt_i32_f64";
+                let x = self.f64_src(inst, 0)?;
+                let (low, high) = if signed {
+                    (-2_147_483_648.0, 2_147_483_647.0)
+                } else {
+                    (0.0, 4_294_967_295.0)
+                };
+                let (low, high) = (self.double_const(low), self.double_const(high));
+                let nan = self.s.m.cmp(c, pred::UNO, x, x);
+                let below = self.s.m.cmp(c, pred::OLT, x, low);
+                let x = self.s.m.select(c, below, low, x);
+                let above = self.s.m.cmp(c, pred::OGT, x, high);
+                let x = self.s.m.select(c, above, high, x);
+                let zero = self.double_const(0.0);
+                let x = self.s.m.select(c, nan, zero, x);
+                self.s.flags |= flags::DOUBLE_EXTENSIONS;
+                let op = if signed { Cast::FpToSi } else { Cast::FpToUi };
+                let r = self.s.m.cast(c, op, x, self.s.t.i32);
+                return self.write_i(inst, r, guard);
+            }
+        };
+        self.write_f64(inst, r, guard)
     }
 
     /// Converts IEEE-754 binary64 `(lo, hi)` to binary32 bits with round-to-nearest-even,
@@ -10005,6 +10161,35 @@ impl<'a> Lower<'a> {
                     self.s.m.cmp(c, p, a, b)
                 }
             }
+            "f64" if op != "class" => {
+                let (a, b) = (self.f64_src(inst, 0)?, self.f64_src(inst, 1)?);
+                if op == "lg" {
+                    // as the f32 form: olt | ogt
+                    let lt = self.s.m.cmp(c, pred::OLT, a, b);
+                    let gt = self.s.m.cmp(c, pred::OGT, a, b);
+                    self.s.m.bin(c, Bin::Or, lt, gt)
+                } else {
+                    let p = match op {
+                        "f" => pred::FALSE,
+                        "lt" => pred::OLT,
+                        "eq" => pred::OEQ,
+                        "le" => pred::OLE,
+                        "gt" => pred::OGT,
+                        "ge" => pred::OGE,
+                        "o" => pred::ORD,
+                        "u" => pred::UNO,
+                        "nge" => pred::ULT,
+                        "nlg" => pred::UEQ,
+                        "ngt" => pred::ULE,
+                        "nle" => pred::UGT,
+                        "neq" => pred::UNE,
+                        "nlt" => pred::UGE,
+                        "tru" => pred::TRUE,
+                        _ => return Err(inst.name()),
+                    };
+                    self.s.m.cmp(c, p, a, b)
+                }
+            }
             "u64" | "i64" => {
                 let (a, b) = (self.src64(inst, 0)?, self.src64(inst, 1)?);
                 let signed = ty == "i64";
@@ -10397,7 +10582,7 @@ impl<'a> Lower<'a> {
 
     /// `x` (an f16 in the low bits) as the low half of VGPR `reg`: 16-bit
     /// results keep the register's high half (GFX10).
-    fn low_half(&mut self, inst: &Inst, reg: u8, x: V) -> V {
+    fn low_half(&mut self, inst: &Inst, reg: u16, x: V) -> V {
         let c = self.cur;
         let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
             Some(Ok(o)) => o,
@@ -10454,7 +10639,7 @@ impl<'a> Lower<'a> {
         let mut regs = Vec::new();
         for a in addr {
             if let Operand::Vector { reg, dwords } = *a {
-                regs.extend((0..dwords).map(|k| reg + k));
+                regs.extend((0..dwords).map(|k| reg + u16::from(k)));
             }
         }
         // Full 32-bit address VGPR at `reg_idx` (offset, bias, z-compare).
@@ -10612,7 +10797,7 @@ impl<'a> Lower<'a> {
             for k in 0..4u8 {
                 // d16: two f16 channels per VGPR, low half first.
                 let r = if *d16 { k / 2 } else { k };
-                let v = inst.read(Reg::V(reg + r)).ok_or("image store data")?;
+                let v = inst.read(Reg::V(reg + u16::from(r))).ok_or("image store data")?;
                 vals.push(if *d16 {
                     let mut x = self.i32_of(v)?;
                     if k % 2 == 1 {
@@ -10690,7 +10875,7 @@ impl<'a> Lower<'a> {
                 } else {
                     self.s.m.extract(c, d, ch)
                 };
-                self.write(inst, Reg::V(reg + k as u8), x, guard);
+                self.write(inst, Reg::V(reg + k as u16), x, guard);
             }
             return Ok(());
         }
@@ -10788,7 +10973,7 @@ impl<'a> Lower<'a> {
                         &[h, sh, cs[0], cs[1], cs[2], clamped],
                     );
                     let x = self.as_int(lod);
-                    self.write(inst, Reg::V(reg + k as u8), x, guard);
+                    self.write(inst, Reg::V(reg + k as u16), x, guard);
                 }
                 return Ok(());
             }
@@ -11160,7 +11345,7 @@ impl<'a> Lower<'a> {
                 .collect();
         }
         for (k, x) in xs.into_iter().enumerate() {
-            self.write(inst, Reg::V(reg + k as u8), x, guard);
+            self.write(inst, Reg::V(reg + k as u16), x, guard);
         }
         Ok(())
     }
@@ -11281,7 +11466,7 @@ impl<'a> Lower<'a> {
             return Err("a buffer address");
         };
         let vaddr = |l: &mut Self, k: u8| -> Result<V, Why> {
-            let v = inst.read(Reg::V(areg + k)).ok_or("a buffer address")?;
+            let v = inst.read(Reg::V(areg + u16::from(k))).ok_or("a buffer address")?;
             l.i32_of(v)
         };
         let index = if *idxen { Some(vaddr(self, 0)?) } else { None };
@@ -11361,7 +11546,7 @@ impl<'a> Lower<'a> {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
                 let x = self.cbuffer_dword(h, a);
-                self.write(inst, Reg::V(reg + k as u8), x, guard);
+                self.write(inst, Reg::V(reg + k as u16), x, guard);
             }
             return Ok(());
         }
@@ -11591,7 +11776,7 @@ impl<'a> Lower<'a> {
                 return Err("a buffer result");
             };
             for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
-                self.write(inst, Reg::V(reg + k as u8), x, guard);
+                self.write(inst, Reg::V(reg + k as u16), x, guard);
             }
             return Ok(());
         }
@@ -11679,14 +11864,14 @@ impl<'a> Lower<'a> {
                         None => h,
                     });
                 }
-                self.write(inst, Reg::V(reg + k as u8), x.expect("a channel"), guard);
+                self.write(inst, Reg::V(reg + k as u16), x.expect("a channel"), guard);
             }
             return Ok(());
         }
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
             let x = self.as_int(x);
-            self.write(inst, Reg::V(reg + k as u8), x, guard);
+            self.write(inst, Reg::V(reg + k as u16), x, guard);
         }
         Ok(())
     }

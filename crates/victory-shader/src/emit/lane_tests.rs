@@ -280,9 +280,9 @@ fn card_with(
     };
     let (native, shader) = if dual {
         // one host wave of 32 per console wave, two console lanes per host lane
-        let native = crate::dualbank::transform(&console)
+        let (native, banks) = crate::dualbank::transform(&console)
             .unwrap_or_else(|e| panic!("{what}: not rewritten: {e}"));
-        let p = ir::build(&native.code, native.wave64, native.vgprs)
+        let p = ir::build_banked(&native.code, native.wave64, native.vgprs, Some(&banks))
             .unwrap_or_else(|e| panic!("{what}: ir::build: {e}"));
         let shader = lower::with_dual_bank(|| lowered(&native, &p, &HashSet::new()))
             .unwrap_or_else(|e| panic!("{what}: not lowered: {e}"));
@@ -1204,6 +1204,89 @@ fn dual_bank_a_loop_with_an_if_inside_runs_each_lane_its_own_count() {
     DUAL.set(false);
 }
 
+/// A far jump (`s_getpc_b64`, `s_add_u32` of a literal, `s_addc_u32`, `s_setpc_b64`), the form
+/// the console's compiler gives a branch past a 16-bit offset's reach (the early-out of the
+/// cascaded shadows' compute program, 169 KB of code). With s0 0 the jump goes to code that
+/// gives every lane 9; else lanes below s0 take 7 from SCC (`s_cselect_b32` after the branch
+/// on it: SCC must come through), the others keep their value.
+#[test]
+fn a_far_jump_goes_where_it_points() {
+    use crate::gfx10::{Encoding, opcode};
+    let sop1n = |name: &str, sdst: u32, ssrc0: u32| {
+        0xBE80_0000 | sdst << 16 | u32::from(opcode(Encoding::Sop1, name).expect(name)) << 8 | ssrc0
+    };
+    let sop2n = |name: &str, sdst: u32, ssrc0: u32, ssrc1: u32| {
+        0x8000_0000
+            | u32::from(opcode(Encoding::Sop2, name).expect(name)) << 23
+            | sdst << 16
+            | ssrc1 << 8
+            | ssrc0
+    };
+    let sopp =
+        |name: &str| 0xBF80_0000 | u32::from(opcode(Encoding::Sopp, name).expect(name)) << 16;
+    let cmp = u32::from(opcode(Encoding::Sopc, "s_cmp_lg_u32").expect("s_cmp_lg_u32"));
+    let mut w = prologue();
+    w.push(0xBF00_0000 | cmp << 16 | int(0) << 8); // s_cmp_lg_u32 s0, 0
+    let over = w.len();
+    w.push(sopp("s_cbranch_scc1"));
+    let pc = w.len();
+    w.push(sop1n("s_getpc_b64", 30, 0));
+    w.push(sop2n("s_add_u32", 30, 30, LITERAL));
+    let lit = w.len();
+    w.push(0);
+    w.push(sop2n("s_addc_u32", 31, 31, int(0)));
+    w.push(sop1n("s_setpc_b64", 0, 30));
+    let then = w.len();
+    w.push(sop2n("s_cselect_b32", 40, int(7), int(8)));
+    w.push(vopc(0xC4, 0, 0)); // v_cmp_gt_u32 vcc, s0, v0
+    w.push(sop1n("s_and_saveexec_b64", 20, VCC_LO));
+    w.push(vop1(V_MOV_B32, 12, 40));
+    let to_end = w.len();
+    w.push(sopp("s_branch"));
+    let none = w.len();
+    w.push(vop1(V_MOV_B32, 12, int(9)));
+    let end = w.len();
+    epilogue(&mut w);
+    let rel = |from: usize, to: usize| (to as i32 - (from as i32 + 1)) as u16 as u32;
+    w[over] |= rel(over, then);
+    w[to_end] |= rel(to_end, end);
+    w[lit] = 4 * (none - (pc + 1)) as u32;
+    let _one = one_at_a_time();
+    let Some(card) = card("far jump", &w) else {
+        return;
+    };
+    for below in [0u32, 1, 32, 33, 64] {
+        let got = card.run([below, 0, 0, 0]);
+        let want: [u32; 64] = std::array::from_fn(|l| match below {
+            0 => 9,
+            _ if (l as u32) < below => 7,
+            _ => DEAD,
+        });
+        compare(&format!("far jump, lanes below {below}"), &got, &some(want));
+    }
+    eprintln!("far jump: lanes below 0, 1, 32, 33, 64 as the model");
+}
+
+#[test]
+fn dual_bank_a_far_jump_goes_where_it_points() {
+    DUAL.set(true);
+    a_far_jump_goes_where_it_points();
+    DUAL.set(false);
+}
+
+/// Dual-bank with every branch written as a far jump ([`crate::dualbank`]: what a branch the
+/// rewrite has put out of its offset's reach becomes), forward and backward, on EXEC and
+/// unconditional, against the same model.
+#[test]
+fn dual_bank_branches_as_far_jumps_run_as_the_short_ones() {
+    crate::dualbank::ALL_FAR.set(true);
+    DUAL.set(true);
+    a_far_jump_goes_where_it_points();
+    a_loop_with_an_if_inside_runs_each_lane_its_own_count();
+    DUAL.set(false);
+    crate::dualbank::ALL_FAR.set(false);
+}
+
 /// The model of a DPP16 `row_shr:n` compare `src0 > vsrc1` (unsigned) over a 64-lane wave:
 /// lane l reads src0 of lane l - n in its row of 16; a lane whose source is past the row's
 /// start takes 0 with bound_ctrl, else is not written (its bit 0); rows off in `rows` and
@@ -1317,4 +1400,146 @@ fn dual_bank_a_dpp_compare_reads_its_row_neighbour() {
     DUAL.set(true);
     a_dpp_compare_reads_its_row_neighbour();
     DUAL.set(false);
+}
+
+/// A program of 156 VGPRs, as the volumetric fog program with local lights has: through
+/// dual-bank its bank 1 lies past the machine word's 256 ([`crate::dualbank::Banks`]). The
+/// shuffle's data goes through v155, and lane 37's value of it is added to every lane.
+#[test]
+fn a_program_of_156_vgprs_runs_as_the_model() {
+    let mut w = prologue();
+    w.extend([
+        vop1(V_MOV_B32, 155, v(1)),
+        vop2(V_XOR_B32, 2, 0, 0),       // v2 = s0 ^ v0
+        vop2(V_ADD_NC_U32, 2, 1, 2),    // v2 = s1 + v2
+        vop2(V_AND_B32, 2, int(63), 2), // v2 &= 63
+        vop2(V_LSHLREV_B32, 2, int(2), 2),
+    ]);
+    w.extend(ds(DS_BPERMUTE_B32, 150, 2, 155));
+    w.push(S_WAITCNT_LGKM0);
+    w.extend(vop3(V_READLANE_B32, 40, v(155), int(37))); // s40 = lane 37 of v155
+    w.push(vop2(V_ADD_NC_U32, 12, 40, 150)); // v12 = s40 + v150
+    epilogue(&mut w);
+    let _one = one_at_a_time();
+    let Some(card) = card_with("156 VGPRs", &w, |n| n.vgprs = 156) else {
+        return;
+    };
+    for (x, y) in [(0, 0), (0, 1), (32, 0), (5, 17)] {
+        let got = card.run([x, y, 0, 0]);
+        let want = shuffle_want(x, y, u64::MAX).map(|l| l.map(|d| d + 0x1000 + 37));
+        compare(&format!("156 VGPRs, x {x}, y {y}"), &got, &want);
+    }
+    eprintln!("156 VGPRs: shuffles and a lane read as the model");
+}
+
+#[test]
+fn dual_bank_a_program_of_156_vgprs_runs_as_the_model() {
+    DUAL.set(true);
+    a_program_of_156_vgprs_runs_as_the_model();
+    DUAL.set(false);
+}
+
+/// A lane pair of a VGPR the compiler parks scalars in holding a lane mask, then one of its
+/// lanes a scalar alone (as the underwater volumetric fog program reuses lanes 18 and 19 of
+/// v128): the save and the restore that come together move as a pair, the lone lane as a
+/// scalar (`ir::unspill`'s pairs, for dual-bank programs where some saves and restores of the
+/// two lanes come together), so the mask comes back as a mask. Restored where EXEC holds fewer
+/// lanes than it; lanes below s0 and s2 take v1, every lane adds s1 restored from lane 4 alone.
+#[test]
+fn dual_bank_a_parked_mask_beside_a_parked_scalar_comes_back_as_a_mask() {
+    use crate::gfx10::{Encoding, opcode};
+    let vop3n = |name: &str, vdst: u32, src0: u32, src1: u32| {
+        let o = u32::from(opcode(Encoding::Vop3, name).expect(name));
+        [0xD400_0000 | o << 16 | vdst, src1 << 9 | src0]
+    };
+    let mut w = prologue();
+    w.push(vopc(0xC4, 0, 0)); // v_cmp_gt_u32 vcc, s0, v0
+    w.push(sop1(S_MOV_B64, 26, VCC_LO));
+    w.extend(vop3n("v_writelane_b32", 15, 26, int(4)));
+    w.extend(vop3n("v_writelane_b32", 15, 27, int(5)));
+    w.push(vopc(0xC4, 2, 0)); // v_cmp_gt_u32 vcc, s2, v0
+    let saveexec = u32::from(opcode(Encoding::Sop1, "s_and_saveexec_b64").expect("saveexec"));
+    w.push(sop1(saveexec, 20, VCC_LO)); // EXEC = the lanes below s2
+    w.extend(vop3n("v_readlane_b32", 24, v(15), int(4)));
+    w.extend(vop3n("v_readlane_b32", 25, v(15), int(5)));
+    let and = u32::from(opcode(Encoding::Sop2, "s_and_b64").expect("s_and_b64"));
+    w.push(0x8000_0000 | and << 23 | EXEC << 16 | 24 << 8 | EXEC); // and below s0
+    w.push(vop1(V_MOV_B32, 12, v(1)));
+    w.push(sop1(S_MOV_B64, EXEC, 22));
+    w.extend(vop3n("v_writelane_b32", 15, 1, int(4))); // lane 4 alone: s1
+    w.extend(vop3n("v_readlane_b32", 31, v(15), int(4)));
+    w.push(vop2(V_ADD_NC_U32, 12, 31, 12)); // v12 += s31
+    epilogue(&mut w);
+    // the pair's save (from s[26:27]) and restore (to s[24:25]) as two `s_mov_b64`
+    let (dual, banks) = crate::dualbank::transform(&native_of(&w, true, 64)).expect("dual-bank");
+    let p = ir::build_banked(&dual.code, false, dual.vgprs, Some(&banks)).expect("ir::build");
+    let at = |o: Option<&crate::gfx10::Operand>, c: u8| matches!(o, Some(&crate::gfx10::Operand::Scalar { code, dwords: 2 }) if code == c);
+    let pairs = p.blocks.iter().flat_map(|b| &b.insts).filter(|i| {
+        matches!(&i.fields, crate::gfx10::Fields::Sop { dst, src, .. }
+            if i.name() == "s_mov_b64" && (at(src.first(), 26) || at(dst.as_ref(), 24)))
+    });
+    assert_eq!(pairs.count(), 2, "the parked pair's save and restore");
+    DUAL.set(true);
+    let _one = one_at_a_time();
+    let card = card("parked mask and scalar", &w);
+    DUAL.set(false);
+    let Some(card) = card else {
+        return;
+    };
+    for (below, and) in [
+        (0u32, 64u32),
+        (1, 64),
+        (31, 40),
+        (40, 33),
+        (64, 32),
+        (64, 64),
+    ] {
+        let got = card.run([below, 5, and, 0]);
+        let want: [u32; 64] = std::array::from_fn(|l| {
+            let l = l as u32;
+            let x = if l < below && l < and {
+                0x1000 + l
+            } else {
+                DEAD
+            };
+            x.wrapping_add(5)
+        });
+        compare(
+            &format!("parked mask, lanes below {below} and {and}"),
+            &got,
+            &some(want),
+        );
+    }
+    eprintln!("parked mask and scalar: six masks as the model");
+}
+
+/// Every dual-bank lane test once more numbered as a program of more than 124 VGPRs is
+/// (`crate::dualbank::Banks`: bank 1 by bank 0's numbers in the words, the scratch VGPRs at
+/// the top, put in place by the IR), against the same model.
+#[test]
+fn dual_bank_numbered_past_124_vgprs_runs_every_lane_test() {
+    crate::dualbank::ALL_WIDE.set(true);
+    DUAL.set(true);
+    let tests: [fn(); 15] = [
+        a_shuffle_reads_every_lane_of_the_console_wave,
+        a_shuffle_under_random_masks_keeps_the_inactive_lanes,
+        a_lane_read_reaches_both_halves,
+        a_lane_write_reaches_both_halves,
+        the_first_active_lane_is_found_in_either_half,
+        a_ballot_holds_both_halves,
+        a_prefix_count_runs_across_the_halves,
+        a_whole_wave_sum_of_lane_ids_is_2016,
+        lanes_left_out_by_exec_keep_their_values,
+        a_shuffle_in_partial_groups_stays_in_its_console_wave,
+        an_if_else_on_lane_masks_runs_each_side_in_its_lanes,
+        three_dimensional_groups_number_lanes_x_first,
+        a_loop_with_an_if_inside_runs_each_lane_its_own_count,
+        a_far_jump_goes_where_it_points,
+        a_dpp_compare_reads_its_row_neighbour,
+    ];
+    for test in tests {
+        test();
+    }
+    DUAL.set(false);
+    crate::dualbank::ALL_WIDE.set(false);
 }

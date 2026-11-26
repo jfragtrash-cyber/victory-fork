@@ -2102,7 +2102,7 @@ impl<'a> Tracer<'a> {
                         let Term::Value(x) = self.origin(inst.read(Reg::S(code + k))?) else {
                             return None;
                         };
-                        let lane = inst.read(Reg::V(reg + k))?;
+                        let lane = inst.read(Reg::V(reg + u16::from(k)))?;
                         let (_, read) = self.defs[x.0 as usize]?;
                         let same = reads.contains(&x)
                             && read < i

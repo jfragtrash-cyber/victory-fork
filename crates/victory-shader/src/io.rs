@@ -209,7 +209,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             // A pixel shader exports no parameters; `[]` never reaches `Unread`.
             let loaded = ps_vgprs(*input_addr)
                 .into_iter()
-                .map(|(r, i)| (Reg::V(r), i))
+                .map(|(r, i)| (Reg::V(r.into()), i))
                 .collect();
             (loaded, &inputs[..], &[][..])
         }
@@ -225,7 +225,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         row: i.row,
                         channel,
                     };
-                    loaded.push((Reg::V(i.vgpr + channel), input));
+                    loaded.push((Reg::V(u16::from(i.vgpr + channel)), input));
                 }
             }
             (loaded, &[][..], &outputs[..])
@@ -235,7 +235,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         (StageIo::Cs(cs), HwStage::Cs) => {
             let (ids, info) = cs.system_sgprs();
             let mut loaded: Vec<(Reg, Input)> = (0..cs.thread_id_vgprs())
-                .map(|c| (Reg::V(c), Input::ThreadIdInGroup(c)))
+                .map(|c| (Reg::V(c.into()), Input::ThreadIdInGroup(c)))
                 .collect();
             for (c, s) in ids.into_iter().enumerate() {
                 if let Some(s) = s {

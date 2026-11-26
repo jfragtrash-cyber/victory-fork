@@ -27,7 +27,15 @@ const FIRST: u32 = 16;
 /// [`ir::build`] of `native`'s code as the hardware runs it, with the loads
 /// of a spilled user-data table rewritten ([`user_data`]).
 pub fn build(native: &NativeProgram) -> Result<Program, ShaderError> {
-    let mut p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    build_banked(native, None)
+}
+
+/// [`build`] of a dual-bank program with its VGPR numbering ([`crate::dualbank::Banks`]).
+pub fn build_banked(
+    native: &NativeProgram,
+    banks: Option<&crate::dualbank::Banks>,
+) -> Result<Program, ShaderError> {
+    let mut p = ir::build_banked(&native.patched_code(), native.wave64, native.vgprs, banks)?;
     user_data(&mut p, native);
     Ok(p)
 }

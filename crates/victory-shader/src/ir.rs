@@ -26,7 +26,9 @@ use crate::gfx10::{self, Fields, Flow, Instruction, Operand};
 pub enum Reg {
     S(u8),
     Scc,
-    V(u8),
+    /// A VGPR: 0-255 as the machine names them (and `Operand::Vector` holds), past 255 the
+    /// second bank of a dual-bank program of more than 124 (`crate::dualbank::Banks`).
+    V(u16),
 }
 
 pub const VCC: u8 = 106;
@@ -127,7 +129,27 @@ impl Inst {
 /// count. Fails on instructions the IR cannot express yet
 /// ([`ShaderError::Unsupported`]).
 pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderError> {
+    build_banked(code, wave64, vgprs, None)
+}
+
+/// [`build`] of a dual-bank program ([`crate::dualbank::Banks`]): where its second bank's
+/// VGPRs are past the machine word's, each instruction's VGPRs are put in place first; its
+/// parked lane masks come back as the pairs they are (a console mask is a pair of bank dwords
+/// there, as in a wave64 program).
+pub fn build_banked(
+    code: &[u8],
+    wave64: bool,
+    vgprs: u16,
+    banks: Option<&crate::dualbank::Banks>,
+) -> Result<Program, ShaderError> {
     let mut list = gfx10::decode(code)?;
+    let fields_of = |machine: &gfx10::Instruction| {
+        let mut fields = machine.fields(wave64);
+        if let Some(banks) = banks {
+            banks.remap(machine.offset, &mut fields);
+        }
+        fields
+    };
     let lanes = 1 + u8::from(wave64);
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
 
@@ -149,7 +171,10 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
     }
     leaders.sort_unstable();
     leaders.dedup();
-    let parked = unspill(&mut list, &leaders, wave64, lanes, vgprs);
+    let (pairs, partial) = (wave64 || banks.is_some(), banks.is_some());
+    let parked = unspill(
+        &mut list, &leaders, pairs, partial, lanes, vgprs, &fields_of,
+    );
     let block_at = |offset: usize| {
         leaders
             .binary_search(&offset)
@@ -175,7 +200,7 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
             offset: machine.offset,
             what: "unknown opcode",
         })?;
-        let mut fields = machine.fields(wave64);
+        let mut fields = fields_of(&machine);
         // A move to or from a scalar parked in a VGPR lane (`unspill`): its register
         // codes may be ones the machine word cannot hold.
         if let Ok(k) = parked.binary_search_by_key(&n, |m| m.0)
@@ -245,16 +270,24 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
 /// A register pair parked in two neighbouring lanes (a lane mask, a 64-bit
 /// address) moves as a pair (`s_mov_b64`) when every save and every restore
 /// of the two lanes come together, so a parked lane mask comes back as the
-/// mask it is; otherwise its halves come back as two scalars.
+/// mask it is; otherwise its halves come back as two scalars. With `partial` (a dual-bank
+/// program, `crate::dualbank`) the saves and restores that come together move as pairs even
+/// where others of the two lanes do not, which move as scalars: the compiler reuses a lane
+/// pair that held a lane mask for a single scalar later (the underwater volumetric fog
+/// program: lanes 18 and 19 of v128 hold a saved EXEC, then lane 18 a scalar alone), and the
+/// mask restored dword by dword is one the lowering cannot follow.
+#[allow(clippy::too_many_arguments)]
 fn unspill(
     list: &mut [gfx10::Instruction],
     leaders: &[usize],
     wave64: bool,
+    partial: bool,
     lanes: u8,
     vgprs: u16,
+    fields_of: &dyn Fn(&gfx10::Instruction) -> Fields,
 ) -> Vec<(usize, u8, u8)> {
     /// `v_writelane_b32 vN, sX, K` / `v_readlane_b32 sX, vN, K`: (save, N, X, K).
-    fn parked(inst: &gfx10::Instruction, fields: &Fields) -> Option<(bool, u8, u8, u32)> {
+    fn parked(inst: &gfx10::Instruction, fields: &Fields) -> Option<(bool, u16, u8, u32)> {
         let Fields::Valu(v) = fields else { return None };
         if v.abs != 0 || v.neg != 0 || v.opsel != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some() || v.dpp.is_some() {
             return None;
@@ -275,15 +308,15 @@ fn unspill(
     }
     // VGPRs used by parking alone, the scalar codes the program uses, and
     // per instruction the scalar codes it writes.
-    let mut stores = [false; 256];
-    let mut other = [false; 256];
+    let mut stores = [false; 512];
+    let mut other = [false; 512];
     let mut used = [false; 128];
-    let mut parks: Vec<Option<(bool, u8, u8, u32)>> = Vec::with_capacity(list.len());
+    let mut parks: Vec<Option<(bool, u16, u8, u32)>> = Vec::with_capacity(list.len());
     let mut written: Vec<Vec<u8>> = Vec::with_capacity(list.len());
     let mut read: Vec<Vec<u8>> = Vec::with_capacity(list.len());
     for inst in list.iter() {
         let Some(name) = inst.name() else { return Vec::new() };
-        let fields = inst.fields(wave64);
+        let fields = fields_of(inst);
         let park = parked(inst, &fields);
         let Ok(effects) = effects(inst, &fields, name, lanes, vgprs) else {
             return Vec::new();
@@ -340,9 +373,10 @@ fn unspill(
     // restore of the next lane into the next register.
     // The second save may come any number of instructions after the first (the
     // compiler puts loads and constants between the two: five instructions later
-    // in the ped mesh programs). Only wave64 programs have pairs: a wave32 mask
+    // in the ped mesh programs). Only wave64 programs have pairs (and dual-bank ones, whose
+    // console masks are pairs of bank dwords): a wave32 mask
     // is one dword, and a pair move of it with its neighbour would hide it.
-    let mut slots: Vec<(u8, u32)> = parks.iter().flatten().map(|p| (p.1, p.3)).collect();
+    let mut slots: Vec<(u16, u32)> = parks.iter().flatten().map(|p| (p.1, p.3)).collect();
     slots.sort_unstable();
     slots.dedup();
     // instruction -> the instruction that completes its pair
@@ -385,7 +419,7 @@ fn unspill(
             None
         }
     };
-    let mut pairs: Vec<(u8, u32)> = Vec::new();
+    let mut pairs: Vec<(u16, u32)> = Vec::new();
     for &(reg, lane) in &slots {
         if !wave64 || pairs.iter().any(|&(r, l)| r == reg && l + 1 == lane) || !slots.contains(&(reg, lane + 1)) {
             continue;
@@ -396,7 +430,9 @@ fn unspill(
         let mut distinct: Vec<usize> = partners.iter().flatten().copied().collect();
         distinct.sort_unstable();
         distinct.dedup();
-        if partners.iter().all(Option::is_some) && distinct.len() == lower.len() && upper == lower.len() {
+        let all = partners.iter().all(Option::is_some) && distinct.len() == lower.len() && upper == lower.len();
+        let some = partial && !distinct.is_empty() && distinct.len() == partners.iter().flatten().count();
+        if all || some {
             pairs.push((reg, lane));
         }
     }
@@ -411,7 +447,7 @@ fn unspill(
         free[c] = !used[c];
     }
     free[past..255].fill(true);
-    let mut codes: Vec<((u8, u32), u8)> = Vec::new();
+    let mut codes: Vec<((u16, u32), u8)> = Vec::new();
     for &(reg, lane) in &pairs {
         let at = (108..123).chain((0..104).rev()).chain(past..254).find(|&c| free[c] && free[c + 1]);
         // Not enough spare codes: leave the program as it is.
@@ -430,7 +466,7 @@ fn unspill(
         free[c] = false;
         codes.push((slot, c as u8));
     }
-    let code_of = |reg: u8, lane: u32| codes.iter().find(|c| c.0 == (reg, lane)).map(|c| c.1);
+    let code_of = |reg: u16, lane: u32| codes.iter().find(|c| c.0 == (reg, lane)).map(|c| c.1);
     let put = |list: &mut [gfx10::Instruction], i: usize, encoding, opcode: u16, word: u32| {
         list[i] = gfx10::Instruction {
             offset: list[i].offset,
@@ -444,25 +480,37 @@ fn unspill(
     let field = |code: u8| if code < PARKED { u32::from(code) } else { 0 };
     let mov = |wide: bool, dst: u8, src: u8| 0xBE80_0000 | field(dst) << 16 | (3 + u32::from(wide)) << 8 | field(src);
     const NOP: u32 = 0xBF80_0000;
+    // the upper halves that move with their lower ones
+    let claimed: std::collections::HashSet<usize> = (0..list.len())
+        .filter(|&i| parks[i].is_some_and(|p| pairs.contains(&(p.1, p.3))))
+        .filter_map(partner)
+        .collect();
     let mut edits: Vec<(usize, Option<(bool, u8, u8)>)> = Vec::new();
     for i in 0..list.len() {
         let Some((save, reg, code, lane)) = parks[i] else {
             continue;
         };
         let Some(slot) = code_of(reg, lane) else { return Vec::new() };
+        let single = |edits: &mut Vec<_>| {
+            let (dst, src) = if save { (slot, code) } else { (code, slot) };
+            edits.push((i, Some((false, dst, src))));
+        };
         if pairs.contains(&(reg, lane)) {
-            let Some(j) = partner(i) else { return Vec::new() };
+            let Some(j) = partner(i) else {
+                // (`partial` only: a lower half alone)
+                single(&mut edits);
+                continue;
+            };
             // A save moves the pair where its second half is saved; a
             // restore where its first half is restored.
             let (at, gone) = if save { (j, i) } else { (i, j) };
             let (dst, src) = if save { (slot, code) } else { (code, slot) };
             edits.push((at, Some((true, dst, src))));
             edits.push((gone, None));
-        } else if lane > 0 && pairs.contains(&(reg, lane - 1)) {
+        } else if lane > 0 && pairs.contains(&(reg, lane - 1)) && claimed.contains(&i) {
             // the upper half of a pair: moved with the lower
         } else {
-            let (dst, src) = if save { (slot, code) } else { (code, slot) };
-            edits.push((i, Some((false, dst, src))));
+            single(&mut edits);
         }
     }
     let mut moves = Vec::new();
@@ -774,8 +822,9 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
 
 /// Placeholder before renaming.
 const NONE: Value = Value(u32::MAX);
-/// Scalar codes 0-255 (from [`PARKED`] up: parked scalars), SCC, VGPRs 0-255.
-const REGS: usize = 256 + 1 + 256;
+/// Scalar codes 0-255 (from [`PARKED`] up: parked scalars), SCC, VGPRs 0-511 (past 255: a
+/// dual-bank program's second bank, [`crate::dualbank::Banks`]).
+const REGS: usize = 256 + 1 + 512;
 type RegSet = [u64; REGS.div_ceil(64)];
 
 fn index(reg: Reg) -> usize {
@@ -790,7 +839,7 @@ fn reg_at(i: usize) -> Reg {
     match i {
         0..256 => Reg::S(i as u8),
         256 => Reg::Scc,
-        _ => Reg::V((i - 257) as u8),
+        _ => Reg::V((i - 257) as u16),
     }
 }
 
@@ -1193,7 +1242,7 @@ fn effects(
     let mask = |code: u8| (0..lanes).map(move |i| Reg::S(code + i));
     let (mut r, mut w) = (Vec::new(), Vec::new());
     let regs = |op: &Operand, out: &mut Vec<Reg>| {
-        add_regs(op, lanes, out).map_err(|_| ShaderError::Isa {
+        add_regs(op, lanes, vgprs, out).map_err(|_| ShaderError::Isa {
             offset: inst.offset,
             reason: "register range out of bounds",
         })
@@ -1288,8 +1337,8 @@ fn effects(
             };
             // v[reg + M0] for any M0 that stays inside the program's VGPRs.
             let indexed = |op: &Operand, out: &mut Vec<Reg>| match *op {
-                Operand::Vector { reg, .. } if u16::from(reg) < vgprs => {
-                    out.extend((u16::from(reg)..vgprs).map(|r| Reg::V(r as u8)));
+                Operand::Vector { reg, .. } if reg < vgprs => {
+                    out.extend((reg..vgprs).map(Reg::V));
                     Ok(())
                 }
                 _ => Err(ShaderError::Isa {
@@ -1514,7 +1563,9 @@ fn atomic_result(data: &Operand, name: &str) -> Operand {
 
 /// Appends the register dwords an operand names; reading `vccz`, `execz`,
 /// `scc` or `lds_direct` reads the register behind it.
-fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
+/// `vgprs` past 256: a dual-bank program numbered past the machine's VGPRs
+/// ([`crate::dualbank::Banks`]), whose ranges end within its own count.
+fn add_regs(op: &Operand, lanes: u8, vgprs: u16, out: &mut Vec<Reg>) -> Result<(), ()> {
     match *op {
         Operand::Scalar { code, .. } if code == gfx10::NULL => {}
         Operand::Scalar { code, dwords } => {
@@ -1528,10 +1579,10 @@ fn add_regs(op: &Operand, lanes: u8, out: &mut Vec<Reg>) -> Result<(), ()> {
             out.extend((u16::from(code)..end).map(|c| Reg::S(c as u8)));
         }
         Operand::Vector { reg, dwords } => {
-            if u16::from(reg) + u16::from(dwords) > 256 {
+            if reg + u16::from(dwords) > vgprs.max(256) {
                 return Err(());
             }
-            out.extend((0..dwords).map(|i| Reg::V(reg + i)));
+            out.extend((0..dwords).map(|i| Reg::V(reg + u16::from(i))));
         }
         Operand::Const(251) => out.extend((0..lanes).map(|i| Reg::S(VCC + i))),
         Operand::Const(252) => out.extend((0..lanes).map(|i| Reg::S(EXEC + i))),
@@ -1771,7 +1822,7 @@ mod tests {
         let [movreld, movrels, _] = &p.blocks[0].insts[..] else {
             panic!()
         };
-        let vgprs = |regs: &[(Reg, Value)]| -> Vec<u8> {
+        let vgprs = |regs: &[(Reg, Value)]| -> Vec<u16> {
             regs.iter()
                 .filter_map(|r| match r.0 {
                     Reg::V(v) => Some(v),

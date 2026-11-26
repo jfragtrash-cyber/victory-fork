@@ -85,7 +85,7 @@ impl<'a> Lower<'a> {
         let mut regs = Vec::new();
         for a in addr {
             if let Operand::Vector { reg, dwords } = *a {
-                regs.extend((0..dwords).map(|k| reg + k));
+                regs.extend((0..dwords).map(|k| reg + u16::from(k)));
             }
         }
         if regs.len() != if wide { 12 } else { 11 } {
@@ -216,7 +216,7 @@ impl<'a> Lower<'a> {
         }
         let results = self.end_guarded(gate, &results);
         for (k, &r) in results.iter().enumerate() {
-            self.write(inst, Reg::V(dst + k as u8), r, guard);
+            self.write(inst, Reg::V(dst + k as u16), r, guard);
         }
         Ok(())
     }

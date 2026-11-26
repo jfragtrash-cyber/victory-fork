@@ -270,8 +270,23 @@ pub(crate) mod pace {
                     N[9].fetch_add(at.elapsed().as_micros() as u64, Ordering::Relaxed);
                     N[10].fetch_add(frame.saturating_sub(called), Ordering::Relaxed);
                     if detail_now() || SAID.fetch_add(1, Ordering::Relaxed) < 48 {
+                        // Where the time went, for laying a burst's chain
+                        // out signal by signal: until it went behind the
+                        // flights, the card, the landing.
+                        let split = match (lined, taken) {
+                            (Some(lined), Some(taken)) => {
+                                let ms = |a: Instant, b: Instant| b.saturating_duration_since(a).as_micros() as f64 / 1e3;
+                                format!(
+                                    " = {:.1} to the line + {:.1} the card + {:.1} landing",
+                                    ms(at, lined),
+                                    ms(lined, taken),
+                                    ms(taken, Instant::now())
+                                )
+                            }
+                            _ => String::new(),
+                        };
                         tracing::info!(
-                            "pace: fence {fence:?} is set to {v}, {:.1} ms after the title's Signal for it (called in frame {called}, set in frame {frame})",
+                            "pace: fence {fence:?} is set to {v}, {:.1} ms after the title's Signal for it{split} (called in frame {called}, set in frame {frame})",
                             at.elapsed().as_micros() as f64 / 1e3
                         );
                     }

@@ -5725,6 +5725,8 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
         submitting(1, runs.len());
+        // Nothing is made ahead any more for lists refreshed now.
+        ahead::submitted(runs);
         // Copies of physical pages whose source was written are taken again
         // before anything of this submission reads them (`crate::alias`).
         crate::alias::flush();
@@ -6395,6 +6397,8 @@ impl HostList {
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+        // What its submission will refresh, for our thread to take ahead.
+        ahead::closed(self);
     }
 
     /// Only after the list's last submission finished (every one is waited
@@ -8558,6 +8562,7 @@ impl Meter {
         crate::descriptor::sync_line(frames);
         crate::watch::shared_line(frames);
         late_line(frames);
+        ahead::line(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
@@ -10158,4 +10163,476 @@ fn present_stats(swap_chain: &IDXGISwapChain3, frame: u64, started: std::time::I
         ok,
         "host present"
     );
+}
+
+/// Refreshes made ahead (`VICTORY_REFRESH_AHEAD`; off by default, `1` on,
+/// `alt` twenty seconds with and twenty without, in turn): when the title
+/// closes a list, the ranges of host copies its submission will refresh
+/// are noted, and the thread that prepares submissions
+/// (`crate::queue::behind`) brings them up to date while it has nothing to
+/// prepare. The submission's own refreshes still run, as always; they find
+/// those pages taken and copy only what the title wrote since.
+///
+/// Why: the frame is a chain, not a wall. The title hands a frame over in
+/// two bursts and holds the next burst back until fences of the last one
+/// are set, and those are set only after our thread has prepared every
+/// part before them, the card has run them and the landing thread has
+/// landed them. Run BK, per signal: 29.8 ms until it went behind the
+/// flights (everything before it prepared), 26.5 ms the card, 10.2 ms
+/// landing; the next burst follows the last fence of the one before by a
+/// median 8 ms (`pace` lines of runs BI, BJ, BK). Our thread meanwhile is
+/// idle 16 ms a frame (run BA's profile: in `queue::worker`'s wait for
+/// work) to 24 ms (run BM: at work 51 ms of a 75 ms frame), so what it
+/// prepares is on the chain and its idle time is not. Of its preparing,
+/// the refreshes are the largest step (run BA: `Batch::flush` 17.9 ms a
+/// frame, `Shadow::update` 16.5 of it: guards made again after copying 2.8,
+/// copies spread to the kept threads and waited for 4.1, their bookkeeping
+/// 8.2; a range with nothing written since it was taken costs little of
+/// that). What the title writes before it closes a list can be taken
+/// then, off the chain.
+///
+/// What it assumes: nothing beyond a refresh at submission, which may run
+/// while the title's threads write and while flights read the copy. A
+/// range shaders of a flight in the air may write is left alone by
+/// `Shadow::update` as at submission. A range the title writes again
+/// after the refresh ahead is copied again by the submission's refresh:
+/// copied twice, never missed (the guards and the write watch see the
+/// second write).
+///
+/// What it costs: kernel askings and guard work ahead, beside the title's
+/// recording threads, and a block guarded again ahead faults once more if
+/// the title writes it again before the submission. Hence the switch and
+/// its `alt` mode, which the line "refreshes ahead per frame" goes with.
+pub(crate) mod ahead {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use super::{HostList, Step};
+    use crate::shadow::Shadow;
+
+    /// Ranges of one copy closer than this are refreshed as one: the
+    /// guards' blocks are 64 KiB, and two ranges in a block ask about it
+    /// once.
+    const GAP: usize = 64 << 10;
+
+    /// The most lists taken at a time (a stop is looked for after each of
+    /// their ranges): a burst of the title's that comes meanwhile waits for
+    /// one range at most.
+    const MOST_LISTS: usize = 4;
+
+    /// 0 off, 1 on, 2 in turn.
+    fn mode() -> u8 {
+        static MODE: OnceLock<u8> = OnceLock::new();
+        *MODE.get_or_init(|| {
+            let asked = match std::env::var("VICTORY_REFRESH_AHEAD").as_deref() {
+                Ok("1") => 1,
+                Ok("alt") => 2,
+                _ => 0,
+            };
+            // Needs our thread that prepares (and the flights it sends).
+            let mode = if asked != 0 && crate::queue::behind() && super::late() { asked } else { 0 };
+            if mode != 0 {
+                tracing::info!(
+                    "the ranges a closed list refreshes are brought up to date ahead, while the submitting thread has nothing to prepare (VICTORY_REFRESH_AHEAD=1; alt: in turn)"
+                );
+            } else if asked != 0 {
+                tracing::warn!("VICTORY_REFRESH_AHEAD needs VICTORY_ASYNC_SUBMIT=1 and flights: left off");
+            }
+            mode
+        })
+    }
+
+    /// Whether refreshes are made ahead now.
+    pub(crate) fn on() -> bool {
+        match mode() {
+            0 => false,
+            1 => true,
+            _ => {
+                let on = (super::now_us() / 20_000_000) % 2 == 1;
+                static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+                if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                    tracing::info!(
+                        "refreshes ahead from now (VICTORY_REFRESH_AHEAD=alt): {}",
+                        if on { "ON" } else { "off, as usual" }
+                    );
+                }
+                on
+            }
+        }
+    }
+
+    /// The ranges `[from, to)` of one copy, joined where they overlap or
+    /// lie at most `gap` apart, in order; empty ones left out.
+    pub(super) fn spans_of(mut ranges: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
+        ranges.sort_unstable();
+        let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+        for (from, to) in ranges {
+            if from >= to {
+                continue;
+            }
+            match out.last_mut() {
+                Some(last) if from <= last.1.saturating_add(gap) => last.1 = last.1.max(to),
+                _ => out.push((from, to)),
+            }
+        }
+        out
+    }
+
+    /// A list's refreshes `(copy's key, copy, from, to)` as spans per copy
+    /// ([`spans_of`]), the copies in the order they first appear.
+    pub(super) fn group<T: Clone>(refreshes: &[(usize, T, usize, usize)], gap: usize) -> Vec<(T, usize, usize)> {
+        let mut order: Vec<(usize, T, Vec<(usize, usize)>)> = Vec::new();
+        for (key, copy, from, to) in refreshes {
+            match order.iter_mut().find(|(k, ..)| *k == *key) {
+                Some((_, _, ranges)) => ranges.push((*from, *to)),
+                None => order.push((*key, copy.clone(), vec![(*from, *to)])),
+            }
+        }
+        order
+            .into_iter()
+            .flat_map(|(_, copy, ranges)| spans_of(ranges, gap).into_iter().map(move |(from, to)| (copy.clone(), from, to)))
+            .collect()
+    }
+
+    /// The lists closed and not submitted yet whose refreshes are still to
+    /// be made ahead, oldest first: each with its spans.
+    pub(super) struct Waiting<T> {
+        lists: VecDeque<(usize, Vec<(T, usize, usize)>)>,
+    }
+
+    impl<T> Waiting<T> {
+        pub(super) const fn new() -> Waiting<T> {
+            Waiting { lists: VecDeque::new() }
+        }
+
+        /// List `list` was closed with these spans to refresh. A list
+        /// closed again (reset and recorded anew, never submitted) keeps
+        /// only its new spans.
+        pub(super) fn closed(&mut self, list: usize, spans: Vec<(T, usize, usize)>) {
+            self.lists.retain(|(l, _)| *l != list);
+            if !spans.is_empty() {
+                self.lists.push_back((list, spans));
+            }
+        }
+
+        /// These lists are being submitted: their own refreshes run now,
+        /// nothing is made ahead for them. Returns how many were waiting.
+        pub(super) fn submitted(&mut self, lists: &[usize]) -> usize {
+            let before = self.lists.len();
+            self.lists.retain(|(l, _)| !lists.contains(l));
+            before - self.lists.len()
+        }
+
+        /// Up to `most` lists, oldest first, as one run of spans, each with
+        /// the list it is of.
+        pub(super) fn take(&mut self, most: usize) -> Vec<(usize, T, usize, usize)> {
+            let mut out = Vec::new();
+            for _ in 0..most {
+                let Some((list, spans)) = self.lists.pop_front() else {
+                    break;
+                };
+                out.extend(spans.into_iter().map(|(copy, from, to)| (list, copy, from, to)));
+            }
+            out
+        }
+
+        /// Spans taken and not made (a stop came first): back at the head,
+        /// in their order, unless their list was submitted (`gone`) or
+        /// closed again meanwhile.
+        pub(super) fn put_back(&mut self, spans: Vec<(usize, T, usize, usize)>, gone: &[usize]) {
+            let mut back: Vec<(usize, Vec<(T, usize, usize)>)> = Vec::new();
+            for (list, copy, from, to) in spans {
+                if gone.contains(&list) || self.lists.iter().any(|(l, _)| *l == list) {
+                    continue;
+                }
+                match back.last_mut() {
+                    Some((l, spans)) if *l == list => spans.push((copy, from, to)),
+                    _ => back.push((list, vec![(copy, from, to)])),
+                }
+            }
+            for entry in back.into_iter().rev() {
+                self.lists.push_front(entry);
+            }
+        }
+
+        pub(super) fn is_empty(&self) -> bool {
+            self.lists.is_empty()
+        }
+
+        pub(super) fn clear(&mut self) {
+            self.lists.clear();
+        }
+    }
+
+    static WAITING: Mutex<Waiting<Arc<Shadow>>> = Mutex::new(Waiting::new());
+
+    /// Lists submitted while spans of theirs were being made ahead: what a
+    /// stop leaves of them is not put back.
+    static GONE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    fn waiting() -> std::sync::MutexGuard<'static, Waiting<Arc<Shadow>>> {
+        WAITING.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn gone() -> std::sync::MutexGuard<'static, Vec<usize>> {
+        GONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Since the last line: lists closed with refreshes noted; of them,
+    /// submitted before their turn came; spans made ahead; the bytes they
+    /// copied; the microseconds that took; runs cut short by work that
+    /// came; runs left for later because a submission held the lock.
+    static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+    /// `list` was closed (on the thread that recorded it): its refreshes
+    /// are noted, and the submitting thread told.
+    pub(crate) fn closed(list: &HostList) {
+        if !on() {
+            return;
+        }
+        let refreshes: Vec<(usize, Arc<Shadow>, usize, usize)> = list
+            .deferred()
+            .copies
+            .iter()
+            .filter_map(|step| match step {
+                // A copy with no watch is copied whole at every refresh:
+                // ahead it would be copied twice.
+                Step::Refresh(shadow, address, len) if !shadow.unwatched() && !shadow.in_place() && *len > 0 => {
+                    Some((Arc::as_ptr(shadow) as usize, shadow.clone(), *address, *address + *len))
+                }
+                _ => None,
+            })
+            .collect();
+        if refreshes.is_empty() {
+            return;
+        }
+        let spans = group(&refreshes, GAP);
+        waiting().closed(std::ptr::from_ref(list) as usize, spans);
+        STATS[0].fetch_add(1, Ordering::Relaxed);
+        crate::queue::wake_for_ahead();
+    }
+
+    /// `runs` are being submitted (the submission lock is held).
+    pub(crate) fn submitted(runs: &[&HostList]) {
+        let mut waiting = waiting();
+        if waiting.is_empty() {
+            return;
+        }
+        if !on() {
+            waiting.clear();
+            return;
+        }
+        let lists: Vec<usize> = runs.iter().map(|&l| std::ptr::from_ref(l) as usize).collect();
+        let dropped = waiting.submitted(&lists);
+        drop(waiting);
+        STATS[1].fetch_add(dropped as u64, Ordering::Relaxed);
+        gone().extend(lists);
+    }
+
+    /// On the submitting thread, with nothing to prepare: makes the
+    /// refreshes of up to [`MOST_LISTS`] closed lists, looking at `stop`
+    /// after each span; what a stop leaves goes back. Whether anything was
+    /// made (else the thread waits for work again).
+    pub(crate) fn run(host: &super::Host, stop: &dyn Fn() -> bool) -> bool {
+        if !on() {
+            waiting().clear();
+            return false;
+        }
+        let spans = waiting().take(MOST_LISTS);
+        if spans.is_empty() {
+            return false;
+        }
+        gone().clear();
+        // One at a time with the submissions, as they are with each other:
+        // the journal's one asking is theirs while they prepare.
+        let lock = match host.submitted.try_lock() {
+            Ok(lock) => Some(lock),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        let Some(lock) = lock else {
+            let gone = std::mem::take(&mut *gone());
+            waiting().put_back(spans, &gone);
+            STATS[6].fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        let started = std::time::Instant::now();
+        let ranges: Vec<(usize, usize)> = spans.iter().map(|s| (s.2, s.3)).collect();
+        crate::watch::ask_once(&ranges);
+        let (mut copied, mut made, mut stopped) = (0usize, 0u64, false);
+        let mut held = Vec::with_capacity(spans.len());
+        // The copies on the kept threads while the next ranges ask, as a
+        // submission's (the copies are held until the last is in).
+        let spreading = crate::shadow::Spreading::begin();
+        let mut spans = spans.into_iter();
+        for (_, shadow, from, to) in spans.by_ref() {
+            copied += shadow.update(from, to - from);
+            held.push(shadow);
+            made += 1;
+            if stop() {
+                stopped = true;
+                break;
+            }
+        }
+        spreading.end();
+        drop(held);
+        crate::watch::ask_once_end();
+        drop(lock);
+        if stopped {
+            let left: Vec<_> = spans.collect();
+            let gone = std::mem::take(&mut *gone());
+            waiting().put_back(left, &gone);
+            STATS[5].fetch_add(1, Ordering::Relaxed);
+        }
+        STATS[2].fetch_add(made, Ordering::Relaxed);
+        STATS[3].fetch_add(copied as u64, Ordering::Relaxed);
+        STATS[4].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        true
+    }
+
+    /// For the frame-rate line, with the switch.
+    pub(crate) fn line(frames: f64) {
+        if mode() == 0 {
+            return;
+        }
+        let n: Vec<f64> = STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        tracing::info!(
+            "refreshes ahead per frame (VICTORY_REFRESH_AHEAD): {:.1} lists closed with refreshes, {:.1} of them submitted before their turn; {:.1} ranges brought up to date ahead, {:.2} MB copied, {:.1} ms of the submitting thread with nothing to prepare; {:.2} runs cut short by work that came, {:.2} left for later (the submission lock was held)",
+            n[0],
+            n[1],
+            n[2],
+            n[3] / 1e6,
+            n[4] / 1e3,
+            n[5],
+            n[6]
+        );
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn ranges_join_where_they_overlap_or_lie_close() {
+            let gap = 0x100;
+            // Overlapping, touching, within the gap, beyond it; an empty one goes.
+            let spans = spans_of(vec![(0x500, 0x600), (0, 0x100), (0x80, 0x180), (0x280, 0x300), (0x700, 0x700)], gap);
+            assert_eq!(spans, [(0, 0x300), (0x500, 0x600)]);
+            assert!(spans_of(Vec::new(), gap).is_empty());
+            // With no gap only what touches is joined.
+            assert_eq!(spans_of(vec![(0, 0x10), (0x10, 0x20), (0x21, 0x30)], 0), [(0, 0x20), (0x21, 0x30)]);
+        }
+
+        #[test]
+        fn a_lists_refreshes_are_spans_per_copy_in_first_seen_order() {
+            let refreshes = [(2, 'b', 0x1000, 0x1100), (1, 'a', 0x50, 0x60), (2, 'b', 0x1100, 0x1200), (1, 'a', 0x9000, 0x9100)];
+            assert_eq!(group(&refreshes, 0x100), [('b', 0x1000, 0x1200), ('a', 0x50, 0x60), ('a', 0x9000, 0x9100)]);
+        }
+
+        #[test]
+        fn lists_submitted_first_are_never_made_ahead() {
+            let mut w: Waiting<char> = Waiting::new();
+            w.closed(1, vec![('a', 0, 8)]);
+            w.closed(2, vec![('b', 0, 8), ('c', 0, 8)]);
+            w.closed(3, vec![('d', 0, 8)]);
+            // A list with nothing to refresh is not kept.
+            w.closed(4, Vec::new());
+            assert_eq!(w.submitted(&[2, 9]), 1);
+            assert_eq!(w.take(8), [(1, 'a', 0, 8), (3, 'd', 0, 8)]);
+            assert!(w.is_empty());
+        }
+
+        #[test]
+        fn a_list_closed_again_keeps_only_its_new_ranges() {
+            let mut w: Waiting<char> = Waiting::new();
+            w.closed(1, vec![('a', 0, 8)]);
+            w.closed(2, vec![('b', 0, 8)]);
+            w.closed(1, vec![('z', 8, 16)]);
+            assert_eq!(w.take(8), [(2, 'b', 0, 8), (1, 'z', 8, 16)]);
+            // Closed again with nothing to refresh: nothing is left of it.
+            w.closed(3, vec![('c', 0, 8)]);
+            w.closed(3, Vec::new());
+            assert!(w.is_empty());
+        }
+
+        #[test]
+        fn taking_is_by_whole_lists_oldest_first() {
+            let mut w: Waiting<char> = Waiting::new();
+            for (list, copy) in [(1, 'a'), (2, 'b'), (3, 'c')] {
+                w.closed(list, vec![(copy, 0, 8), (copy, 16, 24)]);
+            }
+            assert_eq!(w.take(2), [(1, 'a', 0, 8), (1, 'a', 16, 24), (2, 'b', 0, 8), (2, 'b', 16, 24)]);
+            assert_eq!(w.take(2), [(3, 'c', 0, 8), (3, 'c', 16, 24)]);
+            assert!(w.take(2).is_empty());
+        }
+
+        #[test]
+        fn what_a_stop_leaves_goes_back_first_unless_its_list_went() {
+            let mut w: Waiting<char> = Waiting::new();
+            w.closed(1, vec![('a', 0, 8), ('a', 16, 24)]);
+            w.closed(2, vec![('b', 0, 8)]);
+            w.closed(3, vec![('c', 0, 8)]);
+            let mut taken = w.take(2);
+            // The first span was made, then a stop.
+            taken.remove(0);
+            // Meanwhile list 4 was closed and list 2 submitted.
+            w.closed(4, vec![('d', 0, 8)]);
+            w.put_back(taken, &[2]);
+            assert_eq!(w.take(8), [(1, 'a', 16, 24), (3, 'c', 0, 8), (4, 'd', 0, 8)]);
+            // A list closed again meanwhile keeps its new ranges only.
+            w.closed(5, vec![('e', 0, 8)]);
+            let taken = w.take(1);
+            w.closed(5, vec![('f', 0, 8)]);
+            w.put_back(taken, &[]);
+            assert_eq!(w.take(8), [(5, 'f', 0, 8)]);
+        }
+
+        /// What making refreshes ahead rests on: a range brought up to
+        /// date ahead costs the submission's refresh no copy when the
+        /// title has not written it since, and a write the title makes
+        /// after it is copied by the submission's refresh, not lost.
+        #[test]
+        fn a_range_made_ahead_is_copied_again_only_where_written_since() {
+            use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+            const MEM_WRITE_WATCH: u32 = 0x20_0000;
+            // The watch's pages (64 KiB): an asking covers whole ones.
+            const PAGE: usize = crate::watch::PAGE;
+            let len = 4 * PAGE;
+            // SAFETY: a fresh write-watched allocation, freed at the end.
+            let p = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+            assert!(p != 0 && p.is_multiple_of(PAGE));
+            crate::shadow::register(p, p as u64, len as u64);
+            let done = || {
+                crate::shadow::unregister(p, p as u64);
+                // SAFETY: our allocation.
+                unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+            };
+            let Some(copy) = crate::shadow::find(p as u64, len as u64).filter(|c| !c.in_place() && !c.carded() && !c.unwatched()) else {
+                done();
+                return; // no host GPU here, or a copy this test does not cover
+            };
+            let title = |at: usize| (p + at) as *mut u8;
+            let host = |at: usize| copy.read_host((p + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
+            // Taken once before (the first takings also find the pages the
+            // kernel counts written since the allocation).
+            copy.update(p, len);
+            copy.update(p, len);
+            // SAFETY: (all title writes below) bytes of our allocation.
+            unsafe { title(PAGE + 7).write_volatile(0x11) };
+            // Ahead: the list's range is brought up to date.
+            let ahead = copy.update(p, len);
+            assert!(ahead > 0 && ahead < len, "ahead, what the title wrote before the close is taken ({ahead} of {len} bytes)");
+            assert_eq!(host(PAGE + 7), 0x11);
+            // The submission's refresh: nothing written since, nothing copied.
+            assert_eq!(copy.update(p, len), 0, "a range taken ahead and not written since is not copied again");
+            // The title writes after the refresh ahead, before the submission.
+            unsafe { title(2 * PAGE + 9).write_volatile(0x22) };
+            let again = copy.update(p, len);
+            assert!(again > 0 && again < len, "only what was written since is copied again ({again} of {len} bytes)");
+            assert_eq!(host(2 * PAGE + 9), 0x22, "a write after the refresh ahead reaches the copy at submission");
+            assert_eq!(host(PAGE + 7), 0x11);
+            done();
+        }
+    }
 }

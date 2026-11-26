@@ -453,6 +453,13 @@ impl Structured {
         }
         .copied()
     }
+
+    /// What holds in every lane that runs the instruction at `site`: its
+    /// block's reach and, for a vector instruction, its guard.
+    pub(crate) fn running(&self, (b, i): (usize, usize)) -> impl Iterator<Item = (Bool, bool)> {
+        let guard = self.guards.get(b).and_then(|g| g.get(i)).copied().flatten();
+        std::iter::once((self.reach[b], true)).chain(guard.map(|g| (g, true)))
+    }
 }
 
 /// Builds the per-lane form of `program`.

@@ -35,8 +35,8 @@ cd /d/victory-data/data/7952987A && B=/d/victory-data/saves-backup-20261125-afte
 The title's executable is the one `.exe` in `D:/victory-data/game/`
 (`ls D:/victory-data/game/*.exe`). Never write its file name into the tree.
 
-Best known switch set (2026-11-26; runs AD/AL, 100-110 ms a frame in play; the staging pool stays on;
-`VICTORY_ASYNC_PAGE_MAPPINGS=1` halves the cutscene low points, runs AK/AL):
+Best known switch set (2026-11-26; runs BI/BJ, 75-77 ms a frame at the cell window, captured; the
+staging pool stays on; async page mappings are on by default with `VICTORY_ASYNC_SUBMIT=1`):
 
 ```bash
 BEST="VICTORY_CARD_HASH_WIDE=1 VICTORY_ASYNC_PAGE_MAPPINGS=1 VICTORY_STAGING_POOL_MB=1024 VICTORY_VIEW_KNOWN=1 VICTORY_ASYNC_PRESENT=1 VICTORY_LEVELS_ON_DEMAND=1 VICTORY_ASYNC_SUBMIT=1 \
@@ -81,6 +81,18 @@ Diagnostics that cost time (leave out when measuring absolute speed):
 
 Other machines' work (cargo builds of agents) skews absolute numbers.
 Compare runs only on a quiet machine, or compare ratios.
+
+Runs go different ways (the title screen comes at a different second, the
+scripted presses land elsewhere, the user walks the character): two runs
+are seldom the same scene. To measure a switch, give it an `alt` mode
+(twenty seconds on, twenty off, each change logged; see
+`VICTORY_RELAY_WIDE`, `VICTORY_WIDE_FILLS`) and split one run by phase:
+`python scripts/altphase.py <log> "<change line text>" "<word of the ON
+line>"` (usual frames per 1,000 draws, the fence's way, the relay's
+copy-back). Add the switch's module to `VICTORY_LOG` so the change lines
+are kept. A run that ends long before its timeout with nothing in the log
+was ended from outside (window closed, title bar clicked): add
+`victory_hle=info` to see "window closed".
 
 ## 4. Read the numbers
 

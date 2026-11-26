@@ -232,6 +232,9 @@ struct Lower<'a> {
     console_lanes: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
+    /// With groups merged ([`group_merge`]): whether this thread's console group is one the
+    /// dispatch has, and that group's x (made in the entry block).
+    merged: Option<(V, V)>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// IR blocks whose `s_barrier` not every lane is sure to reach (a lane
@@ -1284,7 +1287,50 @@ thread_local! {
     pub(super) static TEST_MINMAX_CONST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
     /// A test's [`legacy_mul_mode`], for its thread only.
     pub(super) static TEST_LEGACY_MUL: std::cell::Cell<Option<LegacyMul>> = const { std::cell::Cell::new(None) };
+    /// A test's [`group_merge`], for its thread only.
+    pub(super) static TEST_GROUP_MERGE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
+
+/// `VICTORY_GROUP_MERGE=<k>` (2 or 4; anything else: off): a compute program whose thread
+/// group is one whole console wave of 32 lanes runs k console groups in each host group of
+/// k × 32 threads, the console groups stacked in z (each a host wave of its own on a host of
+/// 32-lane waves, so its lane-level code sees its own lanes). An RTX 3090 holds at most 16
+/// thread groups on an SM, so a group of one wave caps it at 16 of its 48 waves, whatever
+/// the program's registers would allow. In run AN, 32-thread groups were 14.4 ms of the
+/// 24.7 ms of compute in the 40 costliest command kinds; the costliest command (4.67 ms) is
+/// such a program, a ray march whose 44 VGPRs would let some 40 waves an SM hide the
+/// latency of its dependent samples.
+/// Only for programs without LDS and without `s_barrier` (a group barrier would wait for
+/// the other console groups, and a console group that ends early would leave it waiting),
+/// of at most [`MERGE_VGPRS`] VGPRs, and on a host whose waves are 32 lanes. The host
+/// divides the x group count of a direct dispatch by k and passes the console's count in a
+/// user-data dword ([`USER_GROUPS_X`]), past which a host group's console groups end at
+/// once. An indirect dispatch keeps the console's counts (its arguments are in title
+/// memory): the dword is 0 and each host group runs its first console group only, the
+/// others ending at once, but holding their places until the group ends. With k = 2 and
+/// registers within [`MERGE_VGPRS`] that leaves an SM its 16 working waves as before; with
+/// k = 4, 12 (48 waves an SM): try 2 first.
+/// Off until a timing run shows it.
+///
+/// [`USER_GROUPS_X`]: super::shader::USER_GROUPS_X
+fn group_merge() -> u32 {
+    #[cfg(test)]
+    if let Some(k) = TEST_GROUP_MERGE.get() {
+        return k;
+    }
+    static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| match std::env::var("VICTORY_GROUP_MERGE").ok().as_deref().map(str::trim) {
+        Some("2") => 2,
+        Some("4") => 4,
+        _ => 1,
+    })
+}
+
+/// The most VGPRs a program whose groups merge ([`group_merge`]) has on the console. Two
+/// host waves of 64 registers fill an SM's 64 Ki registers with its 16 groups: a program
+/// with more gains less from merging, and its indirect dispatches, each group with one
+/// working wave, would get fewer working waves than before.
+const MERGE_VGPRS: u16 = 64;
 
 /// Whether a float maximum or minimum against a constant whose magnitude is not zero is
 /// the plain FMax/FMin ([`Lower::max_min`]), without the test for two zeros of opposite
@@ -1695,6 +1741,26 @@ impl<'a> Lower<'a> {
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
             }
+            // k console groups in a host group ([`group_merge`]): one whole wave of 32 lanes
+            // a group, nothing shared between the threads of a group, and a first block no
+            // branch comes back to (the host's first block is then the merge's prologue).
+            let shares = insts().any(|i| {
+                i.name() == "s_barrier"
+                    || matches!(i.fields, Fields::Ds { .. })
+                        && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
+            });
+            let merge = group_merge();
+            if merge > 1
+                && !x.native.wave64
+                && group == 32
+                && host_max_wave() == 32
+                && x.native.vgprs <= MERGE_VGPRS
+                && s.lds_dwords == 0
+                && !shares
+                && p.blocks.first().is_some_and(|b| b.preds.is_empty())
+            {
+                s.groups_merged = merge;
+            }
         }
         // The title's barriers a thread of the group may never reach, which
         // leaves the others waiting on the host: those in blocks some lanes
@@ -1853,6 +1919,7 @@ impl<'a> Lower<'a> {
             halves,
             wave_base: None,
             flat: None,
+            merged: None,
             no_barrier,
             fence_only,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -2521,6 +2588,15 @@ impl<'a> Lower<'a> {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
         }
+        if self.s.groups_merged > 1 {
+            // a console group the dispatch does not have ends here
+            let (valid, _) = self.merged_ids();
+            let (body, out) = (self.s.m.new_block(), self.s.m.new_block());
+            self.s.m.terminate(self.cur, Term::CondBr(valid, body, out));
+            self.s.m.terminate(out, Term::Ret);
+            self.cur = body;
+            self.block[order[0]] = Some(body);
+        }
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
@@ -2577,6 +2653,10 @@ impl<'a> Lower<'a> {
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        if self.s.groups_merged > 1 && self.s.flags & flags::WAVE_OPS != 0 {
+            // a wave operation must see one console group's lanes: a host wave of 32 each
+            self.s.wave_size = Some(32);
+        }
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             wave_size,
@@ -2661,10 +2741,10 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => return self.compute_id(94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
-                let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+                let Val::I32(g) = self.compute_id(94, 0) else {
                     unreachable!()
                 };
                 let n = self.s.m.i32(self.x.mesh_stride);
@@ -2726,13 +2806,59 @@ impl<'a> Lower<'a> {
         self.load_input(id, col)
     }
 
-    /// A component of a compute thread or group id, read in the entry block.
-    fn compute_id(&mut self, name: &str, opcode: u32, c: u8) -> Val {
+    /// A component of a compute thread or group id, read in the entry block. With groups
+    /// merged ([`group_merge`]), the console group's: its x from [`Lower::merged_ids`], its
+    /// thread's z within the console's group.
+    fn compute_id(&mut self, opcode: u32, c: u8) -> Val {
+        if self.s.groups_merged > 1 {
+            if opcode == 94 && c == 0 {
+                return Val::I32(self.merged_ids().1);
+            }
+            if opcode == 95 && c == 2 {
+                let z = self.s.threads.expect("compute")[2];
+                let host = self.host_id(opcode, 2);
+                let z = self.s.m.i32(z);
+                return Val::I32(self.s.m.bin(self.s.entry, Bin::URem, host, z));
+            }
+        }
+        Val::I32(self.host_id(opcode, c))
+    }
+
+    /// Component `c` of the host's thread id in the group (`opcode` 95) or group id (94).
+    fn host_id(&mut self, opcode: u32, c: u8) -> V {
+        let name = if opcode == 94 { "groupId.i32" } else { "threadIdInGroup.i32" };
         let (entry, c) = (self.s.entry, self.s.m.i32(u32::from(c)));
-        Val::I32(
-            self.s
-                .op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[c]),
-        )
+        self.s.op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[c])
+    }
+
+    /// With groups merged ([`group_merge`]): whether this thread's console group is one the
+    /// dispatch has, and its x. The host group's console groups are its waves of 32 in order;
+    /// the dispatch's x count of console groups is a user-data dword ([`USER_GROUPS_X`]), 0
+    /// when the host's group counts are the console's (then only the first runs).
+    ///
+    /// [`USER_GROUPS_X`]: super::shader::USER_GROUPS_X
+    fn merged_ids(&mut self) -> (V, V) {
+        if let Some(ids) = self.merged {
+            return ids;
+        }
+        let (e, i32t, k) = (self.s.entry, self.s.t.i32, self.s.groups_merged);
+        let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+        let group = self.s.threads.expect("compute").iter().product::<u32>();
+        let group = self.s.m.i32(group);
+        let sub = self.s.m.bin(e, Bin::UDiv, flat, group);
+        let host_x = self.host_id(94, 0);
+        let count = self.host_word(RootType::Other(super::shader::USER_GROUPS_X), 0, k);
+        let kk = self.s.m.i32(k);
+        let first = self.s.m.bin(e, Bin::Mul, host_x, kk);
+        let merged_x = self.s.m.bin(e, Bin::Add, first, sub);
+        let zero = self.s.m.i32(0);
+        let console = self.s.m.cmp(e, pred::EQ, count, zero);
+        let x = self.s.m.select(e, console, host_x, merged_x);
+        let leading = self.s.m.cmp(e, pred::EQ, sub, zero);
+        let inside = self.s.m.cmp(e, pred::IULT, merged_x, count);
+        let valid = self.s.m.select(e, console, leading, inside);
+        self.merged = Some((valid, x));
+        (valid, x)
     }
 
     fn find_input(&self, row: u8, channel: u8) -> Option<(usize, u8)> {
@@ -4426,7 +4552,7 @@ impl<'a> Lower<'a> {
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
         if !self.console_lanes {
-            return self.compute_id("threadIdInGroup.i32", 95, c);
+            return self.compute_id(95, c);
         }
         let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
@@ -4464,7 +4590,13 @@ impl<'a> Lower<'a> {
         let mask = self.s.m.i32(!(wave - 1));
         let base = self.s.m.bin(e, Bin::And, first, mask);
         let lane = self.lane_index();
-        let f = self.s.m.bin(e, Bin::Add, base, lane);
+        let mut f = self.s.m.bin(e, Bin::Add, base, lane);
+        if self.s.groups_merged > 1 {
+            // the thread's index in its console group
+            let group = self.s.threads.expect("compute").iter().product::<u32>();
+            let group = self.s.m.i32(group);
+            f = self.s.m.bin(e, Bin::URem, f, group);
+        }
         self.s.flags |= flags::WAVE_OPS;
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
         Val::I32(match c {

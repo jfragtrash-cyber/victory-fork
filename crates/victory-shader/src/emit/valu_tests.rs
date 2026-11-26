@@ -100,7 +100,14 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 /// [`build_valu_cs`] with `threads` threads in x (thread index in `v0`
 /// on entry, before `body`) and `lds_bytes` of LDS (a multiple of 512).
 fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
-    let mut words = Vec::new();
+    build_cs_with(&[], body, threads, (5 << 1) | ((lds_bytes / 512) << 15))
+}
+
+/// [`build_cs`] with `head` before the prologue (which sets `s5`) and the program's
+/// `COMPUTE_PGM_RSRC2` given: 5 user SGPRs (`s0..s4`) and whatever system SGPRs it enables
+/// after them (bit 7: the group id in x, in `s5`).
+fn build_cs_with(head: &[u32], body: &[u32], threads: u32, rsrc2: u32) -> HostShader {
+    let mut words = head.to_vec();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
     words.extend_from_slice(&s_load_dwordx4(8, 4));
@@ -147,7 +154,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: (5 << 1) | ((lds_bytes / 512) << 15), // 5 user SGPRs: s0..s4
+            rsrc2,
             threads: [threads, 1, 1],
         }),
         code,
@@ -578,6 +585,119 @@ fn legacy_multiply_against_a_constant_keeps_the_d3d9_rule() {
             }
         }
     }
+}
+
+/// A 32-thread program (the group id in x copied to `v5` first) whose thread `t` of group
+/// `g` stores `32 g + t + 1` at dword `32 g + t`, plus `readfirstlane(32 g + t)` with
+/// `wave`; every thread then stores 1 to dword 0 (`build_cs`'s own store), which is what
+/// thread 0 of group 0 stores there anyway. Built with `merge` console groups a host group.
+fn merge_program(wave: bool, merge: Option<u32>) -> HostShader {
+    let head = [vop1(0x001, 5, sgpr(5))]; // v_mov_b32 v5, s5 (the group id)
+    let mut body = Vec::new();
+    body.extend_from_slice(&vop3(0x11A, 6, 133, vgpr(5), 0)); // v_lshlrev_b32 v6, 5, v5
+    body.extend_from_slice(&vop3(0x125, 6, vgpr(6), vgpr(0), 0)); // v_add_nc_u32 v6, v6, v0
+    body.extend_from_slice(&vop3(0x125, 7, 129, vgpr(6), 0)); // v_add_nc_u32 v7, 1, v6
+    if wave {
+        body.push(vop1(0x002, 12, vgpr(6))); // v_readfirstlane_b32 s12, v6
+        body.extend_from_slice(&vop3(0x125, 7, sgpr(12), vgpr(7), 0)); // v_add_nc_u32 v7, s12, v7
+    }
+    body.extend_from_slice(&vop3(0x11A, 6, 130, vgpr(6), 0)); // v_lshlrev_b32 v6, 2, v6
+    // buffer_store_dword v7, v6, s[8:11], 0 offen
+    let [w0, w1] = buffer_store_dword(7, 8, 0);
+    body.extend_from_slice(&[w0 | 1 << 12, w1 | 6]);
+    body.push(vop1(0x001, 0, 129)); // v_mov_b32 v0, 1
+    let was = (lower::TEST_GROUP_MERGE.replace(merge), lower::TEST_HOST_WAVE.replace(Some(32)));
+    let shader = build_cs_with(&head, &body, 32, (5 << 1) | 1 << 7);
+    lower::TEST_GROUP_MERGE.set(was.0);
+    lower::TEST_HOST_WAVE.set(was.1);
+    shader
+}
+
+/// `merge_program` dispatched with `groups` host groups in x, `count` in its
+/// `USER_GROUPS_X` dword: the UAV's `dwords`.
+fn dispatch_groups(host: &Host, shader: &HostShader, groups: u32, count: u32, dwords: u32) -> Vec<u32> {
+    let (root, pso) = host.compute_pipeline(shader).unwrap_or_else(|e| panic!("compute_pipeline failed: {e}"));
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        ud[u.index as usize] = match u.root {
+            RootType::Other(super::USER_GROUPS_X) => count,
+            RootType::Constants | RootType::Table => 0,
+            other => panic!("unexpected user data {other:?}"),
+        };
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(dwords)],
+                samplers: &[],
+                groups: [groups, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    out[0].clone()
+}
+
+/// Console groups merged into host groups (`VICTORY_GROUP_MERGE`) write what the console's
+/// groups write: 7 groups as 4 host groups of 2 and 2 of 4 (the last with console groups
+/// past the dispatch, which end at once), and as 7 host groups with the dword 0 (an indirect
+/// dispatch, the host's counts the console's), each running its first console group only.
+fn check_merged_groups(wave: bool, devices: &[(&str, bool)]) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let (console, dwords) = (7u32, 8 * 32);
+    let want: Vec<u32> = (0..dwords)
+        .map(|i| match i {
+            _ if i >= console * 32 => 0,
+            _ if wave => i + 1 + i / 32 * 32,
+            _ => i + 1,
+        })
+        .collect();
+    let plain = merge_program(wave, None);
+    assert!(
+        !plain.user_data.iter().any(|u| u.root == RootType::Other(super::USER_GROUPS_X)),
+        "merged without the switch"
+    );
+    let mut ran = 0;
+    for &(label, warp) in devices {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        assert_eq!(dispatch_groups(&host, &plain, console, 0, dwords), want, "{label}: as the console's");
+        for k in [2, 4] {
+            let merged = merge_program(wave, Some(k));
+            let u = merged
+                .user_data
+                .iter()
+                .find(|u| u.root == RootType::Other(super::USER_GROUPS_X))
+                .expect("the group count dword");
+            assert_eq!(u.dword, k, "{label}: the dword's merge factor");
+            let got = dispatch_groups(&host, &merged, console.div_ceil(k), console, dwords);
+            assert_eq!(got, want, "{label}: {k} console groups a host group");
+            let got = dispatch_groups(&host, &merged, console, 0, dwords);
+            assert_eq!(got, want, "{label}: {k} merged, dispatched with the console's counts");
+            // a dispatch of 6 console groups leaves the 7th's dwords alone
+            let got = dispatch_groups(&host, &merged, 6u32.div_ceil(k), 6, dwords);
+            let six: Vec<u32> = want.iter().enumerate().map(|(i, &w)| if i < 6 * 32 { w } else { 0 }).collect();
+            assert_eq!(got, six, "{label}: {k} merged, 6 console groups");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0 || devices.iter().all(|&(_, warp)| !warp), "no SM 6.6 device available");
+}
+
+#[test]
+fn merged_groups_write_what_the_console_groups_write() {
+    check_merged_groups(false, &[("hardware", false), ("warp", true)]);
+}
+
+/// With a wave operation the merged program asks for waves of 32 (each a console group);
+/// WARP takes no such pipeline, so the hardware alone.
+#[test]
+fn merged_groups_keep_each_console_group_in_its_own_wave() {
+    check_merged_groups(true, &[("hardware", false)]);
 }
 
 #[test]

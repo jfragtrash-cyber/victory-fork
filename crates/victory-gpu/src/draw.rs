@@ -438,6 +438,9 @@ pub(crate) struct State {
     root_uav_slots: FastMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// While a direct dispatch of a program that merges thread groups binds: the title's
+    /// group count in x (the user-data dword `USER_GROUPS_X`); 0 otherwise.
+    groups_x: u32,
 }
 
 impl Drop for State {
@@ -1052,9 +1055,13 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_GROUPS_X, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_GROUPS_X {
+            // (0 outside `dispatch`: the group counts are the title's)
+            return self.groups_x;
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -2409,7 +2416,18 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        // A program that runs k of the title's groups in each host group
+        // (`VICTORY_GROUP_MERGE`, the translation's `USER_GROUPS_X` dword):
+        // x.div_ceil(k) host groups, told the title's x.
+        let merged = p
+            .stages
+            .iter()
+            .flat_map(|s| s.translated().host.user_data.iter())
+            .find(|u| u.root == RootType::Other(victory_shader::emit::USER_GROUPS_X))
+            .map_or(1, |u| u.dword.max(1));
+        self.groups_x = if merged > 1 { x } else { 0 };
         if !self.bind(list, p, true) {
+            self.groups_x = 0;
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -2420,8 +2438,9 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        self.groups_x = 0;
         // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        unsafe { list.list.Dispatch(x.div_ceil(merged), y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 

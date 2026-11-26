@@ -71,6 +71,9 @@ struct Tally {
     ms_pipelines: usize,
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
+    /// Programs that translated other than at the first try, or with an approximate lane
+    /// write, by how (`emit::last_path`) → programs, and the first one.
+    paths: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
@@ -136,6 +139,9 @@ impl Tally {
         self.lines.extend(other.lines);
         for (reason, (n, example)) in other.failed {
             self.failed.entry(reason).or_insert((0, example)).0 += n;
+        }
+        for (path, (n, example)) in other.paths {
+            self.paths.entry(path).or_insert((0, example)).0 += n;
         }
     }
 }
@@ -356,6 +362,9 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    for (path, (n, example)) in &t.paths {
+        println!("  {n:>7}  path: {path}  (e.g. {example})");
+    }
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -545,6 +554,15 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                     match emit::emit(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
+                            let (took, form) = emit::last_path();
+                            let approx = form & emit::form::APPROX_LANE_WRITE != 0;
+                            if took != "first try" || approx {
+                                let path = format!("{took}{}", if approx { ", APPROXIMATE lane write" } else { "" });
+                                if t.list {
+                                    t.lines.push(format!("{}  path: {path}", label()));
+                                }
+                                t.paths.entry(path).or_insert_with(|| (0, label())).0 += 1;
+                            }
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);
                         }

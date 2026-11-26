@@ -7,6 +7,7 @@
 //! console-only intrinsics, so the GFX10 code is translated in general.
 
 pub mod bvh;
+pub mod dualbank;
 pub mod dxbc;
 pub mod dxil;
 pub mod emit;

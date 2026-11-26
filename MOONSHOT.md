@@ -666,3 +666,11 @@ already reach.
   one): `VICTORY_RELAY_WIDE` stays off. Of 72 MB fetched a frame, 52.7
   are written back to title memory (first to last byte that differs) and
   31 MB were changed by the card: writing the card's words alone is next.
+- 2026-11-26, morning. The landing stores back only where a merge changed
+  title memory (16-byte places, joined 64 bytes apart), through our own
+  view (`VICTORY_BACK_PARTS`). Run BK (`alt`, captured, the cell window,
+  more people in the yard than BJ: 4,060 draws): the relay's copy-back
+  54.9 ms a frame with, 55.3 without; per 1,000 draws 20.35 ms a frame
+  with, 19.44 without: no gain, the switch is off by default (it keeps a
+  title write that falls between the merge's read and its store). The
+  pictures right.

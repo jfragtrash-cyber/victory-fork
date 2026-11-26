@@ -201,6 +201,39 @@ pub(crate) fn relay_wide() -> usize {
     if on { n } else { 1 }
 }
 
+/// Whether the landing stores through our own view only the places where a
+/// merge changed title memory (`VICTORY_BACK_PARTS=1`; off by default: the
+/// whole stretch from the first byte to the last that differs). Run BJ: of
+/// 72 MB fetched a frame, 52.7 MB were stored back so and 31 MB had been
+/// changed by the card; and a byte the title wrote between the merge's read
+/// and its store is put back to the value read. Run BK measured no gain
+/// (the relay's copy-back 54.9 ms a frame with, 55.3 without; the store
+/// through our view is a plain copy, a small part of it). (After
+/// VIctory-7900XTX 0d5e4c8, which writes the changed words alone.) `alt`:
+/// twenty seconds each way in turn, each change said in the log.
+fn back_parts() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_BACK_PARTS").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = (crate::host::now_us() / 20_000_000) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "the landing stores from now (VICTORY_BACK_PARTS=alt): {}",
+                    if on { "PARTS, where title memory changes" } else { "the whole stretch, as before" }
+                );
+            }
+            on
+        }
+    }
+}
+
 /// `VICTORY_RELAY_WIDE` as asked: the threads, and whether in turn (`alt`).
 fn relay_threads() -> (usize, bool) {
     static N: std::sync::OnceLock<(usize, bool)> = std::sync::OnceLock::new();
@@ -976,10 +1009,23 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 /// [`merge_piece`], and what the card changed: its bytes, and the 4 KiB
 /// stretches (from the first byte given) that hold one or more of them.
 fn merge_piece_counted(now: &[u8], held: &mut [u8], title: &mut [u8]) -> (bool, usize, usize) {
+    merge_piece_marked(now, held, title, |_, _| {})
+}
+
+/// [`merge_piece_counted`], telling `changed_at(offset, bytes)`, in order,
+/// each place where `title` changed: sixteen bytes that hold one or more
+/// of those, or one byte at the end.
+fn merge_piece_marked(
+    now: &[u8],
+    held: &mut [u8],
+    title: &mut [u8],
+    mut changed_at: impl FnMut(usize, usize),
+) -> (bool, usize, usize) {
     const STRETCH: usize = 4 << 10;
     let (mut changed, mut bytes, mut stretches) = (false, 0usize, 0usize);
-    for ((now, held), title) in now.chunks(STRETCH).zip(held.chunks_mut(STRETCH)).zip(title.chunks_mut(STRETCH)) {
-        let (differs, wrote_here) = merge_stretch(now, held, title);
+    let stretches_of = now.chunks(STRETCH).zip(held.chunks_mut(STRETCH)).zip(title.chunks_mut(STRETCH));
+    for (k, ((now, held), title)) in stretches_of.enumerate() {
+        let (differs, wrote_here) = merge_stretch(now, held, title, |at, n| changed_at(k * STRETCH + at, n));
         changed |= differs;
         bytes += wrote_here;
         stretches += usize::from(wrote_here != 0);
@@ -996,7 +1042,7 @@ fn merge_piece_counted(now: &[u8], held: &mut [u8], title: &mut [u8]) -> (bool, 
 /// write cost one compare. Byte by byte it was 20 ms a frame of the
 /// landing thread in run BA, which works 56 ms of a ~80 ms frame, and the
 /// title's fences wait for its landings.
-fn merge_stretch(now: &[u8], held: &mut [u8], title: &mut [u8]) -> (bool, usize) {
+fn merge_stretch(now: &[u8], held: &mut [u8], title: &mut [u8], mut changed_at: impl FnMut(usize, usize)) -> (bool, usize) {
     let n = now.len().min(held.len()).min(title.len());
     let (mut differs, mut wrote) = (false, 0usize);
     let mut i = 0;
@@ -1018,7 +1064,10 @@ fn merge_stretch(now: &[u8], held: &mut [u8], title: &mut [u8]) -> (bool, usize)
                     let t = _mm_loadu_si128(title.as_ptr().add(i).cast());
                     // The card's byte where it wrote, the title's elsewhere.
                     let merged = _mm_or_si128(_mm_and_si128(same, t), _mm_andnot_si128(same, a));
-                    differs |= _mm_movemask_epi8(_mm_cmpeq_epi8(merged, t)) != 0xffff;
+                    if _mm_movemask_epi8(_mm_cmpeq_epi8(merged, t)) != 0xffff {
+                        differs = true;
+                        changed_at(i, 16);
+                    }
                     _mm_storeu_si128(title.as_mut_ptr().add(i).cast(), merged);
                     _mm_storeu_si128(held.as_mut_ptr().add(i).cast(), a);
                     wrote += (!kept & 0xffff).count_ones() as usize;
@@ -1029,7 +1078,10 @@ fn merge_stretch(now: &[u8], held: &mut [u8], title: &mut [u8]) -> (bool, usize)
     }
     for k in i..n {
         if now[k] != held[k] {
-            differs |= title[k] != now[k];
+            if title[k] != now[k] {
+                differs = true;
+                changed_at(k, 1);
+            }
             title[k] = now[k];
             held[k] = now[k];
             wrote += 1;
@@ -1523,7 +1575,7 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod difference_tests {
-    use super::{first_difference, last_difference, merge_piece_counted};
+    use super::{first_difference, last_difference};
 
     /// The merge by sixteen bytes gives what the merge byte by byte gave
     /// (title, kept bytes, and the counts), whatever the length and
@@ -1564,10 +1616,22 @@ mod difference_tests {
                 let title: Vec<u8> = held.iter().map(|&h| if next() % 16 == 0 { next() as u8 } else { h }).collect();
                 let (mut h1, mut t1) = (held.clone(), title.clone());
                 let (mut h2, mut t2) = (held.clone(), title.clone());
-                let a = merge_piece_counted(&now, &mut h1, &mut t1);
+                let mut places = Vec::new();
+                let a = super::merge_piece_marked(&now, &mut h1, &mut t1, |at, n| places.push((at, at + n)));
                 let b = by_bytes(&now, &mut h2, &mut t2);
                 assert_eq!(a, b, "len {len} density {density}");
                 assert!(t1 == t2 && h1 == h2, "len {len} density {density}");
+                // The places told hold every byte of `title` that changed,
+                // each at least one, in order.
+                assert!(places.windows(2).all(|w| w[0].1 <= w[1].0));
+                for (i, (&before, &after)) in title.iter().zip(&t1).enumerate() {
+                    if before != after {
+                        assert!(places.iter().any(|&(f, t)| f <= i && i < t), "byte {i} len {len}");
+                    }
+                }
+                for &(f, t) in &places {
+                    assert!(title[f..t] != t1[f..t], "place {f}..{t} len {len}");
+                }
             }
         }
     }
@@ -3909,7 +3973,7 @@ impl Shadow {
             return 0;
         }
         crate::host::shaders_write(start + at, &title[..]);
-        if self.put_back_own(start + at, &title[..]) {
+        if self.put_back_own(start + at, &title[..], &[(0, n)]) {
             return n;
         }
         crate::watch::writing(start + at, n);
@@ -3928,7 +3992,7 @@ impl Shadow {
     /// and is reported at a later asking, which every copy then takes,
     /// this one too. False with nothing done if the switch is off or the
     /// memory cannot be written that way (the caller writes as before).
-    fn put_back_own(&self, at: usize, bytes: &[u8]) -> bool {
+    fn put_back_own(&self, at: usize, bytes: &[u8], parts: &[(usize, usize)]) -> bool {
         /// Since the start: stretches and bytes stored this way, pages
         /// noted current for their copy, stretches written the old way;
         /// and with `VICTORY_BACK_OWN_CHECK=1`: stores the title's own
@@ -3942,7 +4006,7 @@ impl Shadow {
         if !crate::inplace::back_own() {
             return false;
         }
-        let Some(shown) = crate::inplace::write_own(at, bytes) else {
+        let Some(shown) = crate::inplace::write_own(at, bytes, parts) else {
             OWN_WRITES[3].fetch_add(1, Ordering::Relaxed);
             return false;
         };
@@ -3987,7 +4051,8 @@ impl Shadow {
                 }
             }
         }
-        OWN_WRITES[1].fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        let stored: usize = parts.iter().map(|p| p.1.min(bytes.len()).saturating_sub(p.0)).sum();
+        OWN_WRITES[1].fetch_add(stored as u64, Ordering::Relaxed);
         let n = OWN_WRITES[0].fetch_add(1, Ordering::Relaxed) + 1;
         if n % 16384 == 0 {
             tracing::info!(
@@ -4917,18 +4982,30 @@ impl Shadow {
         // title's, and may have been written again since.
         let as_read = (mapped && merge_race_on()).then(|| title.clone());
         let (mut changed, mut bytes, mut stretches) = (false, 0, 0);
+        // Where title memory changes, `[from, to)` in `title`: what is
+        // stored back through our own view. Places this close are one.
+        const PART_GAP: usize = 64;
+        let mut parts: Vec<(usize, usize)> = Vec::new();
         for (a, b) in outside(at, at + n, skip) {
             let (a, b) = (a - at, b - at);
             // Title memory that is not mapped: the CPU's side keeps what
             // the card wrote, as before; `title` is scratch then.
-            let (c, by, st) = merge_piece_counted(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
+            let (c, by, st) = merge_piece_marked(&gpu[a..b], &mut held[a..b], &mut title[a..b], |off, len| {
+                let (from, to) = (a + off, a + off + len);
+                match parts.last_mut() {
+                    Some(last) if from <= last.1 + PART_GAP => last.1 = last.1.max(to),
+                    _ => parts.push((from, to)),
+                }
+            });
             (changed, bytes, stretches) = (changed | c, bytes + by, stretches + st);
         }
         if !mapped || !changed {
             return (0, bytes, stretches);
         }
         crate::host::shaders_write(start + at, &title[..]);
-        if self.put_back_own(start + at, &title[..]) {
+        // Only where it changes ([`back_parts`]).
+        let whole = [(0, n)];
+        if self.put_back_own(start + at, &title[..], if back_parts() { &parts } else { &whole }) {
             return (n, bytes, stretches);
         }
         crate::watch::writing(start + at, n);

@@ -786,13 +786,14 @@ struct Own {
 /// host refused the view (not asked again).
 static OWN: Mutex<Option<std::collections::HashMap<usize, Option<Own>>>> = Mutex::new(None);
 
-/// Stores `bytes` at title address `at` through a view of our own
-/// ([`back_own`]), if `[at, at + bytes.len())` lies in one 64 KiB page of
-/// a title view of a section. Gives the addresses of that page in every
-/// title view that shows it (the page of `at` among them), or `None` with
-/// nothing written: not view memory, a page of very many views, the
-/// runtime changing mappings at this moment, or the host refusing.
-pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
+/// Stores the parts `[from, to)` of `bytes` (offsets in it, in order) at
+/// title address `at` on, through a view of our own ([`back_own`]), if
+/// `[at, at + bytes.len())` lies in one 64 KiB page of a title view of a
+/// section. Gives the addresses of that page in every title view that shows
+/// it (the page of `at` among them), or `None` with nothing written: not
+/// view memory, a page of very many views, the runtime changing mappings at
+/// this moment, or the host refusing.
+pub(crate) fn write_own(at: usize, bytes: &[u8], parts: &[(usize, usize)]) -> Option<Vec<usize>> {
     if bytes.is_empty() || at / K64 != (at + bytes.len() - 1) / K64 {
         return None;
     }
@@ -867,8 +868,13 @@ pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
     drop(own);
     // SAFETY: committed bytes inside our own view, which is never unmapped
     // (one forgotten stays mapped, `title_memory_section`); the source is
-    // the caller's slice.
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), into as *mut u8, bytes.len()) };
+    // the caller's slice, the parts inside it.
+    for &(from, to) in parts {
+        let to = to.min(bytes.len());
+        if from < to {
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr().add(from), (into + from) as *mut u8, to - from) };
+        }
+    }
     Some(shown)
 }
 

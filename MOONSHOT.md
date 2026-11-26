@@ -636,3 +636,18 @@ already reach.
   objects early in the world are there in BF as well). Play at 84.4 ms
   a frame at 4,473 draws (BB 76.9 at 3,953): 18.9 ms per 1,000 draws
   against 19.5.
+- 2026-11-26, morning. Cube levels from DXIL's base-2 logarithm (they
+  were 1.44 times too high, the reflections too blurred) and the
+  instruction's least level kept (VIctory-7900XTX 9a6c829's cube part,
+  with its card test); the cache warmed anew (25,696 shaders, 373 s on 4
+  threads). Run BI (best set, captured; it stayed at the cell window, as
+  BB did): play 77.4 ms a frame at 3,723 draws (BB 76.9 at 3,953), 20.8
+  ms per 1,000 draws against 19.5, the submitting thread 57.0 against
+  53.7: the morning's changes are inside the noise. The pictures right.
+  The submitting thread does not wait for flights for the title memory
+  it reads ("title memory read 0.0": fills are not waited for), so the
+  card steps VIctory-7900XTX made for that wait (CARD_STEPS) have
+  nothing to take here. Left of that report, by size: the title threads'
+  recording handed to threads of ours (THIN, their 75 -> 68 ms), the
+  written 4 KiB parts of a page copied alone (PAGE_PARTS), faults that
+  open one view and leave a block open 3 ms (GUARD_REST).

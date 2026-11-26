@@ -3180,12 +3180,40 @@ mod fill_check {
     }
 }
 
+/// The ranges `runs` refresh of copies that are watched, in order, those
+/// that overlap or touch made one: what a submission's one asking is about
+/// with `crate::watch::ask_exact`.
+fn refreshed_ranges(runs: &[&HostList]) -> Vec<(usize, usize)> {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::Refresh(shadow, address, len) = step
+                && *len > 0
+                && !shadow.unwatched()
+            {
+                ranges.push((*address, *address + *len));
+            }
+        }
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (a, e) in ranges {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(e),
+            _ => merged.push((a, e)),
+        }
+    }
+    merged
+}
+
 /// With flights in the air, after the submission's write-watch asking:
 /// whether `runs` refresh a range of a host copy that a flight's shaders
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
-/// the title's bytes there would reach the card a submission late.
-fn stale_under_flights(runs: &[&HostList]) -> bool {
+/// the title's bytes there would reach the card a submission late. With
+/// `exact` (`crate::watch::ask_exact`), per copy the ranges refreshed, those
+/// closer than the askings' gap made one, as the refreshes are (`Batch`).
+fn stale_under_flights(runs: &[&HostList], exact: bool) -> bool {
     use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
@@ -3195,12 +3223,29 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
             if let Step::Refresh(shadow, address, len) = step
                 && shadow.writes_pending()
             {
+                if exact {
+                    spans.push((shadow.clone(), *address, *address + *len));
+                    continue;
+                }
                 match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
                     Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
                     None => spans.push((shadow.clone(), *address, *address + *len)),
                 }
             }
         }
+    }
+    if exact {
+        spans.sort_unstable_by_key(|s| (Arc::as_ptr(&s.0) as usize, s.1));
+        let mut merged: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::with_capacity(spans.len());
+        for (shadow, a, e) in spans {
+            match merged.last_mut() {
+                Some(last) if Arc::ptr_eq(&last.0, &shadow) && a <= last.2.saturating_add(crate::watch::AHEAD_GAP_BYTES) => {
+                    last.2 = last.2.max(e);
+                }
+                _ => merged.push((shadow, a, e)),
+            }
+        }
+        spans = merged;
     }
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
@@ -5784,40 +5829,58 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        // With the submission's one asking about the ranges refreshed
+        // (`crate::watch::ask_exact`, read once here): a copy's refreshes
+        // are split where its ranges lie apart, so each lies in one asking.
+        let exact = crate::watch::once() && crate::watch::ask_exact();
+        let mut batch = Batch { exact, ..Batch::default() };
         // The time a settle of flights takes inside this preparing: the
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
         // One write-watch asking for everything the submission refreshes
-        // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
+        // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges;
+        // with `exact`, the ranges.
         if crate::watch::once() {
-            let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
-            for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && !shadow.unwatched()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+            static SAMPLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let sample = SAMPLED.fetch_add(1, Ordering::Relaxed).is_multiple_of(8);
+            let ranges: Vec<(usize, usize)> = if exact {
+                refreshed_ranges(runs)
+            } else {
+                let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
+                for list in runs {
+                    for step in &list.deferred().copies {
+                        if let Step::Refresh(shadow, address, len) = step
+                            && !shadow.unwatched()
+                        {
+                            let span = spans
+                                .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                                .or_insert((*address, *address + *len));
+                            *span = (span.0.min(*address), span.1.max(*address + *len));
+                        }
                     }
                 }
+                spans.into_values().collect()
+            };
+            // What an exact asking would cover, now and then (the line of
+            // `crate::watch::ahead_line`).
+            if sample {
+                let pages = |&(a, e): &(usize, usize)| (e.div_ceil(crate::watch::PAGE) - a / crate::watch::PAGE) as u64;
+                let refreshed: u64 = if exact { ranges.iter().map(pages).sum() } else { refreshed_ranges(runs).iter().map(pages).sum() };
+                crate::watch::note_refreshed(refreshed);
             }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
             crate::watch::ask_once(&ranges);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            if behind && stale_under_flights(runs, exact) {
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
                 crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(runs) {
+        } else if behind && stale_under_flights(runs, false) {
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
@@ -7923,6 +7986,12 @@ struct Batch {
     textures: std::collections::HashSet<usize>,
     /// Fills not made yet (destination, source, bytes): [`wide_fills`].
     fills: Vec<(usize, usize, usize)>,
+    /// The submission's one asking is about the ranges refreshed
+    /// (`crate::watch::ask_exact`): a copy's range farther than the
+    /// askings' gap from its pending refresh is not merged into it (the
+    /// refresh would span what was not asked about); the pending one is
+    /// done first.
+    exact: bool,
 }
 
 impl Batch {
@@ -7963,6 +8032,17 @@ impl Batch {
                 crate::copystat::add(crate::copystat::C::SkippedBytes, len as u64);
             }
             return;
+        }
+        if self.exact
+            && let Some(&at) = self.index.get(&key)
+        {
+            let r = &self.refreshes[at];
+            if crate::watch::apart(r.1, r.2, address, end) {
+                // Done now, before any later step: nothing between the
+                // steps that made it and this one wrote title memory (a
+                // step that does flushes first).
+                self.flush_one(shadow);
+            }
         }
         match self.index.get(&key) {
             Some(&at) => {
@@ -8559,6 +8639,7 @@ impl Meter {
         crate::watch::shared_line(frames);
         crate::watch::rest_line(frames);
         crate::watch::hole_bits_line(frames);
+        crate::watch::ahead_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);

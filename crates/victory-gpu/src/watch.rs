@@ -270,8 +270,96 @@ pub(crate) fn forget_written(start: usize, end: usize) {
 /// call that resets written pages costs 30-70 microseconds whatever the
 /// range).
 const AHEAD_GAP: usize = (8 << 20) / PAGE;
+/// [`AHEAD_GAP`] in bytes: ranges of one copy closer than this are one
+/// refresh with `VICTORY_ASK_EXACT` ([`ask_exact`]), and so lie in one
+/// asking.
+pub(crate) const AHEAD_GAP_BYTES: usize = AHEAD_GAP * PAGE;
 /// The most one asking covers (its answer needs 8 bytes per 4 KiB page).
 const AHEAD_MAX: usize = (1 << 30) / PAGE;
+
+/// Whether a submission's one asking ([`ask_once`]) is about the ranges
+/// its lists refresh, not about the span of each copy's refreshed ranges
+/// (`VICTORY_ASK_EXACT=1`; `alt`: twenty seconds with, twenty without, in
+/// turn, each change said in the log; off by default). Read once a
+/// submission (`crate::host`): its refreshes and the look under the flights
+/// go by what it says there too.
+///
+/// A kernel asking walks every page of its range (by hand, 2026-11-26, a
+/// test process of 1 GiB write-watched: 0.75 us a MB alone, about 1.4 with
+/// 24 threads of the process running beside, so 0.8-1.5 ms for 1 GiB,
+/// whatever was written; a failed asking 0.3-0.5 us, and some 10 us more
+/// when it resets written pages, the shootdown of TLBs). Run BA's play
+/// spent 3.7 ms a frame of the submitting thread in the askings of
+/// `ask_once` (9.6 submissions a frame) and run BL had 1.2 askings a frame
+/// of a millisecond or more (2.4 ms a frame): runs of hundreds of MB. A
+/// copy of a big buffer whose lists read pieces far apart was asked about
+/// from its first piece to its last. With the switch the ranges themselves
+/// are asked about (those of a copy closer than [`AHEAD_GAP`] together, as
+/// before), and a copy's refreshes of one flush are split where its ranges
+/// lie farther apart (`crate::host`'s `Batch`), so each still lies in one
+/// asking and is answered from the journal. What the lists do not read is
+/// neither asked about nor copied. `ahead_line` says what was asked.
+pub(crate) fn ask_exact() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_ASK_EXACT").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = (crate::host::now_us() / 20_000_000) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a submission's one write-watch asking from now (VICTORY_ASK_EXACT=alt): {}",
+                    if on { "EXACT, about the ranges refreshed" } else { "off, about each copy's span as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Since the last frame line ([`ahead_line`]), of the askings ahead
+/// ([`ask_ahead`], [`ask_once`]): runs of two ranges or more asked
+/// together, the pages they spanned (what the kernel walks), the pages of
+/// the ranges in them; ranges asked alone, their pages; the microseconds
+/// of `ask_once`, and its submissions; of the submissions sampled
+/// ([`note_refreshed`]), the pages of the ranges their lists refresh, and
+/// how many.
+static AHEAD: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
+/// The pages of the ranges a submission's lists refresh, all copies
+/// together (sampled by `crate::host`): what an exact asking would cover.
+pub(crate) fn note_refreshed(pages: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    AHEAD[7].fetch_add(pages, Relaxed);
+    AHEAD[8].fetch_add(1, Relaxed);
+}
+
+/// With the frame line: what [`AHEAD`] counted, per submission.
+pub(crate) fn ahead_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = AHEAD.each_ref().map(|a| a.swap(0, Relaxed) as f64);
+    let (subs, sampled) = (n[6].max(1.0), n[8].max(1.0));
+    let mb = |pages: f64| pages * (PAGE >> 10) as f64 / 1024.0;
+    tracing::info!(
+        "write-watch askings ahead per submission ({:.1} submissions a frame; VICTORY_ASK_EXACT {}): {:.1} runs over {:.0} MB \
+         (what the kernel walks), the ranges asked in them {:.0} MB; {:.1} ranges asked alone, {:.0} MB; {:.0} us in all; \
+         the ranges the lists refresh, all copies together, {:.0} MB (one submission in 8)",
+        n[6] / frames,
+        if ask_exact() { "on" } else { "off" },
+        n[0] / subs,
+        mb(n[1] / subs),
+        mb(n[2] / subs),
+        n[3] / subs,
+        mb(n[4] / subs),
+        n[5] / subs,
+        mb(n[7] / sampled)
+    );
+}
 
 /// Asks the kernel about many ranges `(start, end)` at once, before the
 /// [`writes`] of each: ranges close together are one asking, and `writes`
@@ -314,22 +402,12 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     AHEAD_VIEWS.fetch_add((all - pieces.len()) as u64, std::sync::atomic::Ordering::Relaxed);
     j.ahead_asked = j.next_asking();
     j.ahead.clear();
-    // The runs of pieces asked together: `[i, k)` of `pieces` each.
-    let mut runs = Vec::new();
-    let mut i = 0;
-    while i < pieces.len() {
-        let first = pieces[i].0;
-        let mut last = pieces[i].1;
-        let mut k = i + 1;
-        while k < pieces.len()
-            && pieces[k].0 <= last + AHEAD_GAP
-            && last.max(pieces[k].1) - first <= AHEAD_MAX
-        {
-            last = last.max(pieces[k].1);
-            k += 1;
-        }
-        runs.push((i, k));
-        i = k;
+    let (runs, spanned, held) = ahead_runs(&pieces);
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        AHEAD[0].fetch_add(runs.iter().filter(|r| r.1 - r.0 >= 2).count() as u64, Relaxed);
+        AHEAD[1].fetch_add(spanned as u64, Relaxed);
+        AHEAD[2].fetch_add(held as u64, Relaxed);
     }
     if ask_wide() && runs.iter().filter(|r| r.1 - r.0 >= 2).count() >= 2 {
         let answers = crate::shadow::spread_own(runs.len(), &|r| {
@@ -353,6 +431,45 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     for (i, k) in runs {
         ask_run(j, &pieces[i..k]);
     }
+}
+
+/// The runs of `pieces` (page ranges, in order) that [`ask_ahead`] asks
+/// about together: `[i, k)` of `pieces` each, pieces closer than
+/// [`AHEAD_GAP`] in one, none spanning more than [`AHEAD_MAX`]; and of the
+/// runs of two pieces or more (the ones it asks), the pages they span (what
+/// the kernel walks) and the pages of their pieces.
+fn ahead_runs(pieces: &[(usize, usize)]) -> (Vec<(usize, usize)>, usize, usize) {
+    let mut runs = Vec::new();
+    let (mut spanned, mut held) = (0, 0);
+    let mut i = 0;
+    while i < pieces.len() {
+        let first = pieces[i].0;
+        let mut last = pieces[i].1;
+        let mut k = i + 1;
+        // The pieces' union so far: whole up to `covered`.
+        let (mut union, mut covered) = (last - first, last);
+        while k < pieces.len() && pieces[k].0 <= last + AHEAD_GAP && last.max(pieces[k].1) - first <= AHEAD_MAX {
+            union += pieces[k].1.saturating_sub(pieces[k].0.max(covered));
+            covered = covered.max(pieces[k].1);
+            last = last.max(pieces[k].1);
+            k += 1;
+        }
+        if k - i >= 2 {
+            (spanned, held) = (spanned + (last - first), held + union);
+        }
+        runs.push((i, k));
+        i = k;
+    }
+    (runs, spanned, held)
+}
+
+/// With [`ask_exact`]: whether a copy's range `[address, end)` lies too far
+/// from its pending refresh `[from, to)` to be merged into it (`crate::host`'s
+/// `Batch`): farther than [`AHEAD_GAP_BYTES`] on either side. Merged only
+/// closer than that, a refresh lies in one run of [`ahead_runs`] made of the
+/// submission's ranges.
+pub(crate) fn apart(from: usize, to: usize, address: usize, end: usize) -> bool {
+    address > to.saturating_add(AHEAD_GAP_BYTES) || end.saturating_add(AHEAD_GAP_BYTES) < from
 }
 
 thread_local! {
@@ -431,6 +548,14 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
     if !once() {
         return;
     }
+    let started = std::time::Instant::now();
+    ask_once_here(ranges);
+    AHEAD[5].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+    AHEAD[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`ask_once`], untimed.
+fn ask_once_here(ranges: &[(usize, usize)]) {
     ask_once_end();
     ask_ahead(ranges);
     let mut j = journal();
@@ -475,22 +600,32 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         j.kept = !j.ahead.is_empty();
         return;
     }
-    for &(start, end) in ranges {
-        if start >= end {
-            continue;
-        }
-        // View memory the guards hold is not asked about: the asking can
-        // only fail there, one failed kernel call for each such copy at
-        // every submission, and `writes` answers it from the guards
-        // (after triippywhale cc368c7c).
-        if known_view(start) {
-            #[cfg(feature = "diagnostics")]
-            AHEAD_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            continue;
-        }
-        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    // View memory the guards hold is not asked about: the asking can only
+    // fail there, one failed kernel call for each such copy at every
+    // submission, and `writes` answers it from the guards (after
+    // triippywhale cc368c7c). The guards are looked at once for all the
+    // ranges, as `ask_ahead` does (`VICTORY_ASK_EXACT` gives thousands).
+    let lone: Vec<(usize, usize)> = {
+        let g = (!views_asked()).then(guards_shared);
+        ranges
+            .iter()
+            .filter(|&&(start, end)| start < end)
+            .filter(|&&(start, _)| {
+                let known = g.as_ref().is_some_and(|g| known_view_in(g, start));
+                #[cfg(feature = "diagnostics")]
+                if known {
+                    AHEAD_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                !known
+            })
+            .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+            .collect()
+    };
+    for (first, last) in lone {
         if !j.ahead.holds(first, last) && ask_kernel(j, first, last) {
             j.ahead.push((first, last));
+            AHEAD[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            AHEAD[4].fetch_add((last - first) as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
     j.kept = !j.ahead.is_empty();
@@ -3160,6 +3295,62 @@ mod tests {
         }
         ahead.clear();
         assert!(ahead.is_empty() && !ahead.holds(10, 11));
+    }
+
+    /// With `VICTORY_ASK_EXACT`: the refreshes of a submission's copies,
+    /// merged as `Batch` merges them ([`apart`] splits; a step of ours that
+    /// writes title memory flushes), each lie in one asking made of the
+    /// submission's ranges ([`ahead_runs`]), so each is answered from the
+    /// journal; and the runs' span counts what they cover.
+    #[test]
+    fn exact_refreshes_lie_in_one_asking() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize % n
+        };
+        for trial in 0..300 {
+            // Three copies' steps over 512 MB, short and long, near and far.
+            let mut steps: Vec<(usize, usize, usize)> = Vec::new();
+            for _ in 0..1 + next(60) {
+                let copy = next(3);
+                let at = copy * (512 << 20) / 3 + next(160 << 20);
+                let len = 1 + if next(4) == 0 { next(24 << 20) } else { next(256 << 10) };
+                steps.push((copy, at, at + len));
+            }
+            // As `Batch` merges them, flushed now and then.
+            let mut pending: [Option<(usize, usize)>; 3] = [None; 3];
+            let mut refreshes = Vec::new();
+            for &(copy, a, e) in &steps {
+                if next(10) == 0 {
+                    refreshes.extend(pending.iter_mut().filter_map(Option::take));
+                }
+                pending[copy] = match pending[copy] {
+                    Some((from, to)) if !apart(from, to, a, e) => Some((from.min(a), to.max(e))),
+                    Some(old) => {
+                        refreshes.push(old);
+                        Some((a, e))
+                    }
+                    None => Some((a, e)),
+                };
+            }
+            refreshes.extend(pending.iter().flatten());
+            // The submission's asking, of all its ranges.
+            let mut pieces: Vec<(usize, usize)> = steps.iter().map(|&(_, a, e)| (a / PAGE, e.div_ceil(PAGE))).collect();
+            pieces.sort_unstable();
+            let (runs, spanned, held) = ahead_runs(&pieces);
+            let spans: Vec<(usize, usize)> =
+                runs.iter().map(|&(i, k)| (pieces[i].0, pieces[i..k].iter().map(|p| p.1).max().unwrap())).collect();
+            for &(from, to) in &refreshes {
+                let (first, last) = (from / PAGE, to.div_ceil(PAGE));
+                assert!(spans.iter().any(|&(a, b)| a <= first && last <= b), "trial {trial}: {from:#x}..{to:#x} in no asking");
+            }
+            assert!(held <= spanned);
+            let asked: usize = runs.iter().zip(&spans).filter(|(r, _)| r.1 - r.0 >= 2).map(|(_, s)| s.1 - s.0).sum();
+            assert_eq!(spanned, asked);
+        }
     }
 
     /// A run of pieces in two reservations is asked by halves; the pages

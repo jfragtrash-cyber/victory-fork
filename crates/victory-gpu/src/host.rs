@@ -8136,6 +8136,17 @@ impl Batch {
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    copy_mapped_as(dst, src, len, title_dst, false);
+}
+
+/// [`copy_mapped`] into host memory that this processor does not read soon
+/// (a host copy's refresh): in place, its stores may go past the caches
+/// (`crate::plaincopy::copy_streamed`, `VICTORY_COPY_STREAM`).
+pub(crate) fn copy_mapped_cold(dst: *mut u8, src: *const u8, len: usize) {
+    copy_mapped_as(dst, src, len, false, true);
+}
+
+fn copy_mapped_as(dst: *mut u8, src: *const u8, len: usize, title_dst: bool, cold: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -8170,7 +8181,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let moved = std::time::Instant::now();
     // Into host memory: in place first, if asked for (`crate::plaincopy`);
     // through the kernel if that is off or met a page that was not there.
-    let whole = (!title_dst && crate::plaincopy::copy_any(dst, src, len)) || read(src, dst, len);
+    let in_place = if cold { crate::plaincopy::copy_streamed } else { crate::plaincopy::copy_any };
+    let whole = (!title_dst && in_place(dst, src, len)) || read(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {

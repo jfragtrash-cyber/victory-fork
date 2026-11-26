@@ -2058,10 +2058,11 @@ impl Drop for Spreading {
 }
 
 /// Copies a piece of title memory into host copies: (destination, source,
-/// bytes).
+/// bytes). Nothing here reads them before the card does
+/// (`crate::host::copy_mapped_cold`).
 fn copy_piece(piece: &[(usize, usize, usize)]) {
     for &(dst, src, len) in piece {
-        crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
+        crate::host::copy_mapped_cold(dst as *mut u8, src as *const u8, len);
     }
 }
 
@@ -2256,8 +2257,9 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
             jobs.push(Box::new(move || {
                 for (src, dst, len) in group {
                     // SAFETY: the caller's ranges: a host copy's mapping and
-                    // its snapshot, which do not overlap.
-                    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+                    // its snapshot, which do not overlap. The snapshot is read
+                    // when its flight is done, frames later.
+                    unsafe { crate::plaincopy::copy_own_streamed(dst as *mut u8, src as *const u8, len) };
                 }
             }));
         }
@@ -4689,7 +4691,13 @@ impl Shadow {
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        // A copy that may be spread is read by nothing here before the card
+        // (`crate::host::copy_mapped_cold`); one that may not is read at once.
+        if spread {
+            crate::host::copy_mapped_cold(at, from as *const u8, to - from);
+        } else {
+            crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        }
         self.copied_in(from, to);
         to - from
     }

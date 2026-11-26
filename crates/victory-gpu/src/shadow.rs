@@ -4974,6 +4974,11 @@ impl Shadow {
         self.card.is_some()
     }
 
+    /// Whether this is a window of title memory outside buffers.
+    pub(crate) fn is_window(&self) -> bool {
+        self.window
+    }
+
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
     /// card's side before the next submission.
     fn card_changed(&self, from: usize, to: usize) {
@@ -5467,6 +5472,43 @@ mod found_tests {
         assert!(Arc::ptr_eq(&here, &there));
         unregister(a, start);
     }
+
+    /// `holding` makes nothing: a buffer without a copy is passed over for
+    /// one around it that has one, or none; what it found last is asked
+    /// again only while the buffers stay as they were and the copy lives.
+    #[test]
+    fn holding_finds_only_copies_made_already() {
+        if host().is_none() {
+            return; // no host GPU
+        }
+        // Addresses no title and no other test uses; nothing is read there.
+        let start = 0x7fe5_6780_0000u64;
+        let (a, b) = (0x52_5100usize, 0x52_5200usize);
+        register(a, start, 0x20000);
+        assert!(holding(start + 0x100, 0x40).is_none(), "no copy made yet, and none made by asking");
+        let Some(outer) = find(start + 0x100, 0x40) else {
+            unregister(a, start);
+            return;
+        };
+        let found = holding(start + 0x100, 0x40).expect("the copy find made");
+        assert!(Arc::ptr_eq(&found, &outer));
+        // Past the buffer's end: not held.
+        assert!(holding(start + 0x1_fff0, 0x20).is_none());
+        // A buffer inside without a copy: the one around it still holds.
+        register(b, start + 0x80, 0x1000);
+        assert!(Arc::ptr_eq(&holding(start + 0x100, 0x40).unwrap(), &outer));
+        // Its copy made, and the outer buffer gone: the inner copy.
+        let inner = find(start + 0x100, 0x40).unwrap();
+        assert_eq!(inner.start, start + 0x80);
+        unregister(a, start);
+        assert!(Arc::ptr_eq(&holding(start + 0x100, 0x40).unwrap(), &inner));
+        // On another thread, which remembers nothing of this one's.
+        let there = std::thread::scope(|s| s.spawn(|| holding(start + 0x100, 0x40)).join().unwrap()).unwrap();
+        assert!(Arc::ptr_eq(&there, &inner));
+        unregister(b, start + 0x80);
+        assert!(holding(start + 0x100, 0x40).is_none());
+        drop((outer, found, inner, there));
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -5555,6 +5597,51 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
+}
+
+/// The copy of a title buffer holding `[address, address + len)` that is
+/// made already, the innermost such: nothing is made, windows outside
+/// buffers are not looked at, and title memory in place is not a copy. For
+/// the constants the card gathers from a copy (`crate::host`'s
+/// `gather_fills`); those no copy holds are filled by the CPU, as before.
+///
+/// Each thread remembers the copy it found last while the buffers stay as
+/// they were ([`BUFFERS_CHANGES`]): the title's per-draw constants lie in
+/// one buffer, at new addresses every frame, and ~16,000 asks a frame under
+/// the buffers' lock would stand in line with the recording threads' own
+/// (run P: 16 ms a frame of them in that search).
+pub(crate) fn holding(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    thread_local! {
+        /// The last copy found: its title memory, the count of changes it
+        /// was found at, the copy.
+        static LAST: std::cell::RefCell<Option<(u64, u64, u64, std::sync::Weak<Shadow>)>> = const { std::cell::RefCell::new(None) };
+    }
+    let changes = BUFFERS_CHANGES.load(Ordering::Acquire);
+    let remembered = LAST
+        .try_with(|last| {
+            let last = last.borrow();
+            let (start, stop, at, copy) = last.as_ref()?;
+            (*at == changes && *start <= address && end <= *stop).then(|| copy.upgrade()).flatten()
+        })
+        .ok()
+        .flatten();
+    if remembered.is_some() {
+        return remembered;
+    }
+    let map = buffers();
+    let changes = BUFFERS_CHANGES.load(Ordering::Relaxed);
+    let shadow = map
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .filter(|(_, e)| e.end >= end)
+        .find_map(|(_, e)| e.shadow.clone().filter(|s| s.place.is_none() && !s.window))?;
+    drop(map);
+    let _ = LAST.try_with(|last| {
+        *last.borrow_mut() = Some((shadow.start, shadow.start + shadow.len, changes, Arc::downgrade(&shadow)));
+    });
+    Some(shadow)
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has

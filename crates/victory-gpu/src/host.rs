@@ -3219,11 +3219,27 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
 }
 
+/// Whether the title's fences are set as soon as everything before their
+/// Signal is prepared and sent to the card, not when the card has run it
+/// and its results have landed (`VICTORY_EARLY_FENCES=1`; off; for
+/// measuring only).
+///
+/// The card works on snapshots (copies of title memory taken while
+/// preparing), so the title may change the memory a submission read once
+/// it is prepared. What it may NOT do is read what shaders wrote before it
+/// has landed: with this on it can, and reads the bytes from before. Run
+/// AU: of ~107 ms from Signal to the fence, ~55 ms are the card's and the
+/// landing's; this says what the frame is without them.
+fn early_fences() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_FENCES").is_some_and(|v| v == "1"))
+}
+
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
 /// air, if there are any, and is set when they are settled. Whether it
 /// did; if not the caller sets the fence now.
 pub(crate) fn late_signal(fence: usize, value: u64) -> bool {
-    if !late() {
+    if !late() || early_fences() {
         return false;
     }
     let mut line = line();

@@ -519,3 +519,19 @@ already reach.
   before it), ~45 ms more until the landing thread takes it (the card done
   with those submissions), ~10.5 ms landing. Both the preparing and the
   card are on the way.
+- 2026-11-26, night. Translator branch perf-shader merged: min/max
+  against a non-zero constant without the zero test (`VICTORY_MINMAX_CONST`,
+  on); legacy multiply forms (`VICTORY_LEGACY_MUL=exact|plain`, off; `exact`
+  is not exact on this card: its driver drops the `+ 0`, K x -0 gives -0);
+  one-wave compute groups k to a host group (`VICTORY_GROUP_MERGE=2|4`,
+  off); wave64 exchanges two values a round (`VICTORY_EXCHANGE_BATCH=1`,
+  off). Card tests pass on the RTX 3090. Each switch set has its cache
+  entries: warm with `VICTORY_HOST_WAVE=32 VICTORY_VIEW_LIMIT=999999 [switches]
+  victory.exe translate --warm all <game dir>` (6-10 min on 4 threads).
+- 2026-11-26, night. Runs AV (`GROUP_MERGE=2` + wide hashing) and AW (wide
+  hashing alone), captured, the same keys: AW plays the bar cutscene then
+  the cell as before (pictures right); AV went another way (a yard scene,
+  the cell darker, the camera elsewhere) and its play is not faster (title
+  lists 55.9 ms at 3,799 draws against AW's 48.5 at 3,681). The group merge
+  stays off until a same-scene check clears it. AW's fence way: 72 ms =
+  43 to the line + 22 the card + 8.5 landing (AU: 109 = 55 + 44 + 10).

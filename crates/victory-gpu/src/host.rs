@@ -2099,6 +2099,10 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Ranges declared written by shaders since the list last wrote title
+    /// memory (host copy, address, bytes): declaring them again changes
+    /// nothing ([`declare_once`]).
+    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -3828,6 +3832,18 @@ fn continues(last: (usize, usize, usize), next: (usize, usize, usize)) -> bool {
     d.checked_add(n) == Some(dst)
         && s.checked_add(n) == Some(src)
         && (d.checked_add(all).is_some_and(|end| end <= s) || s.checked_add(all).is_some_and(|end| end <= d))
+}
+
+/// Whether a range shaders of a list write is declared (a step: its copy
+/// brought up to date and a snapshot taken) once until the list next writes
+/// title memory (`VICTORY_DECLARE_ONCE=0`: at every command, as before).
+/// Dispatches declare the same few ranges again and again: some 4,000 to
+/// 5,500 steps a frame there, each a flush of its copy's pending refreshes
+/// and two locks on the submitting thread. (After VIctory-7900XTX b32fb99,
+/// from Belobug dd799aad.)
+fn declare_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DECLARE_ONCE").is_none_or(|v| v != "0"))
 }
 
 /// The ranges the shaders of `runs` may write, per host copy, as declared.
@@ -5814,6 +5830,7 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        batch.fill();
         batch.flush();
         crate::watch::ask_once_end();
         // The snapshots of the ranges shaders may write, if they were left
@@ -6991,6 +7008,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.gpu_written.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -7028,7 +7046,10 @@ impl HostList {
         len: usize,
     ) {
         let mut deferred = self.deferred();
-        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.gpu_written.insert(key) || !declare_once() {
+            deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+        }
         deferred.stored.push((address, address.saturating_add(len)));
     }
 
@@ -7341,8 +7362,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
+        deferred.gpu_written.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -7362,31 +7385,22 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        // Fills one after another, made side by side (`spread_fills`).
-        let mut fills: Vec<(usize, usize, usize)> = Vec::new();
-        let flush_fills = |fills: &mut Vec<(usize, usize, usize)>| {
-            if fills.is_empty() {
-                return;
-            }
-            let started = std::time::Instant::now();
-            crate::shadow::copy_spread(fills, 32);
-            preparing(0, started.elapsed().as_micros() as u64);
-            preparing(1, fills.iter().map(|f| f.2 as u64).sum());
-            fills.clear();
-        };
         for step in &self.deferred().copies {
-            if spread_fills() {
-                if let &Step::Fill(dst, src, len) = step {
+            // Fills noted for the submission's together (`wide_fills`); done
+            // before a step that writes title memory or runs work of ours.
+            match step {
+                &Step::Fill(dst, src, len) if wide_fills() => {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                         fill_check::runs(src, len);
                     }
-                    fills.push((dst, src, len));
+                    batch.fills.push((dst, src, len));
                     continue;
                 }
-                flush_fills(&mut fills);
+                Step::Copy(..) | Step::Run(_) | Step::Host(_) => batch.fill(),
+                _ => {}
             }
             // The clock only for the steps timed below: of a frame's some
             // 30,000 steps (run BA) most are refreshes, noted for the flush.
@@ -7472,21 +7486,48 @@ impl HostList {
             preparing(0, elapsed_us());
             preparing(1, copied as u64);
         }
-        flush_fills(&mut fills);
     }
 }
 
-/// Whether a list's fills of upload memory that follow one another (with
-/// no step between them that writes title memory or reads what they
-/// write) are made side by side on the kept threads, 32 a job, and waited
-/// for before the next other step (`VICTORY_SPREAD_FILLS=1`; off).
+/// Whether a submission's fills of upload memory are noted as its lists'
+/// steps name them and done together: before the next step that writes
+/// title memory or runs work of ours (a title buffer copy, a step of ours)
+/// and once its steps are through, under [`Batch::FEW_FILLS`] on this
+/// thread, more on the kept threads too (`VICTORY_WIDE_FILLS=1`; `alt`:
+/// twenty seconds with, twenty without, in turn, each change said in the
+/// log; off by default). A fill reads title memory and writes memory of
+/// ours that the card alone reads, when the lists run: neither the other
+/// fills, nor the refreshes, textures and snapshots between them (which
+/// read title memory or write copies of ours) care in which order.
 ///
 /// Run BA: ~16,000 fills a frame (8.5 MB, a few hundred bytes each), 6.3
 /// ms a frame of the submitting thread in `copy_mapped`, mostly each
-/// copy's own cost rather than its bytes.
-fn spread_fills() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SPREAD_FILLS").is_some_and(|v| v == "1"))
+/// copy's own cost rather than its bytes. Made side by side a list's run
+/// at a time (`VICTORY_SPREAD_FILLS`, runs BC and BD) they gained nothing:
+/// any other step, a refresh among them, ended the run. (After
+/// VIctory-7900XTX aff4def, `VICTORY_WIDE_FILLS`: 5 ms of the submitting
+/// thread there.)
+fn wide_fills() -> bool {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_WIDE_FILLS").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = (now_us() / 20_000_000) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "fills of upload memory from now (VICTORY_WIDE_FILLS=alt): {}",
+                    if on { "WIDE, a submission's together" } else { "each where its list names it, as usual" }
+                );
+            }
+            on
+        }
+    }
 }
 
 /// Whether the pass over the title's placed descriptor heaps at a
@@ -7880,9 +7921,33 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// Fills not made yet (destination, source, bytes): [`wide_fills`].
+    fills: Vec<(usize, usize, usize)>,
 }
 
 impl Batch {
+    /// Fills below this many are made on this thread: the kept threads
+    /// cost more than they save.
+    const FEW_FILLS: usize = 96;
+
+    /// The fills noted ([`wide_fills`]) are made.
+    fn fill(&mut self) {
+        if self.fills.is_empty() {
+            return;
+        }
+        let started = std::time::Instant::now();
+        if self.fills.len() < Self::FEW_FILLS {
+            for &(dst, src, len) in &self.fills {
+                copy_mapped(dst as *mut u8, src as *const u8, len, false);
+            }
+        } else {
+            crate::shadow::copy_spread(&self.fills, 64);
+        }
+        preparing(0, started.elapsed().as_micros() as u64);
+        preparing(1, self.fills.iter().map(|f| f.2 as u64).sum());
+        self.fills.clear();
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
@@ -8565,10 +8630,13 @@ impl Meter {
         {
             let [written, turn, aliased, unguarded, partial] =
                 [0, 1, 2, 3, 4].map(|i| crate::texture::TEX_WHY[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
+            let [turn_caught, aliased_caught] = [0, 1].map(|i| crate::texture::TEX_CAUGHT[i].swap(0, Ordering::Relaxed));
             if written + turn + aliased + unguarded > 0.0 {
                 tracing::info!(
                     "textures read past their guards per frame: {written:.1} MB written, {turn:.1} MB their eighth-frame turn, \
-                     {aliased:.1} MB pages shown elsewhere too, {unguarded:.1} MB neither watched nor guarded; {partial:.1} MB of it partly mapped"
+                     {aliased:.1} MB pages shown elsewhere too, {unguarded:.1} MB neither watched nor guarded; {partial:.1} MB of it partly mapped; \
+                     since the last line the hash found changed {turn_caught} textures on their turn and {aliased_caught} shown elsewhere, \
+                     with no write the guards saw"
                 );
             }
         }

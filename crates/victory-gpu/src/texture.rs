@@ -172,7 +172,7 @@ fn spare_most() -> u64 {
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<Digest>,
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
@@ -967,6 +967,74 @@ fn aliased(start: usize, size: usize) -> bool {
 /// (read again every thirtieth frame).
 pub(crate) static TEX_WHY: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// Since the last frame line, textures whose hash found them changed though
+/// the guards had seen no write, by why they were read (the eighth-frame
+/// turn, pages shown elsewhere too): what the hash catches that the guards
+/// miss.
+pub(crate) static TEX_CAUGHT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// A texture read for `why` ([`TEX_WHY`]) hashed differently from its last
+/// hash, `had` (none: never hashed).
+fn caught(why: usize, had: Option<Digest>) {
+    if had.is_some() && (why == 1 || why == 2) {
+        TEX_CAUGHT[why - 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A 128-bit digest of `bytes`, to tell a texture's memory changed: four
+/// lanes of folded multiplications over 64 bytes at a time. Not a
+/// cryptographic one: blake3 was 3.9 ms a frame of the submitting thread in
+/// run BA, hashing some 15 MB of textures on their eighth-frame turn, and
+/// nobody makes up textures to collide. (After VIctory-7900XTX 2dfba4d,
+/// 0.035 ms a megabyte against blake3's 0.2-0.27 there.)
+pub(crate) fn digest(bytes: &[u8]) -> Digest {
+    const K: [u64; 8] = [
+        0xa076_1d64_78bd_642f,
+        0xe703_7ed1_a0b4_28db,
+        0x8ebc_6af0_9c88_c6e3,
+        0x5899_65cc_7537_4cc3,
+        0x1d8e_4e27_c47d_124f,
+        0xeb44_acca_b455_d165,
+        0x9e37_79b9_7f4a_7c15,
+        0xc2b2_ae3d_27d4_eb4f,
+    ];
+    let fold = |a: u64, b: u64| {
+        let p = u128::from(a) * u128::from(b);
+        p as u64 ^ (p >> 64) as u64
+    };
+    let word = |b: &[u8]| {
+        let mut w = [0; 8];
+        w[..b.len()].copy_from_slice(b);
+        u64::from_le_bytes(w)
+    };
+    let mut lanes = [K[0], K[1], K[2], K[3]];
+    let mut step = |block: &[u8; 64]| {
+        for (i, lane) in lanes.iter_mut().enumerate() {
+            let a = word(&block[16 * i..16 * i + 8]);
+            let b = word(&block[16 * i + 8..16 * i + 16]);
+            // (What went in is added again: a product with a factor of zero
+            // forgets neither the lane nor the block.)
+            *lane = fold(a ^ K[4 + i], b ^ *lane).wrapping_add(a.rotate_left(23) ^ lane.rotate_left(41)) ^ b;
+        }
+    };
+    let mut blocks = bytes.chunks_exact(64);
+    for block in &mut blocks {
+        step(block.try_into().unwrap_or(&[0; 64]));
+    }
+    let rest = blocks.remainder();
+    let mut last = [0u8; 64];
+    last[..rest.len()].copy_from_slice(rest);
+    step(&last);
+    let len = bytes.len() as u64;
+    let low = fold(lanes[0] ^ K[1], lanes[1] ^ len) ^ fold(lanes[2] ^ K[3], lanes[3] ^ K[5]);
+    let high = fold(lanes[0].rotate_left(32) ^ K[6], lanes[2] ^ len) ^ fold(lanes[1].rotate_left(32) ^ K[7], lanes[3] ^ K[2]);
+    Digest(u128::from(low) << 64 | u128::from(high))
+}
+
+/// See [`digest`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Digest(u128);
+
 impl Staging {
     /// Levels on demand: what says, beside the mapping, which levels of
     /// the texture are the title's now. First the lowest level a live view
@@ -1160,11 +1228,11 @@ impl Staging {
                 crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
                 // Read: the runtime may remap again (see below).
                 drop(mapped);
-                let hash = crate::shadow::hash_wide(read);
+                let hash = digest(read);
                 if last.hash == Some(hash) {
                     return false;
                 }
-                last.hash = Some(hash);
+                caught(why, last.hash.replace(hash));
                 if read.iter().all(|&b| b == 0) {
                     return false;
                 }
@@ -1181,13 +1249,13 @@ impl Staging {
         if through_copy() {
             drop(mapped);
             return with_title(self.memory, size, |tiled| {
-                let hash = crate::shadow::hash_wide(tiled);
+                let hash = digest(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
                 if last.hash == Some(hash) {
                     return size;
                 }
-                last.hash = Some(hash);
+                caught(why, last.hash.replace(hash));
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1197,13 +1265,13 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
-        let hash = crate::shadow::hash_wide(tiled);
+        let hash = digest(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
             return size;
         }
-        last.hash = Some(hash);
+        caught(why, last.hash.replace(hash));
         // Copied out, then detiled with the lock let go: while the runtime
         // waits to remap, every refresh that begins waits behind it, so a
         // read held through the detiling held up all of them (2.1 s a
@@ -1230,7 +1298,7 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            let hash = crate::shadow::hash_wide(read);
+            let hash = digest(read);
             if last.hash != Some(hash) {
                 last.hash = Some(hash);
                 self.detile(read);
@@ -1607,6 +1675,39 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod digest_tests {
+    /// The digest tells every length and every changed byte apart, zeros
+    /// among them, and two bytes swapped.
+    #[test]
+    fn a_digest_tells_bytes_apart() {
+        use super::digest;
+        let zeros = [0u8; 400];
+        let mut seen: Vec<super::Digest> = (0..400).map(|n| digest(&zeros[..n])).collect();
+        for at in 0..400 {
+            for value in [1u8, 0x80, 0xff] {
+                let mut bytes = zeros;
+                bytes[at] = value;
+                seen.push(digest(&bytes));
+            }
+        }
+        let text: Vec<u8> = (0..400u32).map(|i| (i * 37 >> 2) as u8).collect();
+        for at in 0..399 {
+            let mut bytes = text.clone();
+            bytes.swap(at, at + 1);
+            if bytes != text {
+                seen.push(digest(&bytes));
+            }
+        }
+        seen.push(digest(&text));
+        let n = seen.len();
+        seen.sort_unstable_by_key(|d| d.0);
+        seen.dedup();
+        assert_eq!(seen.len(), n);
+        assert_eq!(digest(&text), digest(&text.clone()));
+    }
 }
 
 #[cfg(test)]

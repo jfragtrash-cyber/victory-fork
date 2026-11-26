@@ -612,3 +612,27 @@ already reach.
   pieces take the kept threads, whose spread copies the submitting thread
   waits for. `VICTORY_HASH_WIDE` is off by default from here (`1` on).
   BG ran to its timeout: BE and BF were ended from outside.
+- 2026-11-26, morning. From a report on VIctory-7900XTX (an AMD fork
+  with the same submitting-thread wall, 48 ms of its own work a frame):
+  textures are told changed by a 128-bit digest of folded
+  multiplications instead of blake3 (2dfba4d; blake3 by pieces on the
+  kept threads, `VICTORY_HASH_WIDE`, is gone); a range shaders write is
+  declared once until the list next writes title memory
+  (`VICTORY_DECLARE_ONCE`, on; b32fb99); the ranges asked ahead are kept
+  sorted with the farthest end beside each, a binary search instead of
+  a walk (c83e54c); the memory map is walked every 60 memory lines, not
+  6 (`VICTORY_MEMORY_MAP=<n>`; fb28d49: its questions hold the process's
+  memory map, askings waited 11-13 ms behind them); a submission's fills
+  of upload memory are made together before the next step that writes
+  title memory or runs work of ours (`VICTORY_WIDE_FILLS`, aff4def).
+  Diagnostics: the textures the eighth-frame hash finds changed with no
+  write the guards saw. Run BH (`VICTORY_WIDE_FILLS=alt`, captured, the
+  character walked by hand): per 1,000 draws 21.1 ms a frame with, 19.8
+  without, the submitting thread 15.0 against 13.9: no gain, the third
+  time work handed to the kept threads in small pieces costs more than
+  it saves on this machine (BF, BG); the switch stays off. In 595 lines
+  the eighth-frame hash found no texture changed that the guards had
+  not seen. The pictures right (the yard's black ground and floating
+  objects early in the world are there in BF as well). Play at 84.4 ms
+  a frame at 4,473 draws (BB 76.9 at 3,953): 18.9 ms per 1,000 draws
+  against 19.5.

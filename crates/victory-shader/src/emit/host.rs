@@ -1004,12 +1004,17 @@ pub enum View<'a> {
     Texture(u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, mip count, texels in D3D subresource order).
     Cube(u32, u16, &'a [[f32; 4]]),
+    /// An RGBA32F square texture SRV (size, levels) whose texels in level
+    /// `n` are all `n`.
+    Levels(u32, u32),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
     UintTextureUav(u32, u32),
+    /// An R32G32_UINT texture UAV (width, height), zeroed (64-bit atomics).
+    Uint2TextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
     /// A constant buffer of these dwords.
@@ -1110,7 +1115,7 @@ impl Host {
                 Flags: flags,
                 ..Default::default()
             };
-            // Texel words: 4 for RGBA32F, 1 for R32_UINT.
+            // Texel words: 4 for RGBA32F, 1 for R32_UINT, 2 for R32G32_UINT.
             let footprint_as =
                 |r: &ID3D12Resource, w: u32, h: u32, words: u32| D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(r),
@@ -1119,10 +1124,10 @@ impl Host {
                         PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                             Offset: 0,
                             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                Format: if words == 1 {
-                                    DXGI_FORMAT_R32_UINT
-                                } else {
-                                    DXGI_FORMAT_R32G32B32A32_FLOAT
+                                Format: match words {
+                                    1 => DXGI_FORMAT_R32_UINT,
+                                    2 => DXGI_FORMAT_R32G32_UINT,
+                                    _ => DXGI_FORMAT_R32G32B32A32_FLOAT,
                                 },
                                 Width: w,
                                 Height: h,
@@ -1248,6 +1253,53 @@ impl Host {
                         );
                         keep.push(tex);
                     }
+                    View::Levels(w, levels) => {
+                        let mut desc = texture(w, w, D3D12_RESOURCE_FLAG_NONE);
+                        desc.MipLevels = levels as u16;
+                        let tex = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        for level in 0..levels {
+                            let n = (w >> level).max(1);
+                            let pitch = (n as usize * 16).next_multiple_of(256);
+                            let upload = make(
+                                D3D12_HEAP_TYPE_UPLOAD,
+                                &buffer((pitch * n as usize) as u64, D3D12_RESOURCE_FLAG_NONE),
+                                D3D12_RESOURCE_STATE_GENERIC_READ,
+                            )?;
+                            let mut p = std::ptr::null_mut();
+                            upload.Map(0, None, Some(&mut p)).map_err(err)?;
+                            let row = vec![[level as f32; 4]; n as usize];
+                            for y in 0..n as usize {
+                                std::ptr::copy_nonoverlapping(
+                                    row.as_ptr().cast::<u8>(),
+                                    p.cast::<u8>().add(y * pitch),
+                                    row.len() * 16,
+                                );
+                            }
+                            upload.Unmap(0, None);
+                            let mut at_level = subresource(&tex);
+                            at_level.Anonymous.SubresourceIndex = level;
+                            list.CopyTextureRegion(
+                                &at_level,
+                                0,
+                                0,
+                                0,
+                                &footprint(&upload, n, n),
+                                None,
+                            );
+                            keep.push(upload);
+                        }
+                        list.ResourceBarrier(&[transition(
+                            &tex,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        dev.CreateShaderResourceView(&tex, None, at);
+                        keep.push(tex);
+                    }
                     View::RawUav(_) | View::HalfUav(_) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
@@ -1302,25 +1354,24 @@ impl Host {
                         )?;
                         uavs.push((t, Some((w, h)), 4, rb));
                     }
-                    View::UintTextureUav(w, h) => {
+                    View::UintTextureUav(w, h) | View::Uint2TextureUav(w, h) => {
+                        let (format, words) = match *v {
+                            View::UintTextureUav(..) => (DXGI_FORMAT_R32_UINT, 1),
+                            _ => (DXGI_FORMAT_R32G32_UINT, 2),
+                        };
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
-                            &texture_as(
-                                w,
-                                h,
-                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                                DXGI_FORMAT_R32_UINT,
-                            ),
+                            &texture_as(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, format),
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                         )?;
                         dev.CreateUnorderedAccessView(&t, None, None, at);
-                        let pitch = (w * 4).next_multiple_of(256);
+                        let pitch = (w * 4 * words).next_multiple_of(256);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(u64::from(pitch * h), D3D12_RESOURCE_FLAG_NONE),
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        uavs.push((t, Some((w, h)), 1, rb));
+                        uavs.push((t, Some((w, h)), words, rb));
                     }
                     View::Cbv(data) => {
                         let b = upload(data)?;

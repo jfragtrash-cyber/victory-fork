@@ -3210,6 +3210,10 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         let mut runs_left = *RUNS.get_or_init(|| {
             std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(512, |n| n.clamp(1, 1 << 16))
         });
+        // The pages side by side on the kept threads (`VICTORY_MERGE_WIDE`).
+        if crate::shadow::merge_wide() {
+            return crate::shadow::merge_all_under_writes(&spans, runs_left);
+        }
         return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
@@ -5680,8 +5684,13 @@ impl Host {
             }
         }
         // Descriptors the title copied into placed heaps directly, before
-        // command lists that index those slots are submitted.
-        crate::descriptor::sync_heaps();
+        // command lists that index those slots are submitted: beside the
+        // rest of the preparing ([`heap_sync_beside`]), waited for before
+        // the lists go.
+        let heaps = heap_sync_beside().then(heap_syncer).flatten().map(|b| b.run(crate::descriptor::sync_heaps));
+        if heaps.is_none() {
+            crate::descriptor::sync_heaps();
+        }
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -5700,8 +5709,11 @@ impl Host {
         }
         let behind = late && flying();
         // The slots that waited for a texture's host copy, before the
-        // lists that may read them run.
-        crate::descriptor::make_waiting();
+        // lists that may read them run (with the pass over the heaps
+        // beside, after it: it notes slots waiting).
+        if heaps.is_none() {
+            crate::descriptor::make_waiting();
+        }
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -5783,6 +5795,13 @@ impl Host {
         let card = self.card_before(runs, flown, *submitted);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
+        }
+        // The pass over the heaps, if it ran beside: done before the lists
+        // read the slots, and the slots it left waiting made after it.
+        if let Some(heaps) = heaps {
+            let waited = heaps.wait();
+            crate::descriptor::SYNCED[4].fetch_add(waited, Ordering::Relaxed);
+            crate::descriptor::make_waiting();
         }
         let prepared = std::time::Instant::now();
         if late {
@@ -7383,6 +7402,269 @@ impl HostList {
     }
 }
 
+/// Whether the pass over the title's placed descriptor heaps at a
+/// submission (`crate::descriptor::sync_heaps`) runs on a thread of its own
+/// beside the rest of the preparing, waited for just before the lists go
+/// to the card (`VICTORY_HEAP_SYNC_BESIDE`; on by default, `0` runs it on
+/// the submitting thread first, as before).
+///
+/// Run AB's gameplay profile: 10.8 ms a frame of the submitting thread,
+/// which bounds the frame (busy ~94% of it), in that pass (7.5 of them
+/// making host slots, the rest reading the heaps' written pages), with most
+/// of the machine's cores idle.
+///
+/// What the pass touches: the title's heaps (read through the kernel), the
+/// host heaps' slots and what they note (the queue of textures, the buffer
+/// slots and their strides, [`retire`]), the textures waiting for a host
+/// copy, and the write-watch journal (its asking about the heaps' pages,
+/// under the journal's lock). The title's threads do all of that at any
+/// moment when they write a view (`crate::descriptor`'s `record` and
+/// `mirror`), while a submission is prepared too. What the preparing does
+/// meanwhile (alias copies, the askings, the merge under flights, the
+/// refreshes, the title's buffer copies, the snapshots, the sends to copies
+/// in the card's memory) writes host copies and title memory, no host heap
+/// slot. What must come after the pass waits for it: the lists' run on the
+/// card (the slots they read) and the slots of textures given a host copy
+/// (`crate::descriptor::make_waiting`, which takes what the pass left
+/// waiting: moved behind it). While the submitting thread waits for the
+/// pass it holds no lock but the submission's, which the pass never takes
+/// (it ran under it).
+///
+/// Measured by the line "descriptor records the title copied into its heap
+/// as bytes": the pass's own milliseconds a frame (now on its thread,
+/// `victory-wide-heaps`) and the submitting thread's wait for it.
+fn heap_sync_beside() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_BESIDE").is_none_or(|v| v != "0"))
+}
+
+/// The kept thread of [`heap_sync_beside`]; `None` if none could be had
+/// (then the pass runs on the submitting thread).
+fn heap_syncer() -> Option<&'static Beside> {
+    static ONE: OnceLock<Option<&'static Beside>> = OnceLock::new();
+    *ONE.get_or_init(|| {
+        let beside = Beside::start("victory-wide-heaps");
+        if beside.is_none() {
+            tracing::warn!("no thread for the pass over descriptor heaps: it runs on the submitting thread");
+        }
+        beside
+    })
+}
+
+/// A kept thread that does one job at a time for the thread that hands it
+/// over, which waits for it later ([`Beside::run`], [`BesideJob::wait`]).
+struct Beside {
+    state: Mutex<BesideState>,
+    moved: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct BesideState {
+    /// Handed over and not taken yet.
+    job: Option<Box<dyn FnOnce() + Send>>,
+    /// From the handing over until the job is done.
+    busy: bool,
+    /// The job's panic, for whoever waits for it.
+    panic: Option<Box<dyn std::any::Any + Send>>,
+}
+
+impl Beside {
+    /// A new one, its thread named `name`; `None` if no thread can be had.
+    fn start(name: &str) -> Option<&'static Beside> {
+        let beside: &'static Beside =
+            Box::leak(Box::new(Beside { state: Mutex::new(BesideState::default()), moved: std::sync::Condvar::new() }));
+        let what = name.to_owned();
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                crate::framelog::keep_on_fast_cores(&what);
+                beside.serve()
+            })
+            .ok()?;
+        Some(beside)
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, BesideState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The kept thread's life: the jobs handed over, one after the other.
+    fn serve(&self) -> ! {
+        loop {
+            let job = {
+                let mut state = self.state();
+                loop {
+                    if let Some(job) = state.job.take() {
+                        break job;
+                    }
+                    state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).err();
+            let mut state = self.state();
+            state.busy = false;
+            state.panic = panic;
+            drop(state);
+            self.moved.notify_all();
+        }
+    }
+
+    /// Hands `job` to the kept thread: done once the job returned is waited
+    /// for (or dropped). Done here and now if the job handed over before is
+    /// not done yet.
+    fn run(&'static self, job: impl FnOnce() + Send + 'static) -> BesideJob {
+        {
+            let mut state = self.state();
+            if !state.busy {
+                state.busy = true;
+                state.job = Some(Box::new(job));
+                drop(state);
+                self.moved.notify_all();
+                return BesideJob(Some(self));
+            }
+        }
+        job();
+        BesideJob(None)
+    }
+}
+
+/// A job handed to a [`Beside`], waited for by [`BesideJob::wait`] or when
+/// dropped.
+struct BesideJob(Option<&'static Beside>);
+
+impl BesideJob {
+    /// Waits until the job is done and returns the microseconds that took;
+    /// a panic of the job's goes on here.
+    fn wait(mut self) -> u64 {
+        self.finish(true)
+    }
+
+    fn finish(&mut self, go_on: bool) -> u64 {
+        let Some(beside) = self.0.take() else {
+            return 0;
+        };
+        let started = std::time::Instant::now();
+        let mut state = beside.state();
+        while state.busy {
+            state = beside.moved.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        let panic = state.panic.take();
+        drop(state);
+        if let Some(panic) = panic
+            && go_on
+        {
+            std::panic::resume_unwind(panic);
+        }
+        started.elapsed().as_micros() as u64
+    }
+}
+
+impl Drop for BesideJob {
+    fn drop(&mut self) {
+        // (Not a second panic over one under way.)
+        self.finish(!std::thread::panicking());
+    }
+}
+
+#[cfg(test)]
+mod beside_tests {
+    use super::Beside;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, mpsc};
+
+    /// The job runs on the kept thread, not before it is let go here, and
+    /// is done when the wait returns.
+    #[test]
+    fn a_job_runs_on_its_thread_and_is_done_when_waited_for() {
+        let beside = Beside::start("victory-test-beside-a").expect("a thread");
+        let (go, gone) = mpsc::channel::<()>();
+        let done = Arc::new(AtomicBool::new(false));
+        let ran_on = Arc::new(std::sync::Mutex::new(None));
+        let job = {
+            let (done, ran_on) = (done.clone(), ran_on.clone());
+            beside.run(move || {
+                gone.recv().expect("let go");
+                *ran_on.lock().unwrap() = Some(std::thread::current().id());
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        assert!(!done.load(Ordering::SeqCst), "the job waits to be let go");
+        go.send(()).unwrap();
+        job.wait();
+        assert!(done.load(Ordering::SeqCst), "done once waited for");
+        assert_ne!(*ran_on.lock().unwrap(), Some(std::thread::current().id()), "on the kept thread");
+    }
+
+    /// Jobs one after the other: none lost, each done at its wait.
+    #[test]
+    fn jobs_one_after_the_other_are_each_done_at_their_wait() {
+        let beside = Beside::start("victory-test-beside-b").expect("a thread");
+        let count = Arc::new(AtomicUsize::new(0));
+        for i in 0..2000 {
+            let counted = count.clone();
+            beside
+                .run(move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                })
+                .wait();
+            assert_eq!(count.load(Ordering::SeqCst), i + 1);
+        }
+    }
+
+    /// A job handed over while the one before is not done runs at once on
+    /// the thread that hands it over.
+    #[test]
+    fn a_job_while_another_is_not_done_runs_here() {
+        let beside = Beside::start("victory-test-beside-c").expect("a thread");
+        let (go, gone) = mpsc::channel::<()>();
+        let first = beside.run(move || {
+            gone.recv().expect("let go");
+        });
+        let here = Arc::new(std::sync::Mutex::new(None));
+        let second = {
+            let here = here.clone();
+            beside.run(move || *here.lock().unwrap() = Some(std::thread::current().id()))
+        };
+        assert_eq!(*here.lock().unwrap(), Some(std::thread::current().id()), "done here, before the call returned");
+        second.wait();
+        go.send(()).unwrap();
+        first.wait();
+    }
+
+    /// A job's panic comes back to the thread that waits for it, and the
+    /// kept thread goes on with the next job.
+    #[test]
+    fn a_panic_comes_back_at_the_wait_and_the_thread_goes_on() {
+        let beside = Beside::start("victory-test-beside-d").expect("a thread");
+        let job = beside.run(|| panic!("a job's panic (expected by the test)"));
+        let waited = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.wait()));
+        assert!(waited.is_err(), "the panic came back");
+        let done = Arc::new(AtomicBool::new(false));
+        let d = done.clone();
+        beside.run(move || d.store(true, Ordering::SeqCst)).wait();
+        assert!(done.load(Ordering::SeqCst), "the next job ran");
+    }
+
+    /// A job dropped without a wait is waited for by the drop.
+    #[test]
+    fn a_dropped_job_is_waited_for() {
+        let beside = Beside::start("victory-test-beside-e").expect("a thread");
+        let (go, gone) = mpsc::channel::<()>();
+        let done = Arc::new(AtomicBool::new(false));
+        let job = {
+            let done = done.clone();
+            beside.run(move || {
+                gone.recv().expect("let go");
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                done.store(true, Ordering::SeqCst);
+            })
+        };
+        go.send(()).unwrap();
+        drop(job);
+        assert!(done.load(Ordering::SeqCst), "done by the time the drop returned");
+    }
+}
+
 /// Whether a submission's refreshes of host copies run on several threads,
 /// a copy to a thread (`VICTORY_WIDE_REFRESH=1`; off by default).
 ///
@@ -7400,6 +7682,21 @@ impl HostList {
 /// turn, each change said in the log (run 112 measured the switch worse,
 /// copies 52 -> 68 ms, in a build whose copies went through the kernel one
 /// by one; they are plain copies with one asking ahead now).
+///
+/// What kept the threads in line: a refresh's time is nearly all its
+/// asking (run AB: 20.3 of 21.2 ms a frame in `crate::watch::writes`, 15.5
+/// of them in the guards' check of view memory), and every asking held the
+/// journal alone for all of it. With the switch the askings that change
+/// nothing are answered side by side (`crate::watch::shared_asks`, on with
+/// it), and the biggest refreshes go first, so that no thread takes a big
+/// one when the others are done. Each refresh copies where it runs: on the
+/// kept threads no spreading stands, so a refresh there never waits for
+/// pieces of its own; the submitting thread, which runs refreshes too while
+/// it waits, takes every job left in the line before it waits for the rest
+/// (`crate::shadow::wide_run`), so no job waits for work only a waiting
+/// thread could do. Measured by the frame line's "copies" (the flush's wall
+/// time, not the threads' sum) and the line of askings answered side by
+/// side.
 fn wide_refresh() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: OnceLock<u8> = OnceLock::new();
@@ -7643,6 +7940,8 @@ impl Batch {
             for (shadow, from, to) in &self.refreshes {
                 Self::brought(&mut self.current, shadow, *from, *to);
             }
+            // The biggest first: the threads' line takes jobs in order.
+            self.refreshes.sort_unstable_by_key(|r| std::cmp::Reverse(r.2 - r.1));
             let jobs: Vec<Box<dyn FnOnce() + Send>> = self
                 .refreshes
                 .drain(..)
@@ -8103,6 +8402,7 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::shadow::lookup_line(frames);
         crate::descriptor::sync_line(frames);
+        crate::watch::shared_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);

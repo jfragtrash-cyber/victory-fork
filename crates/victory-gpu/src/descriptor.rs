@@ -256,26 +256,30 @@ pub(crate) fn sync_heaps() {
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
-/// not the one last seen (mirrored), and the microseconds it took.
+/// not the one last seen (mirrored), the microseconds it took, and those
+/// the submitting thread waited for it when it ran beside the preparing
+/// (`crate::host`'s `VICTORY_HEAP_SYNC_BESIDE`).
 #[cfg(windows)]
-pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
-    let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let [pages, looked, mirrored, micros, waited] = [0, 1, 2, 3, 4].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if pages == 0 {
         return;
     }
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
-         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms",
+         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms; \
+         the submitting thread waited {:.2} ms for it beside its preparing (VICTORY_HEAP_SYNC_BESIDE=0: it does it itself)",
         pages as f64 / frames,
         looked as f64 / frames,
         mirrored as f64 / frames,
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
-        micros as f64 / 1000.0 / frames
+        micros as f64 / 1000.0 / frames,
+        waited as f64 / 1000.0 / frames
     );
 }
 

@@ -72,6 +72,13 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host computes: for a compute program
+/// that runs `dword` console thread groups in each host group (`VICTORY_GROUP_MERGE`), the
+/// console's group count in x of a dispatch the host made with `x.div_ceil(dword)` groups;
+/// 0 for a dispatch whose group counts are the console's (an indirect one), where each host
+/// group runs one console group. Its presence in `user_data` is what tells the host that
+/// the program merges groups, and by how many.
+pub const USER_GROUPS_X: u32 = 0x104;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -162,8 +169,11 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
-    /// A compute shader with this thread-group size.
+    /// A compute shader with this thread-group size (the console's).
     pub threads: Option<[u32; 3]>,
+    /// Console thread groups a host group runs (`VICTORY_GROUP_MERGE`): the host's group is
+    /// `threads` with z that many times over. 1: as the console's.
+    pub groups_merged: u32,
     /// The wave size a compute shader requires (`WaveSize`).
     pub wave_size: Option<u32>,
     /// Thread-group shared memory, in dwords.
@@ -220,6 +230,7 @@ impl Shader {
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
+            groups_merged: 1,
             wave_size: None,
             lds_dwords: 0,
             lds: None,
@@ -472,6 +483,12 @@ impl Shader {
             &[index, s, n],
         );
         self.annotate(block, h, props.0, props.1)
+    }
+
+    /// The host's thread-group size: [`Shader::threads`] with [`Shader::groups_merged`]
+    /// groups stacked in z.
+    fn host_threads(&self) -> Option<[u32; 3]> {
+        self.threads.map(|[x, y, z]| [x, y, z * self.groups_merged])
     }
 
     /// The finished container.
@@ -762,7 +779,7 @@ impl Shader {
             let state = [3, g.max_vertices, 1, 5, 1].map(|n| Some(i32c(&mut self, n)));
             props.push(self.m.md_node(state.to_vec()));
         }
-        if let Some(threads) = self.threads {
+        if let Some(threads) = self.host_threads() {
             let t = threads.map(|n| Some(i32c(&mut self, n)));
             let t = self.m.md_node(t.to_vec());
             match self.mesh {
@@ -880,7 +897,7 @@ impl Shader {
             mesh: self.mesh.map(|m| (m, self.lds_dwords * 4)),
             geometry: self.geometry.map(|g| g.max_vertices),
             bindings: &bindings,
-            threads: self.threads.unwrap_or_default(),
+            threads: self.host_threads().unwrap_or_default(),
             wave_size: self.wave_size,
         });
         let hash = [0u8; 20];

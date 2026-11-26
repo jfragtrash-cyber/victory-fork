@@ -100,7 +100,14 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 /// [`build_valu_cs`] with `threads` threads in x (thread index in `v0`
 /// on entry, before `body`) and `lds_bytes` of LDS (a multiple of 512).
 fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
-    let mut words = Vec::new();
+    build_cs_with(&[], body, threads, (5 << 1) | ((lds_bytes / 512) << 15))
+}
+
+/// [`build_cs`] with `head` before the prologue (which sets `s5`) and the program's
+/// `COMPUTE_PGM_RSRC2` given: 5 user SGPRs (`s0..s4`) and whatever system SGPRs it enables
+/// after them (bit 7: the group id in x, in `s5`).
+fn build_cs_with(head: &[u32], body: &[u32], threads: u32, rsrc2: u32) -> HostShader {
+    let mut words = head.to_vec();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
     words.extend_from_slice(&s_load_dwordx4(8, 4));
@@ -147,7 +154,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: (5 << 1) | ((lds_bytes / 512) << 15), // 5 user SGPRs: s0..s4
+            rsrc2,
             threads: [threads, 1, 1],
         }),
         code,
@@ -486,6 +493,215 @@ fn max_and_min_order_negative_zero_below_positive_zero() {
             assert_eq!(got, want, "{backend}: {name} {inp:x?}");
         });
     }
+}
+
+/// [`build_valu_cs`] with the lowering's choices of this thread set for the build, and the
+/// module's instruction count.
+fn build_with(minmax_const: Option<bool>, legacy: Option<lower::LegacyMul>, body: &[u32]) -> (HostShader, u32) {
+    let was = (
+        lower::TEST_MINMAX_CONST.replace(minmax_const),
+        lower::TEST_LEGACY_MUL.replace(legacy),
+        super::census::TEST_ON.replace(true),
+    );
+    let shader = build_valu_cs(body);
+    lower::TEST_MINMAX_CONST.set(was.0);
+    lower::TEST_LEGACY_MUL.set(was.1);
+    super::census::TEST_ON.set(was.2);
+    let total = super::census::take(&shader.dxil).expect("a census of the module").counts[0];
+    (shader, total)
+}
+
+/// A maximum or minimum against a constant whose magnitude is not zero leaves out the test
+/// for two zeros (`VICTORY_MINMAX_CONST`): a smaller module, the same results; against a
+/// zero constant the test stays, and -0 still orders below +0.
+#[test]
+fn max_and_min_against_a_non_zero_constant_skip_the_zero_test() {
+    let f = f32::to_bits;
+    let inputs: Vec<[u32; 4]> = [0.0, -0.0, 0.25, 0.75, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY]
+        .iter()
+        .map(|&x| [f(x), 0, 0, 0])
+        .collect();
+    // (inline constant code, its value)
+    let constants = [(240u16, 0.5f32), (241, -0.5), (128, 0.0)];
+    for (name, op, max) in [("v_max_f32", 0x110u16, true), ("v_min_f32", 0x10F, false)] {
+        for (code, k) in constants {
+            let body = vop3(op, 0, code, vgpr(1), 0);
+            let ((on, n_on), (off, n_off)) = (build_with(Some(true), None, &body), build_with(Some(false), None, &body));
+            if k == 0.0 {
+                assert_eq!(n_on, n_off, "{name} against 0 keeps the zero test");
+            } else {
+                assert!(n_on + 4 <= n_off, "{name} against {k}: {n_on} instructions, {n_off} with the test");
+            }
+            let want = |x: f32| -> u32 {
+                if x == 0.0 && k == 0.0 {
+                    // RDNA2: -0 below +0
+                    return if max { f(0.0) } else { f(x) };
+                }
+                // NaN gives the constant, as `f32::max`/`min` do
+                f(if max { k.max(x) } else { k.min(x) })
+            };
+            for shader in [&on, &off] {
+                run_cases(shader, &inputs, |backend, _, inp, got| {
+                    let x = f32::from_bits(inp[0]);
+                    assert_eq!(got, want(x), "{backend}: {name}({k}, {x}) = {:?}", f32::from_bits(got));
+                });
+            }
+        }
+    }
+}
+
+/// `v_mul_legacy_f32` against a constant (`VICTORY_LEGACY_MUL=exact`): one FMad with +0
+/// against a normal constant, +0 against a zero one, the D3D9 rule's results either way
+/// (`0 × anything = +0`, otherwise the IEEE product). No case underflows: there an unfused
+/// FMad would turn -0 into +0.
+#[test]
+fn legacy_multiply_against_a_constant_keeps_the_d3d9_rule() {
+    let f = f32::to_bits;
+    let inputs: Vec<[u32; 4]> =
+        [0.0, -0.0, 1.5, -3.0, 3.0e38, f32::INFINITY, f32::NEG_INFINITY, f32::NAN, 1.0e-30]
+            .iter()
+            .map(|&x| [f(x), 0, 0, 0])
+            .collect();
+    // (inline constant code, its value): 2, -4, 0.5, 1/(2π), 0
+    let constants = [(244u16, 2.0f32), (247, -4.0), (240, 0.5), (248, 0.159_154_94), (128, 0.0)];
+    for (code, k) in constants {
+        for (src0, src1) in [(code, vgpr(1)), (vgpr(1), code)] {
+            // v_mul_legacy_f32 v0, src0, src1 (VOP3 0x107)
+            let body = vop3(0x107, 0, src0, src1, 0);
+            let (exact, n_exact) = build_with(None, Some(lower::LegacyMul::Exact), &body);
+            let (guard, n_guard) = build_with(None, Some(lower::LegacyMul::Guard), &body);
+            // (against 0 the clean-up already folds the guarded form to +0)
+            assert!(n_exact < n_guard || k == 0.0 && n_exact == n_guard, "legacy multiply by {k}: {n_exact} instructions, {n_guard} guarded");
+            for (form, shader) in [("exact", &exact), ("guard", &guard)] {
+                run_cases(shader, &inputs, |backend, _, inp, got| {
+                    let x = f32::from_bits(inp[0]);
+                    let want = if k == 0.0 || x == 0.0 { 0.0 } else { k * x };
+                    if want.is_nan() {
+                        assert!(f32::from_bits(got).is_nan(), "{backend} {form}: {k} × {x} = {got:#010x}, want NaN");
+                    } else if form == "exact" && x == 0.0 {
+                        // The RTX 3090's driver folds the `+ 0` away: k × -0
+                        // comes out -0 there (run on the card, 2026-11-26).
+                        assert!(got == 0 || got == 0x8000_0000, "{backend} {form}: {k} × {x} = {got:#010x}, want a zero");
+                    } else {
+                        assert_eq!(got, f(want), "{backend} {form}: {k} × {x} = {:?}, want {want:?}", f32::from_bits(got));
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// A 32-thread program (the group id in x copied to `v5` first) whose thread `t` of group
+/// `g` stores `32 g + t + 1` at dword `32 g + t`, plus `readfirstlane(32 g + t)` with
+/// `wave`; every thread then stores 1 to dword 0 (`build_cs`'s own store), which is what
+/// thread 0 of group 0 stores there anyway. Built with `merge` console groups a host group.
+fn merge_program(wave: bool, merge: Option<u32>) -> HostShader {
+    let head = [vop1(0x001, 5, sgpr(5))]; // v_mov_b32 v5, s5 (the group id)
+    let mut body = Vec::new();
+    body.extend_from_slice(&vop3(0x11A, 6, 133, vgpr(5), 0)); // v_lshlrev_b32 v6, 5, v5
+    body.extend_from_slice(&vop3(0x125, 6, vgpr(6), vgpr(0), 0)); // v_add_nc_u32 v6, v6, v0
+    body.extend_from_slice(&vop3(0x125, 7, 129, vgpr(6), 0)); // v_add_nc_u32 v7, 1, v6
+    if wave {
+        body.push(vop1(0x002, 12, vgpr(6))); // v_readfirstlane_b32 s12, v6
+        body.extend_from_slice(&vop3(0x125, 7, sgpr(12), vgpr(7), 0)); // v_add_nc_u32 v7, s12, v7
+    }
+    body.extend_from_slice(&vop3(0x11A, 6, 130, vgpr(6), 0)); // v_lshlrev_b32 v6, 2, v6
+    // buffer_store_dword v7, v6, s[8:11], 0 offen
+    let [w0, w1] = buffer_store_dword(7, 8, 0);
+    body.extend_from_slice(&[w0 | 1 << 12, w1 | 6]);
+    body.push(vop1(0x001, 0, 129)); // v_mov_b32 v0, 1
+    let was = (lower::TEST_GROUP_MERGE.replace(merge), lower::TEST_HOST_WAVE.replace(Some(32)));
+    let shader = build_cs_with(&head, &body, 32, (5 << 1) | 1 << 7);
+    lower::TEST_GROUP_MERGE.set(was.0);
+    lower::TEST_HOST_WAVE.set(was.1);
+    shader
+}
+
+/// `merge_program` dispatched with `groups` host groups in x, `count` in its
+/// `USER_GROUPS_X` dword: the UAV's `dwords`.
+fn dispatch_groups(host: &Host, shader: &HostShader, groups: u32, count: u32, dwords: u32) -> Vec<u32> {
+    let (root, pso) = host.compute_pipeline(shader).unwrap_or_else(|e| panic!("compute_pipeline failed: {e}"));
+    let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    for u in &shader.user_data {
+        ud[u.index as usize] = match u.root {
+            RootType::Other(super::USER_GROUPS_X) => count,
+            RootType::Constants | RootType::Table => 0,
+            other => panic!("unexpected user data {other:?}"),
+        };
+    }
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(dwords)],
+                samplers: &[],
+                groups: [groups, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    out[0].clone()
+}
+
+/// Console groups merged into host groups (`VICTORY_GROUP_MERGE`) write what the console's
+/// groups write: 7 groups as 4 host groups of 2 and 2 of 4 (the last with console groups
+/// past the dispatch, which end at once), and as 7 host groups with the dword 0 (an indirect
+/// dispatch, the host's counts the console's), each running its first console group only.
+fn check_merged_groups(wave: bool, devices: &[(&str, bool)]) {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let (console, dwords) = (7u32, 8 * 32);
+    let want: Vec<u32> = (0..dwords)
+        .map(|i| match i {
+            _ if i >= console * 32 => 0,
+            _ if wave => i + 1 + i / 32 * 32,
+            _ => i + 1,
+        })
+        .collect();
+    let plain = merge_program(wave, None);
+    assert!(
+        !plain.user_data.iter().any(|u| u.root == RootType::Other(super::USER_GROUPS_X)),
+        "merged without the switch"
+    );
+    let mut ran = 0;
+    for &(label, warp) in devices {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        assert_eq!(dispatch_groups(&host, &plain, console, 0, dwords), want, "{label}: as the console's");
+        for k in [2, 4] {
+            let merged = merge_program(wave, Some(k));
+            let u = merged
+                .user_data
+                .iter()
+                .find(|u| u.root == RootType::Other(super::USER_GROUPS_X))
+                .expect("the group count dword");
+            assert_eq!(u.dword, k, "{label}: the dword's merge factor");
+            let got = dispatch_groups(&host, &merged, console.div_ceil(k), console, dwords);
+            assert_eq!(got, want, "{label}: {k} console groups a host group");
+            let got = dispatch_groups(&host, &merged, console, 0, dwords);
+            assert_eq!(got, want, "{label}: {k} merged, dispatched with the console's counts");
+            // a dispatch of 6 console groups leaves the 7th's dwords alone
+            let got = dispatch_groups(&host, &merged, 6u32.div_ceil(k), 6, dwords);
+            let six: Vec<u32> = want.iter().enumerate().map(|(i, &w)| if i < 6 * 32 { w } else { 0 }).collect();
+            assert_eq!(got, six, "{label}: {k} merged, 6 console groups");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0 || devices.iter().all(|&(_, warp)| !warp), "no SM 6.6 device available");
+}
+
+#[test]
+fn merged_groups_write_what_the_console_groups_write() {
+    check_merged_groups(false, &[("hardware", false), ("warp", true)]);
+}
+
+/// With a wave operation the merged program asks for waves of 32 (each a console group);
+/// WARP takes no such pipeline, so the hardware alone.
+#[test]
+fn merged_groups_keep_each_console_group_in_its_own_wave() {
+    check_merged_groups(true, &[("hardware", false)]);
 }
 
 #[test]
@@ -1557,10 +1773,12 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        loop_report: None,
     })
     .expect("lower");
 
     let shader = HostShader {
+        loop_report: false,
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,

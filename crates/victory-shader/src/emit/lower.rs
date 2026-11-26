@@ -232,6 +232,9 @@ struct Lower<'a> {
     console_lanes: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
+    /// With groups merged ([`group_merge`]): whether this thread's console group is one the
+    /// dispatch has, and that group's x (made in the entry block).
+    merged: Option<(V, V)>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// IR blocks whose `s_barrier` not every lane is sure to reach (a lane
@@ -1280,6 +1283,136 @@ pub(super) fn host_max_wave() -> u32 {
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// A test's [`minmax_const`], for its thread only.
+    pub(super) static TEST_MINMAX_CONST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's [`legacy_mul_mode`], for its thread only.
+    pub(super) static TEST_LEGACY_MUL: std::cell::Cell<Option<LegacyMul>> = const { std::cell::Cell::new(None) };
+    /// A test's [`group_merge`], for its thread only.
+    pub(super) static TEST_GROUP_MERGE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// A test's [`exchange_batch`], for its thread only.
+    pub(super) static TEST_EXCHANGE_BATCH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_GROUP_MERGE=<k>` (2 or 4; anything else: off): a compute program whose thread
+/// group is one whole console wave of 32 lanes runs k console groups in each host group of
+/// k × 32 threads, the console groups stacked in z (each a host wave of its own on a host of
+/// 32-lane waves, so its lane-level code sees its own lanes). An RTX 3090 holds at most 16
+/// thread groups on an SM, so a group of one wave caps it at 16 of its 48 waves, whatever
+/// the program's registers would allow. In run AN, 32-thread groups were 14.4 ms of the
+/// 24.7 ms of compute in the 40 costliest command kinds; the costliest command (4.67 ms) is
+/// such a program, a ray march whose 44 VGPRs would let some 40 waves an SM hide the
+/// latency of its dependent samples.
+/// Only for programs without LDS and without `s_barrier` (a group barrier would wait for
+/// the other console groups, and a console group that ends early would leave it waiting),
+/// of at most [`MERGE_VGPRS`] VGPRs, and on a host whose waves are 32 lanes. The host
+/// divides the x group count of a direct dispatch by k and passes the console's count in a
+/// user-data dword ([`USER_GROUPS_X`]), past which a host group's console groups end at
+/// once. An indirect dispatch keeps the console's counts (its arguments are in title
+/// memory): the dword is 0 and each host group runs its first console group only, the
+/// others ending at once, but holding their places until the group ends. With k = 2 and
+/// registers within [`MERGE_VGPRS`] that leaves an SM its 16 working waves as before; with
+/// k = 4, 12 (48 waves an SM): try 2 first.
+/// Off until a timing run shows it.
+///
+/// [`USER_GROUPS_X`]: super::shader::USER_GROUPS_X
+fn group_merge() -> u32 {
+    #[cfg(test)]
+    if let Some(k) = TEST_GROUP_MERGE.get() {
+        return k;
+    }
+    static K: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *K.get_or_init(|| match std::env::var("VICTORY_GROUP_MERGE").ok().as_deref().map(str::trim) {
+        Some("2") => 2,
+        Some("4") => 4,
+        _ => 1,
+    })
+}
+
+/// `VICTORY_EXCHANGE_BATCH=1`: in a console wave64 program run as two host waves of 32, two
+/// values the halves exchange one right after the other (a first-lane read where some lane
+/// may be out of EXEC: whether each half has a lane, then the values; the two dwords of a
+/// 64-bit wave sum) go through one exchange of two group barriers instead of two of two
+/// each. Exact (the same stores and loads); costs two more LDS dwords a console wave. The
+/// 2.4 ms probe-allocation program of run AN met 34 times a thread, 4 of them saved so. Off
+/// until the wave64 tests have run on a card with it.
+fn exchange_batch() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_EXCHANGE_BATCH.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_EXCHANGE_BATCH").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// LDS dwords each console wave of a program run as two host waves exchanges through: a
+/// pair (its halves' values) for each value one exchange carries.
+fn exchange_dwords() -> u32 {
+    if exchange_batch() { 4 } else { 2 }
+}
+
+/// The most VGPRs a program whose groups merge ([`group_merge`]) has on the console. Two
+/// host waves of 64 registers fill an SM's 64 Ki registers with its 16 groups: a program
+/// with more gains less from merging, and its indirect dispatches, each group with one
+/// working wave, would get fewer working waves than before.
+const MERGE_VGPRS: u16 = 64;
+
+/// Whether a float maximum or minimum against a constant whose magnitude is not zero is
+/// the plain FMax/FMin ([`Lower::max_min`]), without the test for two zeros of opposite
+/// signs: exact, as the two operands are then never both zeros. Half of the time-weighted
+/// `v_max_f32`/`v_min_f32` of the 40 costliest command kinds of run AN have such an
+/// operand; the test is five integer instructions (with the others, 5.7% of those kinds'
+/// host instructions), and the clean-up (`bitcode::opt`) does not fold it.
+/// `VICTORY_MINMAX_CONST=0`: the test everywhere, as before.
+fn minmax_const() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_MINMAX_CONST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_MINMAX_CONST").map_or(true, |v| v.trim() != "0"))
+}
+
+/// How the D3D9 multiply (`0 × anything = +0`) of `v_mul_legacy_f32`, `v_mac_legacy_f32`
+/// and `v_mad_legacy_f32` is written ([`Lower::legacy_mul`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LegacyMul {
+    /// A multiply, a compare of each operand with 0, an or and a select.
+    Guard,
+    /// [`LegacyMul::Guard`], but against a constant that is a normal float, `FMad(K, b, +0)`,
+    /// and against a zero constant, +0.
+    Exact,
+    /// A bare multiply.
+    Plain,
+}
+
+/// [`LegacyMul`] from `VICTORY_LEGACY_MUL`. The console's compiler writes most float
+/// multiplies as `v_mul_legacy_f32`: 12.8% of the time-weighted vector instructions of the
+/// 40 costliest command kinds of run AN (811 of 4,320 in the 3.4 ms shadow-mask program),
+/// and the guarded form added 16.8% to those kinds' host instructions.
+/// - unset: [`LegacyMul::Guard`].
+/// - `exact`: [`LegacyMul::Exact`]. Bit for bit the rule wherever the host fuses FMad
+///   (NVIDIA does; the lowering of `v_fma_f32` counts on it too): an exact zero product plus
+///   +0 is +0, any other product is rounded once, as the multiply alone rounds it, and with
+///   a finite non-zero K no 0 × ∞ arises. Where FMad is not fused, a product that rounds to
+///   -0 (an underflow) comes out +0. 18% of the time-weighted legacy multiplies have such a
+///   constant (one instruction instead of three). **Not exact on the RTX 3090's driver**:
+///   it folds the `+ 0` away, so K × -0 gives -0 there, where the rule says +0 (the valu
+///   test, run on the card, 2026-11-26). Off for that.
+/// - `plain`: [`LegacyMul::Plain`]. **Inexact**: 0 × ∞ and 0 × NaN give NaN (the
+///   normalisation of a zero vector), and a zero product keeps its sign. For a timing run
+///   only, which tells what the rule costs: if nothing moves, the host's compiler already
+///   makes the guarded form one instruction.
+pub(super) fn legacy_mul_mode() -> LegacyMul {
+    #[cfg(test)]
+    if let Some(mode) = TEST_LEGACY_MUL.get() {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<LegacyMul> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_LEGACY_MUL").ok().as_deref().map(str::trim) {
+        Some("exact") => LegacyMul::Exact,
+        Some("plain") => LegacyMul::Plain,
+        _ => LegacyMul::Guard,
+    })
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -1580,9 +1713,10 @@ impl<'a> Lower<'a> {
                             split_lds = s.lds_dwords > 0 && group > 32;
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
-                                // numbers go through two exchange dwords past the program's LDS
+                                // numbers go through exchange dwords past the program's LDS
+                                // ([`exchange_dwords`] a console wave)
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                s.lds_dwords += exchange_dwords() * group.div_ceil(64);
                             }
                         }
                     }
@@ -1633,6 +1767,26 @@ impl<'a> Lower<'a> {
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
+            }
+            // k console groups in a host group ([`group_merge`]): one whole wave of 32 lanes
+            // a group, nothing shared between the threads of a group, and a first block no
+            // branch comes back to (the host's first block is then the merge's prologue).
+            let shares = insts().any(|i| {
+                i.name() == "s_barrier"
+                    || matches!(i.fields, Fields::Ds { .. })
+                        && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
+            });
+            let merge = group_merge();
+            if merge > 1
+                && !x.native.wave64
+                && group == 32
+                && host_max_wave() == 32
+                && x.native.vgprs <= MERGE_VGPRS
+                && s.lds_dwords == 0
+                && !shares
+                && p.blocks.first().is_some_and(|b| b.preds.is_empty())
+            {
+                s.groups_merged = merge;
             }
         }
         // The title's barriers a thread of the group may never reach, which
@@ -1792,6 +1946,7 @@ impl<'a> Lower<'a> {
             halves,
             wave_base: None,
             flat: None,
+            merged: None,
             no_barrier,
             fence_only,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -2269,8 +2424,7 @@ impl<'a> Lower<'a> {
                 need(self.cur_ir);
                 return Err("a wave reduction where not every lane runs");
             }
-            let (lo0, lo1) = self.exchange_halves(self.cur, r_lo);
-            let (hi0, hi1) = self.exchange_halves(self.cur, r_hi);
+            let [(lo0, lo1), (hi0, hi1)] = self.exchange_two(self.cur, r_lo, r_hi);
             let c = self.cur;
             let d0 = self
                 .s
@@ -2460,6 +2614,15 @@ impl<'a> Lower<'a> {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
         }
+        if self.s.groups_merged > 1 {
+            // a console group the dispatch does not have ends here
+            let (valid, _) = self.merged_ids();
+            let (body, out) = (self.s.m.new_block(), self.s.m.new_block());
+            self.s.m.terminate(self.cur, Term::CondBr(valid, body, out));
+            self.s.m.terminate(out, Term::Ret);
+            self.cur = body;
+            self.block[order[0]] = Some(body);
+        }
         for &b in &order {
             self.cur = self.block[b].expect("reachable");
             self.cur_ir = b;
@@ -2516,6 +2679,10 @@ impl<'a> Lower<'a> {
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        if self.s.groups_merged > 1 && self.s.flags & flags::WAVE_OPS != 0 {
+            // a wave operation must see one console group's lanes: a host wave of 32 each
+            self.s.wave_size = Some(32);
+        }
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             wave_size,
@@ -2600,10 +2767,10 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => return self.compute_id(94, c),
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
-                let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
+                let Val::I32(g) = self.compute_id(94, 0) else {
                     unreachable!()
                 };
                 let n = self.s.m.i32(self.x.mesh_stride);
@@ -2665,13 +2832,59 @@ impl<'a> Lower<'a> {
         self.load_input(id, col)
     }
 
-    /// A component of a compute thread or group id, read in the entry block.
-    fn compute_id(&mut self, name: &str, opcode: u32, c: u8) -> Val {
+    /// A component of a compute thread or group id, read in the entry block. With groups
+    /// merged ([`group_merge`]), the console group's: its x from [`Lower::merged_ids`], its
+    /// thread's z within the console's group.
+    fn compute_id(&mut self, opcode: u32, c: u8) -> Val {
+        if self.s.groups_merged > 1 {
+            if opcode == 94 && c == 0 {
+                return Val::I32(self.merged_ids().1);
+            }
+            if opcode == 95 && c == 2 {
+                let z = self.s.threads.expect("compute")[2];
+                let host = self.host_id(opcode, 2);
+                let z = self.s.m.i32(z);
+                return Val::I32(self.s.m.bin(self.s.entry, Bin::URem, host, z));
+            }
+        }
+        Val::I32(self.host_id(opcode, c))
+    }
+
+    /// Component `c` of the host's thread id in the group (`opcode` 95) or group id (94).
+    fn host_id(&mut self, opcode: u32, c: u8) -> V {
+        let name = if opcode == 94 { "groupId.i32" } else { "threadIdInGroup.i32" };
         let (entry, c) = (self.s.entry, self.s.m.i32(u32::from(c)));
-        Val::I32(
-            self.s
-                .op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[c]),
-        )
+        self.s.op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[c])
+    }
+
+    /// With groups merged ([`group_merge`]): whether this thread's console group is one the
+    /// dispatch has, and its x. The host group's console groups are its waves of 32 in order;
+    /// the dispatch's x count of console groups is a user-data dword ([`USER_GROUPS_X`]), 0
+    /// when the host's group counts are the console's (then only the first runs).
+    ///
+    /// [`USER_GROUPS_X`]: super::shader::USER_GROUPS_X
+    fn merged_ids(&mut self) -> (V, V) {
+        if let Some(ids) = self.merged {
+            return ids;
+        }
+        let (e, i32t, k) = (self.s.entry, self.s.t.i32, self.s.groups_merged);
+        let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+        let group = self.s.threads.expect("compute").iter().product::<u32>();
+        let group = self.s.m.i32(group);
+        let sub = self.s.m.bin(e, Bin::UDiv, flat, group);
+        let host_x = self.host_id(94, 0);
+        let count = self.host_word(RootType::Other(super::shader::USER_GROUPS_X), 0, k);
+        let kk = self.s.m.i32(k);
+        let first = self.s.m.bin(e, Bin::Mul, host_x, kk);
+        let merged_x = self.s.m.bin(e, Bin::Add, first, sub);
+        let zero = self.s.m.i32(0);
+        let console = self.s.m.cmp(e, pred::EQ, count, zero);
+        let x = self.s.m.select(e, console, host_x, merged_x);
+        let leading = self.s.m.cmp(e, pred::EQ, sub, zero);
+        let inside = self.s.m.cmp(e, pred::IULT, merged_x, count);
+        let valid = self.s.m.select(e, console, leading, inside);
+        self.merged = Some((valid, x));
+        (valid, x)
     }
 
     fn find_input(&self, row: u8, channel: u8) -> Option<(usize, u8)> {
@@ -3572,6 +3785,12 @@ impl<'a> Lower<'a> {
     fn max_min(&mut self, max: bool, a: V, b: V) -> V {
         let c = self.cur;
         let r = self.binary(if max { 35 } else { 36 }, a, b);
+        // Against a constant whose magnitude is not zero the two are never both zeros:
+        // the test below would always give `r` ([`minmax_const`]).
+        let nonzero = |m: &super::bitcode::Module, v: V| m.float_bits(v).is_some_and(|x| x & 0x7FFF_FFFF != 0);
+        if minmax_const() && (nonzero(&self.s.m, a) || nonzero(&self.s.m, b)) {
+            return r;
+        }
         let (ia, ib) = (self.as_int(a), self.as_int(b));
         let either = self.s.m.bin(c, Bin::Or, ia, ib);
         let magnitude = self.s.m.i32(0x7FFF_FFFF);
@@ -3773,11 +3992,31 @@ impl<'a> Lower<'a> {
         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
     }
 
-    /// `0 × anything = 0`, as in D3D9.
+    /// `0 × anything = 0`, as in D3D9 (the form: [`legacy_mul_mode`]).
     fn legacy_mul(&mut self, a: V, b: V) -> V {
         let c = self.cur;
-        let m = self.s.m.bin(c, Bin::Mul, a, b);
         let zero = self.s.m.f32(0);
+        match legacy_mul_mode() {
+            LegacyMul::Guard => {}
+            LegacyMul::Plain => return self.s.m.bin(c, Bin::Mul, a, b),
+            LegacyMul::Exact => {
+                for (k, x) in [(a, b), (b, a)] {
+                    let Some(bits) = self.s.m.float_bits(k) else {
+                        continue;
+                    };
+                    if bits & 0x7FFF_FFFF == 0 {
+                        return zero;
+                    }
+                    // a normal float: neither 0, nor a denormal (0 where the host flushes it,
+                    // where 0 × ∞ would arise), nor ∞ or NaN
+                    let exponent = bits >> 23 & 0xFF;
+                    if exponent != 0 && exponent != 0xFF {
+                        return self.fmad(k, x, zero);
+                    }
+                }
+            }
+        }
+        let m = self.s.m.bin(c, Bin::Mul, a, b);
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
@@ -3954,46 +4193,74 @@ impl<'a> Lower<'a> {
     /// `exchange`: each host wave gives `mine` (the same in all its lanes) for its half; both get
     /// (lower half's, upper half's). A group with no upper half gets 0 for it.
     fn exchange_halves(&mut self, at: usize, mine: V) -> (V, V) {
+        self.exchange_many(at, [mine])[0]
+    }
+
+    /// [`Lower::exchange_halves`] for each of `mine`. With `VICTORY_EXCHANGE_BATCH=1`
+    /// ([`exchange_batch`]) two values go through one exchange (two group barriers) where
+    /// they went through two (four barriers); the same stores and loads, so the same values.
+    fn exchange_two(&mut self, at: usize, a: V, b: V) -> [(V, V); 2] {
+        if exchange_batch() {
+            return self.exchange_many(at, [a, b]);
+        }
+        [self.exchange_halves(at, a), self.exchange_halves(at, b)]
+    }
+
+    /// The exchange of `N` values (at most [`exchange_dwords`] / 2) in one round: each half
+    /// stores its values, the waves meet, both load them all, the waves meet again.
+    fn exchange_many<const N: usize>(&mut self, at: usize, mine: [V; N]) -> [(V, V); N] {
         let Some((slot, small, _)) = self.exchange.as_ref().map(|(a, b, _)| (*a, *b, ())) else {
             let z = self.s.m.i32(0);
-            return (mine, z);
+            return mine.map(|m| (m, z));
         };
         if small {
             let z = self.s.m.i32(0);
-            return (mine, z);
+            return mine.map(|m| (m, z));
         }
         if self.local {
             // each host wave on its own: its half holds `mine`, the other nothing
             let cl = self.console_lane();
             let (k32, z) = (self.s.m.i32(32), self.s.m.i32(0));
             let upper = self.s.m.cmp(at, pred::IUGE, cl, k32);
-            let lo = self.s.m.select(at, upper, z, mine);
-            let hi = self.s.m.select(at, upper, mine, z);
-            return (lo, hi);
+            return mine.map(|m| {
+                let lo = self.s.m.select(at, upper, z, m);
+                let hi = self.s.m.select(at, upper, m, z);
+                (lo, hi)
+            });
         }
-        // the pair of dwords of this thread's console wave: its half's, then both
+        assert!(2 * N as u32 <= exchange_dwords(), "more values than exchange dwords");
+        // the dwords of this thread's console wave: a pair for each value, its half's, then both
         let pair = self.exchange_pair(slot);
         let cl = self.console_lane();
         let five = self.s.m.i32(5);
         let half = self.s.m.bin(at, Bin::LShr, cl, five);
-        let index = self.s.m.bin(at, Bin::Add, pair, half);
         let lds = self.s.lds();
-        let ptr = self.s.m.element(at, lds, index);
-        self.s.m.store(at, ptr, mine);
+        let pairs = std::array::from_fn::<V, N, _>(|n| {
+            let k = self.s.m.i32(2 * n as u32);
+            self.s.m.bin(at, Bin::Add, pair, k)
+        });
+        for (&p, &m) in pairs.iter().zip(&mine) {
+            let index = self.s.m.bin(at, Bin::Add, p, half);
+            let ptr = self.s.m.element(at, lds, index);
+            self.s.m.store(at, ptr, m);
+        }
         self.group_sync(at);
         let one = self.s.m.i32(1);
-        let k1 = self.s.m.bin(at, Bin::Add, pair, one);
-        let p0 = self.s.m.element(at, lds, pair);
-        let p1 = self.s.m.element(at, lds, k1);
-        let lo = self.s.m.load(at, p0);
-        let hi = self.s.m.load(at, p1);
+        let got = pairs.map(|p| {
+            let k1 = self.s.m.bin(at, Bin::Add, p, one);
+            let p0 = self.s.m.element(at, lds, p);
+            let p1 = self.s.m.element(at, lds, k1);
+            let lo = self.s.m.load(at, p0);
+            let hi = self.s.m.load(at, p1);
+            (lo, hi)
+        });
         // the slots are written again only after every thread read them
         self.group_sync(at);
-        (lo, hi)
+        got
     }
 
-    /// The first of the two exchange dwords of this thread's console wave (made in the entry
-    /// block): a group of several console waves has a pair for each.
+    /// The first of the exchange dwords of this thread's console wave (made in the entry
+    /// block): a group of several console waves has [`exchange_dwords`] for each.
     fn exchange_pair(&mut self, slot: u32) -> V {
         if let Some(v) = self.pair {
             return v;
@@ -4002,8 +4269,8 @@ impl<'a> Lower<'a> {
         let thread = self.console_thread();
         let six = self.s.m.i32(6);
         let wave = self.s.m.bin(e, Bin::LShr, thread, six);
-        let one = self.s.m.i32(1);
-        let twice = self.s.m.bin(e, Bin::Shl, wave, one);
+        let shift = self.s.m.i32(exchange_dwords().trailing_zeros());
+        let twice = self.s.m.bin(e, Bin::Shl, wave, shift);
         let base = self.s.m.i32(slot);
         let v = self.s.m.bin(e, Bin::Add, base, twice);
         self.pair = Some(v);
@@ -4339,7 +4606,7 @@ impl<'a> Lower<'a> {
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
         if !self.console_lanes {
-            return self.compute_id("threadIdInGroup.i32", 95, c);
+            return self.compute_id(95, c);
         }
         let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
@@ -4377,7 +4644,13 @@ impl<'a> Lower<'a> {
         let mask = self.s.m.i32(!(wave - 1));
         let base = self.s.m.bin(e, Bin::And, first, mask);
         let lane = self.lane_index();
-        let f = self.s.m.bin(e, Bin::Add, base, lane);
+        let mut f = self.s.m.bin(e, Bin::Add, base, lane);
+        if self.s.groups_merged > 1 {
+            // the thread's index in its console group
+            let group = self.s.threads.expect("compute").iter().product::<u32>();
+            let group = self.s.m.i32(group);
+            f = self.s.m.bin(e, Bin::URem, f, group);
+        }
         self.s.flags |= flags::WAVE_OPS;
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
         Val::I32(match c {
@@ -7868,8 +8141,7 @@ impl<'a> Lower<'a> {
                     } else {
                         let i32t = self.s.t.i32;
                         let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
-                        let (lo_has, hi_has) = self.exchange_halves(c, has);
-                        let (lo, hi) = self.exchange_halves(c, mine);
+                        let [(lo_has, hi_has), (lo, hi)] = self.exchange_two(c, has, mine);
                         let z = self.s.m.i32(0);
                         let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);
                         let in_hi = self.s.m.cmp(c, pred::NE, hi_has, z);

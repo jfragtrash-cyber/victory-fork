@@ -1032,10 +1032,16 @@ fn views_asked() -> bool {
     })
 }
 
-/// [`known_view`]'s look at the guards `g`, the switches aside.
+/// [`known_view`]'s look at the guards `g`, the switches aside. A block
+/// left open to rest ([`rest_now`]) was read-only by our hand a moment ago:
+/// a view, which the kernel's write watch would be asked about in vain at
+/// every check of its rest.
 fn known_view_in(g: &Guards, start: usize) -> bool {
     let first = start / BLOCK;
-    g.protected.contains(first) || g.absent.contains(first) || (view_known() && g.viewed.contains(first))
+    g.protected.contains(first)
+        || g.absent.contains(first)
+        || (view_known() && g.viewed.contains(first))
+        || (!g.rests.rested.is_empty() && g.rests.rested.contains(first))
 }
 
 /// Blocks to a chunk of [`Blocks`]: 2 GiB of title memory, 4 KiB of bits.
@@ -1299,6 +1305,9 @@ struct Guards {
     /// ([`guard_unlocked`]): until it notes them, nothing else changes their
     /// guards, opens them or decides about a write to them ([`wait_protecting`]).
     protecting: Blocks,
+    /// With [`rest_now`]: when checks last made blocks read-only, and the
+    /// blocks a write opened soon after, left open for a while.
+    rests: Rests,
 }
 
 impl Guards {
@@ -1312,8 +1321,254 @@ impl Guards {
             holes: BTreeMap::new(),
             holes_changed: 0,
             protecting: Blocks::new(),
+            rests: Rests::new(),
         }
     }
+}
+
+/// How long a block that the title wrote soon after a check made it
+/// read-only is left open, in microseconds (`VICTORY_GUARD_REST=1`;
+/// `VICTORY_GUARD_REST_US=<n>` sets the time, 2,000 unless given; `alt`:
+/// twenty seconds with, twenty without, in turn, each change said in the
+/// log; off by default). 0 when off.
+///
+/// A block the title keeps writing is made read-only by a check, written
+/// at once, opened by the fault, made read-only by the next check, and so
+/// on: a `VirtualProtect` of ours and a fault of the title's each time. In
+/// run BA's play the submitting thread spent 3.1 ms a frame in
+/// `VirtualProtect` making blocks read-only again ([`protect`]) and 1.9 ms
+/// waiting to hold the guards again after it, and the title's threads 6.6
+/// ms a frame waiting in the fault handler for the guards' lock (360 guard
+/// faults a frame in run BL). On the same title VIctory-7900XTX's fault
+/// book found 220 of a frame's 586 faults within 3 ms of the check that had
+/// made the block read-only, up to a dozen times a frame for one block
+/// (its 7bc7c07). By hand on this machine (2026-11-26, a 1 GiB test
+/// process): making one block read-only costs 2.3 us alone and 11.4 us with
+/// 24 threads of the process running beside (the shootdown of their TLBs),
+/// a copy of the block 3-4.5 us.
+///
+/// So a block opened by a write less than this long after a check made it
+/// read-only rests: for this long after the write, and for at most
+/// [`rest_checks`] checks of it, no check makes it read-only again, and
+/// every check reports it written, as it reports any block that is not
+/// guarded now (nothing written is missed: what is not read-only is never
+/// clean). The first check after the rest makes it read-only again. Blocks
+/// written once in a while are never left open: their next check guards
+/// them as before, and copies nothing more. What it costs: a resting block
+/// is copied at each check of it, written or not. A rest pays where the
+/// title writes the block again between the checks of its rest (each such
+/// write is a `VirtualProtect` of 11 us and a fault saved, the copy made
+/// anyway); where it does not, the rest saves nothing and costs a copy
+/// (3-4.5 us) at each of its checks, which the cap on checks bounds.
+///
+/// By hand (`bench_tests::checks_beside_a_writer_with_and_without_rests`:
+/// 32 blocks of 256 written in turn, the range checked every 250 us, 16
+/// threads running beside; agents' builds beside, so the times are rough):
+/// with a write every 15 us (each block again every ~0.5 ms), without
+/// rests every write faulted (13.8 us each) and the checks took 1.15 s of
+/// 2 s; with rests of 4 ms and no cap on checks the writer wrote 1.4 times
+/// as much, half its writes faulted (10.7 us) and the checks took 0.68 s,
+/// but 3.5 times as many blocks were reported written (copies). With a
+/// write every 120 us (each block again every ~4 ms) those rests saved no
+/// `VirtualProtect` and reported 5 times as many blocks: so 2 ms and 2
+/// checks by default.
+fn rest_now() -> u64 {
+    rest_in_turn(true)
+}
+
+/// [`rest_now`]; with `say`, a change of `alt`'s turn is said in the log
+/// (not from the fault handler, which must not wait for the log's lock).
+fn rest_in_turn(say: bool) -> u64 {
+    #[cfg(test)]
+    if REST_HERE.get() != 0 {
+        return REST_HERE.get();
+    }
+    let on = match rest_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            let on = (crate::host::now_us() / 20_000_000) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if say && LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "blocks written just after their check rest from now (VICTORY_GUARD_REST=alt): {}",
+                    if on { "RESTING, left open a while" } else { "off, guarded again at the next check as usual" }
+                );
+            }
+            on
+        }
+    };
+    if on { rest_us() } else { 0 }
+}
+
+/// `VICTORY_GUARD_REST`: 0 off, 1 on, 2 in turn ([`rest_now`]).
+fn rest_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_GUARD_REST").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    })
+}
+
+/// `VICTORY_GUARD_REST_US`: a rest's length in microseconds ([`rest_now`]).
+fn rest_us() -> u64 {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *US.get_or_init(|| {
+        std::env::var("VICTORY_GUARD_REST_US")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&us| us > 0)
+            .unwrap_or(2000)
+    })
+}
+
+/// `VICTORY_GUARD_REST_CHECKS`: the checks a rest lasts at most, 2 unless
+/// given ([`rest_now`]): the next makes the block read-only again, however
+/// much of the rest's time is left.
+fn rest_checks() -> u32 {
+    #[cfg(test)]
+    if REST_CHECKS_HERE.get() != 0 {
+        return REST_CHECKS_HERE.get();
+    }
+    static CHECKS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CHECKS.get_or_init(|| {
+        std::env::var("VICTORY_GUARD_REST_CHECKS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(2)
+    })
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// Tests: the rest this thread's checks and faults use ([`rest_now`];
+    /// 0: as the switch says), and the checks it lasts ([`rest_checks`]).
+    static REST_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static REST_CHECKS_HERE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs of more blocks than this made read-only at once are not noted in
+/// [`Rests::armed`]: a range guarded for the first time (thousands of
+/// blocks), not a block found written. One of those that the title keeps
+/// writing rests from its next turn on.
+const REST_RUN_MOST: usize = 64;
+
+/// Entries [`Rests`] keeps before it lets the old ones go.
+const RESTS_MOST: usize = 1 << 14;
+
+/// The guards' memory of [`rest_now`], in microseconds of
+/// `crate::host::now_us`.
+struct Rests {
+    /// Blocks resting now; their ends are in `until`. (A bit, so that a look
+    /// at it costs what the guards' other looks do.)
+    rested: Blocks,
+    /// Of those, when each rest ends and the checks it has left.
+    until: BTreeMap<usize, (u64, u32)>,
+    /// Blocks a check made read-only lately, and when.
+    armed: BTreeMap<usize, u64>,
+}
+
+impl Rests {
+    const fn new() -> Rests {
+        Rests { rested: Blocks::new(), until: BTreeMap::new(), armed: BTreeMap::new() }
+    }
+
+    /// A check made blocks `[from, to)` read-only at `now`.
+    fn armed(&mut self, from: usize, to: usize, now: u64, rest: u64) {
+        if to - from > REST_RUN_MOST {
+            return;
+        }
+        if self.armed.len() >= RESTS_MOST {
+            self.armed.retain(|_, at| now.saturating_sub(*at) < rest);
+            if self.armed.len() >= RESTS_MOST {
+                self.armed.clear();
+            }
+        }
+        for block in from..to {
+            self.armed.insert(block, now);
+        }
+    }
+
+    /// A write opened `block` at `now`: whether it rests (a check made it
+    /// read-only less than `rest` before), until `now + rest` or for
+    /// `checks` checks.
+    fn opened(&mut self, block: usize, now: u64, rest: u64, checks: u32) -> bool {
+        let Some(at) = self.armed.remove(&block) else {
+            return false;
+        };
+        if now.saturating_sub(at) >= rest {
+            return false;
+        }
+        if self.until.len() >= RESTS_MOST {
+            let ended: Vec<usize> = self.until.iter().filter(|&(_, &(end, _))| end <= now).map(|(&b, _)| b).collect();
+            for b in ended {
+                self.until.remove(&b);
+                self.rested.remove(b);
+            }
+        }
+        self.rested.insert(block);
+        self.until.insert(block, (now + rest, checks));
+        true
+    }
+
+    /// A check of `block` at `now`: whether it rests (and one check of its
+    /// rest is spent); one whose rest is over is forgotten.
+    fn rests(&mut self, block: usize, now: u64) -> bool {
+        if !self.rested.contains(block) {
+            return false;
+        }
+        if let Some((end, left)) = self.until.get_mut(&block)
+            && *end > now
+            && *left > 0
+        {
+            *left -= 1;
+            return true;
+        }
+        self.rested.remove(block);
+        self.until.remove(&block);
+        false
+    }
+
+    /// Blocks `[from, to)` show something new (the runtime mapped or
+    /// unmapped them): none of them rests, and no check made them read-only
+    /// lately. (A look into each map, mostly finding nothing: the runtime
+    /// remaps thousands of times a frame in cutscenes.)
+    fn remapped(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        self.rested.remove_range(from, to);
+        let armed: Vec<usize> = self.armed.range(from..to).map(|(&b, _)| b).collect();
+        for b in armed {
+            self.armed.remove(&b);
+        }
+        let until: Vec<usize> = self.until.range(from..to).map(|(&b, _)| b).collect();
+        for b in until {
+            self.until.remove(&b);
+        }
+    }
+}
+
+/// Since the last frame line ([`rest_line`]): blocks checks made read-only
+/// and their `VirtualProtect` calls; blocks a write opened soon after their
+/// check, left to rest; blocks checks found resting and left open.
+static RESTED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// With the frame line, while `VICTORY_GUARD_REST` is on or in turn: what
+/// the checks made read-only and what rested, per frame over `frames`.
+pub(crate) fn rest_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [blocks, calls, began, left] = [0, 1, 2, 3].map(|i| RESTED[i].swap(0, Relaxed) as f64 / frames);
+    if rest_mode() == 0 {
+        return;
+    }
+    tracing::info!(
+        "guards per frame: {blocks:.0} blocks made read-only by checks in {calls:.0} calls; {began:.0} opened by a write \
+         soon after their check, left to rest; {left:.0} checks of a resting block left it open (VICTORY_GUARD_REST, {} us)",
+        rest_us()
+    );
 }
 
 /// What [`Guards::holes`] keeps of one answer of Windows.
@@ -1554,6 +1809,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     let mut uncommitted_until = first;
     let mut holes = HolesAhead::new(last);
+    // Blocks resting ([`rest_now`]) are reported and left open; the clock
+    // is read once, at the first one (a rest is milliseconds long).
+    let rest = rest_now();
+    let mut now = None;
     let mut at = first;
     loop {
         // Blocks `[at, block)` are clean, or absent inside the hole the
@@ -1583,6 +1842,14 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.protected.contains(block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
+                end_run(&mut g, &mut run, block, &mut holes);
+            } else if rest > 0
+                && !g.rests.rested.is_empty()
+                && g.rests.rests(block, *now.get_or_insert_with(crate::host::now_us))
+            {
+                // The title wrote it just after a check guarded it: left open,
+                // reported written (above) until its rest is over.
+                RESTED[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 end_run(&mut g, &mut run, block, &mut holes);
             } else {
                 run.get_or_insert(block);
@@ -1744,6 +2011,16 @@ fn protect(g: &mut Held, from: usize, to: usize) {
     protect_noted(g, from, to, whole, &each);
     for alias in others_done {
         protect_alias_noted(g, alias);
+    }
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        RESTED[0].fetch_add((to - from) as u64, Relaxed);
+        RESTED[1].fetch_add(if whole { 1 } else { 1 + (to - from) as u64 }, Relaxed);
+    }
+    // When, for a write that opens them soon after ([`Rests::opened`]).
+    let rest = rest_now();
+    if rest > 0 {
+        g.rests.armed(from, to, crate::host::now_us(), rest);
     }
     g.protecting.remove_range(from, to);
     for &(alias, _) in &others {
@@ -2121,6 +2398,10 @@ fn open(g: &mut Held, start: usize, end: usize) -> bool {
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g.protected.iter_in(start / BLOCK, end.div_ceil(BLOCK)).collect();
+    // A block a check made read-only just before rests ([`rest_now`]).
+    // (Called from the fault handler too: nothing said in the log.)
+    let rest = if blocks.is_empty() || g.rests.armed.is_empty() { 0 } else { rest_in_turn(false) };
+    let now = if rest > 0 { crate::host::now_us() } else { 0 };
     for &block in &blocks {
         g.protected.remove(block);
         g.clean.remove(block);
@@ -2129,6 +2410,9 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
         // Copies of the page there are taken again (`crate::alias`).
         crate::alias::source_opened(block * BLOCK, BLOCK);
+        if rest > 0 && g.rests.opened(block, now, rest, rest_checks()) {
+            RESTED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     !blocks.is_empty()
 }
@@ -2473,6 +2757,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     g.protected.remove_range(from, to);
     g.clean.remove_range(from, to);
     g.aliased.remove_range(from, to);
+    g.rests.remapped(from, to);
     if view_known() {
         // The runtime calls this for two things only (`xmem`: `map` and
         // `unmap`): a range it has just mapped a section's pages into,
@@ -3245,6 +3530,200 @@ mod tests {
         assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
         title_memory_remapped(filler, MANY_VIEWS * BLOCK);
         drop_views(section, &[one, two], BLOCK);
+    }
+
+    /// What [`Rests`] says: a block rests only if a write opens it soon
+    /// after a check made it read-only, for the rest's length, once per
+    /// check; long runs are not noted; old notes go when there are many.
+    #[test]
+    fn rests_begin_just_after_a_check_and_end() {
+        const REST: u64 = 1000;
+        const CHECKS: u32 = 4;
+        let mut r = Rests::new();
+        r.armed(10, 12, 5_000, REST);
+        assert!(r.opened(10, 5_400, REST, CHECKS), "opened soon after its check");
+        assert!(r.rests(10, 5_401) && r.rests(10, 6_399));
+        assert!(!r.rests(10, 6_400), "its rest is over");
+        assert!(!r.rests(10, 6_000), "and forgotten");
+        // At most `CHECKS` checks, however long the time left.
+        r.armed(30, 31, 5_000, REST);
+        assert!(r.opened(30, 5_001, REST, CHECKS));
+        for n in 0..CHECKS {
+            assert!(r.rests(30, 5_002), "check {n} of its rest");
+        }
+        assert!(!r.rests(30, 5_003), "its checks are spent");
+        assert!(!r.rests(30, 5_004));
+        assert!(!r.opened(11, 6_000, REST, CHECKS), "opened too long after its check");
+        r.armed(11, 12, 7_000, REST);
+        assert!(r.opened(11, 7_001, REST, CHECKS));
+        assert!(!r.opened(11, 7_002, REST, CHECKS), "once per check");
+        assert!(!r.opened(20, 0, REST, CHECKS), "never made read-only by a check");
+        // A range guarded whole for the first time is not a block found written.
+        r.armed(100, 101 + REST_RUN_MOST, 8_000, REST);
+        assert!(!r.opened(100, 8_001, REST, CHECKS));
+        r.armed(100, 100 + REST_RUN_MOST, 8_000, REST);
+        assert!(r.opened(100 + REST_RUN_MOST - 1, 8_001, REST, CHECKS));
+        r.armed(150, 151, 8_000, REST);
+        r.remapped(100, 200);
+        assert!(!r.rests(100 + REST_RUN_MOST - 1, 8_002), "mapped anew");
+        assert!(!r.opened(150, 8_002, REST, CHECKS), "mapped anew since its check");
+        // Many notes: the old ones go, a fresh one stays.
+        let mut r = Rests::new();
+        for block in 0..RESTS_MOST - 1 {
+            r.armed(block, block + 1, 0, REST);
+        }
+        r.armed(RESTS_MOST, RESTS_MOST + 1, 2 * REST - 1, REST);
+        r.armed(RESTS_MOST + 1, RESTS_MOST + 2, 2 * REST, REST);
+        assert_eq!(r.armed.len(), 2);
+        assert!(r.opened(RESTS_MOST, 2 * REST, REST, CHECKS));
+        // Many rests: the ended ones go.
+        let mut r = Rests::new();
+        for block in 0..RESTS_MOST {
+            r.armed(block, block + 1, 0, REST);
+            assert!(r.opened(block, 1, REST, CHECKS));
+        }
+        r.armed(RESTS_MOST, RESTS_MOST + 1, 2 * REST, REST);
+        assert!(r.opened(RESTS_MOST, 2 * REST + 1, REST, CHECKS));
+        assert_eq!((r.until.len(), r.rested.len), (1, 1));
+        assert!(!r.rests(0, 2 * REST + 2) && r.rests(RESTS_MOST, 2 * REST + 2));
+    }
+
+    /// With rests: a block the title writes just after its check is left
+    /// open and reported written at every check of its rest, then guarded
+    /// again at the first check after it (its checks spent, or its time
+    /// over); a block written long after its check is guarded again at its
+    /// next check, as without rests.
+    #[test]
+    fn a_block_written_just_after_its_check_rests_then_is_guarded_again() {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        const SIZE: usize = 2 * BLOCK;
+        const CHECKS: u32 = 3;
+        // Long enough that no rest of this test ends by itself.
+        REST_HERE.set(600_000_000);
+        REST_CHECKS_HERE.set(CHECKS);
+        // SAFETY: a fresh pagefile section mapped once; the view and the
+        // handle are let go at the end.
+        let (section, view) = unsafe {
+            let section = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, SIZE as u32, std::ptr::null());
+            assert!(!section.is_null());
+            (section as usize, MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SIZE).Value as usize)
+        };
+        assert_ne!(view, 0);
+        let (block, pages) = (view / BLOCK, |b: usize| (view + b * BLOCK) / PAGE);
+        assert_eq!(guard(view, view + SIZE), Some(vec![pages(0), pages(1)]));
+        assert!(!writable(view) && !writable(view + BLOCK));
+        // SAFETY: a byte of our view; the fault opens its block.
+        unsafe { ((view + 8) as *mut u8).write_volatile(1) };
+        assert!(guards_shared().rests.rested.contains(block), "written just after its check");
+        for n in 0..CHECKS as u8 {
+            assert_eq!(guard(view, view + SIZE), Some(vec![pages(0)]), "reported at every check of its rest");
+            assert!(writable(view), "left open");
+            assert!(!writable(view + BLOCK), "the block beside it stays guarded");
+            // SAFETY: as above; the block is open, nothing faults.
+            unsafe { ((view + 16) as *mut u8).write_volatile(n) };
+        }
+        // Its checks are spent: the next guards it again.
+        assert_eq!(guard(view, view + SIZE), Some(vec![pages(0)]));
+        assert!(!writable(view), "guarded again");
+        assert_eq!(guard(view, view + SIZE), Some(Vec::new()));
+        // Written just after that check: it rests again, until its time is over.
+        // SAFETY: as above; the fault opens it.
+        unsafe { ((view + 8) as *mut u8).write_volatile(2) };
+        assert_eq!(guard(view, view + SIZE), Some(vec![pages(0)]));
+        assert!(writable(view), "left open again");
+        guards().rests.until.insert(block, (0, CHECKS));
+        assert_eq!(guard(view, view + SIZE), Some(vec![pages(0)]));
+        assert!(!writable(view), "guarded again");
+        assert_eq!(guard(view, view + SIZE), Some(Vec::new()));
+        // Written long after its check (its note gone, as old ones go).
+        guards().rests.armed.remove(&block);
+        // SAFETY: as above; the fault opens it.
+        unsafe { ((view + 8) as *mut u8).write_volatile(3) };
+        assert!(!guards_shared().rests.rested.contains(block));
+        assert_eq!(guard(view, view + SIZE), Some(vec![pages(0)]));
+        assert!(!writable(view), "guarded again at once");
+        assert_eq!(guard(view, view + SIZE), Some(Vec::new()));
+        REST_HERE.set(0);
+        REST_CHECKS_HERE.set(0);
+        drop_views(section, &[view], SIZE);
+    }
+
+    /// With rests, two views of the same pages, each checked for a copy of
+    /// its own: a write through either is reported at both, whichever of
+    /// them rests (a view guarded again makes the other read-only too,
+    /// which ends that one's rest), and once the rests are over nothing is
+    /// left to report.
+    #[test]
+    fn no_write_through_another_view_is_lost_while_a_view_rests() {
+        const SIZE: usize = BLOCK;
+        REST_HERE.set(600_000_000);
+        REST_CHECKS_HERE.set(4);
+        let (section, one, two) = two_views(SIZE);
+        let (p1, p2) = (one / PAGE, two / PAGE);
+        assert_eq!(guard(one, one + SIZE), Some(vec![p1]));
+        assert_eq!(guard(two, two + SIZE), Some(vec![p2]), "the second view's first check");
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
+        assert_eq!(guard(two, two + SIZE), Some(Vec::new()));
+        // SAFETY: the first view; the fault opens both.
+        unsafe { ((one + 8) as *mut u8).write_volatile(1) };
+        assert!(guards_shared().rests.rested.contains(one / BLOCK), "written just after its check");
+        // Writes through either view, the views checked in either order.
+        for round in 0..12usize {
+            let at = if round % 2 == 0 { two } else { one };
+            // SAFETY: a view of ours; one that is read-only faults and opens.
+            unsafe { ((at + 8 + round) as *mut u8).write_volatile(round as u8) };
+            let order = if round % 4 < 2 { [(one, p1), (two, p2)] } else { [(two, p2), (one, p1)] };
+            for (view, page) in order {
+                assert_eq!(guard(view, view + SIZE), Some(vec![page]), "round {round}, view {view:#x}");
+            }
+        }
+        {
+            let mut g = guards();
+            for block in [one / BLOCK, two / BLOCK] {
+                if g.rests.until.contains_key(&block) {
+                    g.rests.until.insert(block, (0, 0));
+                }
+            }
+        }
+        // The rests over, the checks guard both again: nothing is left to
+        // report, and both are read-only.
+        for _ in 0..2 {
+            guard(one, one + SIZE);
+            guard(two, two + SIZE);
+        }
+        assert_eq!(guard(one, one + SIZE), Some(Vec::new()));
+        assert_eq!(guard(two, two + SIZE), Some(Vec::new()));
+        assert!(!writable(one) && !writable(two));
+        REST_HERE.set(0);
+        REST_CHECKS_HERE.set(0);
+        drop_views(section, &[one, two], SIZE);
+    }
+
+    /// Without rests (the switch off), a block written just after its check
+    /// is guarded again at the next check, as it always was.
+    #[test]
+    fn without_rests_a_written_block_is_guarded_again_at_once() {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        if rest_mode() != 0 {
+            return;
+        }
+        // SAFETY: as in the test above.
+        let (section, view) = unsafe {
+            let section = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            (section as usize, MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize)
+        };
+        assert_ne!(view, 0);
+        assert_eq!(guard(view, view + BLOCK), Some(vec![view / PAGE]));
+        // SAFETY: a byte of our view; the fault opens its block.
+        unsafe { ((view + 8) as *mut u8).write_volatile(1) };
+        assert!(!guards_shared().rests.rested.contains(view / BLOCK));
+        assert_eq!(guard(view, view + BLOCK), Some(vec![view / PAGE]));
+        assert!(!writable(view));
+        assert_eq!(guard(view, view + BLOCK), Some(Vec::new()));
+        drop_views(section, &[view], BLOCK);
     }
 
     /// A write or mapping that runs past the end of the address space (a
@@ -4084,6 +4563,106 @@ mod bench_tests {
                 // SAFETY: our view.
                 unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut _ }) };
             }
+        }
+    }
+
+    /// By hand: a thread keeps writing 32 of a range's 256 blocks (each
+    /// again some 0.5 ms later, as the title writes what it streams), while
+    /// another checks the range every 250 us (the refreshes) and 16 more
+    /// threads of the process run (the title's, whose TLBs a change of
+    /// protection must shoot down). Without and with rests ([`rest_now`]):
+    /// the time the checks took, the blocks they made read-only and the
+    /// `VirtualProtect` calls, and the writes' faults.
+    #[test]
+    #[ignore = "a timing, run by hand"]
+    fn checks_beside_a_writer_with_and_without_rests() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        const BLOCKS: usize = 256;
+        const HOT: usize = 32;
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let spinners: Vec<_> = (0..16)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    let mut v = vec![0u8; 1 << 16];
+                    let mut i = 0usize;
+                    while !stop.load(SeqCst) {
+                        v[i & 0xffff] = v[i & 0xffff].wrapping_add(1);
+                        i = i.wrapping_add(4099);
+                    }
+                })
+            })
+            .collect();
+        for (pause, rest, most) in [(15, 0, 1), (15, 2000, 2), (15, 4000, 4), (120, 0, 1), (120, 2000, 2), (120, 4000, 4)] {
+            // SAFETY: a new pagefile section, mapped whole.
+            let at = unsafe {
+                let section = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, (BLOCKS * BLOCK) as u32, std::ptr::null());
+                assert!(!section.is_null());
+                let at = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCKS * BLOCK).Value as usize;
+                CloseHandle(section);
+                assert_ne!(at, 0);
+                at
+            };
+            assert!(guard(at, at + BLOCKS * BLOCK).is_some());
+            let done = std::sync::Arc::new(AtomicBool::new(false));
+            let writer = {
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    REST_HERE.set(rest);
+                    REST_CHECKS_HERE.set(most);
+                    let (mut writes, mut slow, mut slow_time) = (0u64, 0u64, std::time::Duration::ZERO);
+                    let mut n = 0;
+                    while !done.load(SeqCst) {
+                        let block = (n % HOT) * (BLOCKS / HOT);
+                        let started = std::time::Instant::now();
+                        // SAFETY: a byte of our view; a guarded block faults and opens.
+                        unsafe { ((at + block * BLOCK + 8) as *mut u8).write_volatile(n as u8) };
+                        let took = started.elapsed();
+                        // A write that took a microsecond or more faulted.
+                        if took >= std::time::Duration::from_micros(1) {
+                            (slow, slow_time) = (slow + 1, slow_time + took);
+                        }
+                        writes += 1;
+                        n += 1;
+                        let waited = std::time::Instant::now();
+                        while waited.elapsed() < std::time::Duration::from_micros(pause) {}
+                    }
+                    (writes, slow, slow_time)
+                })
+            };
+            REST_HERE.set(rest);
+            REST_CHECKS_HERE.set(most);
+            for c in &RESTED {
+                c.store(0, SeqCst);
+            }
+            let (mut checks, mut checking, mut reported) = (0u32, std::time::Duration::ZERO, 0usize);
+            let started = std::time::Instant::now();
+            while started.elapsed() < std::time::Duration::from_secs(2) {
+                let check = std::time::Instant::now();
+                reported += guard(at, at + BLOCKS * BLOCK).expect("a view").len();
+                checking += check.elapsed();
+                checks += 1;
+                while check.elapsed() < std::time::Duration::from_micros(250) {}
+            }
+            done.store(true, SeqCst);
+            let (writes, faults, faulting) = writer.join().unwrap();
+            let [blocks, calls, began, left] = [0, 1, 2, 3].map(|i| RESTED[i].load(SeqCst));
+            println!(
+                "writes {pause} us apart, rest {rest} us or {most} checks: {checks} checks took {:?} ({:?} each), reported {reported} blocks written (each a copy); \
+                 {blocks} blocks made read-only in {calls} calls; {began} rests begun, {left} resting blocks left open; \
+                 {writes} writes, {faults} faulted ({:?} each)",
+                checking,
+                checking / checks.max(1),
+                faulting / (faults.max(1) as u32)
+            );
+            REST_HERE.set(0);
+            title_memory_remapped(at, BLOCKS * BLOCK);
+            // SAFETY: our view.
+            unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut _ }) };
+        }
+        stop.store(true, SeqCst);
+        for s in spinners {
+            s.join().unwrap();
         }
     }
 }

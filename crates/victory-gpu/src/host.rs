@@ -3210,6 +3210,10 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
         let mut runs_left = *RUNS.get_or_init(|| {
             std::env::var("VICTORY_MERGE_RUNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(512, |n| n.clamp(1, 1 << 16))
         });
+        // The pages side by side on the kept threads (`VICTORY_MERGE_WIDE`).
+        if crate::shadow::merge_wide() {
+            return crate::shadow::merge_all_under_writes(&spans, runs_left);
+        }
         return spans.iter().any(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
     }
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))

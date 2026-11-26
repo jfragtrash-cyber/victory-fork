@@ -108,10 +108,11 @@ struct Card {
     /// relay's merge of what the card wrote ([`Shadow::card_merge_relay`])
     /// and the title's bytes put in beside it ([`Shadow::merge_under_writes`]):
     /// each holds one 64 KiB block of title memory at a time, from its read
-    /// of title memory until its bytes are in. With [`relay_wide`] a block
-    /// takes the lock of its number, in turn, so that the merges of several
-    /// threads hold blocks of one copy side by side; without it every block
-    /// takes the first, one lock a copy as before.
+    /// of title memory until its bytes are in. With [`relay_wide`] or
+    /// [`merge_wide`] a block takes the lock of its number, in turn, so that
+    /// the merges of several threads hold blocks of one copy side by side;
+    /// without either every block takes the first, one lock a copy as
+    /// before.
     sides: [Mutex<()>; SIDES],
     /// Since the frame line took them ([`card_merged_take`]), of the relay's
     /// merges ([`Shadow::card_merge_relay`]): pieces, their bytes fetched,
@@ -128,7 +129,10 @@ impl Card {
     /// blocks, in the order of their places (one block, every caller's
     /// case, is one lock).
     fn side(&self, from: usize, to: usize) -> Vec<std::sync::MutexGuard<'_, ()>> {
-        let wide = relay_wide() > 1;
+        // One lock a block wherever several threads merge into one copy:
+        // the relay's landing (`VICTORY_RELAY_WIDE`), or the title's bytes
+        // put in under flights' writes ([`merge_wide`]).
+        let wide = relay_wide() > 1 || merge_wide();
         let mut places: Vec<usize> =
             (from / PIECE..=to.saturating_sub(1).max(from) / PIECE).map(|b| if wide { b % SIDES } else { 0 }).collect();
         places.sort_unstable();
@@ -1549,14 +1553,18 @@ fn workers() -> &'static Workers {
         more: std::sync::Condvar::new(),
     });
     STARTED.call_once(|| {
-        let n = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6);
-        for i in 0..n {
+        for i in 0..wide_count() {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 serve(WORKERS.get().expect("made above"));
             });
         }
     });
     workers
+}
+
+/// The threads kept for [`wide`] (a quarter of the processors, two to six).
+fn wide_count() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
 }
 
 /// A kept thread's life: the jobs of `workers`, one after the other.
@@ -2333,6 +2341,224 @@ fn joined_over(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
 fn merge_gap() -> usize {
     static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *GAP.get_or_init(|| std::env::var("VICTORY_MERGE_GAP").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(0, |n| n.min(64)))
+}
+
+/// Whether the merge of the title's bytes under flights' shader writes
+/// (`crate::host`'s `stale_under_flights`, [`Shadow::merge_under_writes`])
+/// compares and puts in its pages on the threads kept for [`wide`]
+/// (`VICTORY_MERGE_WIDE`; on by default, `0` merges page after page on the
+/// submitting thread, as before).
+///
+/// Run AB's gameplay profile: 13.3 ms a frame of the submitting thread in
+/// that merge, nearly all of it per page (title memory read, compared with
+/// the copy's reference, the changed runs put in: `changed_runs` 8.4,
+/// `joined_over` 1.2, the read 1.2) and 1 ms in the askings. The askings
+/// stay where they were, one after the other ([`merge_plan`]); the pages
+/// they find are merged side by side ([`merge_all_under_writes`]). Pages
+/// are independent: each is one 64 KiB block of title memory, read and
+/// compared under the lock of its copy's reference (a copy's snapshot, or
+/// the lock of the block in a copy in the card's memory: with the switch
+/// the copies in the card's memory take one lock a block, [`Card::side`],
+/// as with `VICTORY_RELAY_WIDE`, for the relay's merge too), and writes
+/// bytes of that block alone, in the copy and its reference, then notes the
+/// page taken. The runs a submission may send up to copies in the card's
+/// memory (`VICTORY_MERGE_RUNS`) are taken from one count: a page that
+/// finds too few left is left as it is and the flights are settled, as
+/// when the merge is one thread's (the pages merged meanwhile stay merged,
+/// as those before such a page do there). The merge comes before the
+/// refreshes and the lists' declared writes, and is done before them.
+///
+/// Measured by the frame line's preparing and the profile's
+/// `stale_under_flights` on the submitting thread (the pages' work moves to
+/// the `wide` role).
+pub(crate) fn merge_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_WIDE").is_none_or(|v| v != "0"))
+}
+
+/// A page for [`merge_all_under_writes`]: of `shadow`, title page `page`
+/// (a page number) of the range `range` shaders may be writing, stale as
+/// the asking `now` says.
+pub(crate) struct MergePage {
+    shadow: Arc<Shadow>,
+    page: usize,
+    range: (usize, usize),
+    now: u64,
+}
+
+/// [`Shadow::merge_under_writes`] for each of `spans` (a copy and the title
+/// addresses `[from, to)` it refreshes), with `runs_left` changed runs at
+/// most for copies in the card's memory in all ([`merge_wide`]): the
+/// askings here one after the other, then the pages they found side by side
+/// on the threads kept for [`wide`]. Whether the caller must still settle
+/// the flights.
+pub(crate) fn merge_all_under_writes(spans: &[(Arc<Shadow>, usize, usize)], runs_left: usize) -> bool {
+    let mut pages = Vec::new();
+    for (shadow, from, to) in spans {
+        if shadow.merge_plan(*from, to.saturating_sub(*from), &mut pages) {
+            return true;
+        }
+    }
+    merge_pages_on(pages, runs_left, wide_count() + 1)
+}
+
+/// The fewest pages handed to a thread of [`merge_pages_on`]: a page is
+/// some 10-30 microseconds of work, a hand-over a few.
+const MERGE_PAGES_A_THREAD: usize = 4;
+
+/// Merges `pages` ([`Shadow::merge_page`]) on up to `threads` threads (this
+/// one among them), `runs_left` changed runs at most in all; whether a page
+/// found too few runs left, or no snapshot (the caller settles).
+fn merge_pages_on(pages: Vec<MergePage>, runs_left: usize, threads: usize) -> bool {
+    if pages.is_empty() {
+        return false;
+    }
+    let threads = threads.min(pages.len().div_ceil(MERGE_PAGES_A_THREAD)).max(1);
+    let pages = Arc::new(pages);
+    let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let left = Arc::new(std::sync::atomic::AtomicUsize::new(runs_left));
+    let settle = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let jobs: Vec<Job> = (0..threads)
+        .map(|_| {
+            let (pages, next, left, settle) = (pages.clone(), next.clone(), left.clone(), settle.clone());
+            Box::new(move || {
+                // A page of title memory, kept from call to call on the
+                // thread (as `merge_under_writes` keeps it).
+                thread_local! {
+                    static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+                }
+                let mut title = TITLE.with(|t| std::mem::take(&mut *t.borrow_mut()));
+                title.resize(PAGE, 0);
+                let mut take = |runs: usize| left.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |l| l.checked_sub(runs)).is_ok();
+                while let Some(p) = pages.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    if !p.shadow.merge_page(p.page, p.range, p.now, &mut title, &mut take) {
+                        settle.store(true, Ordering::Relaxed);
+                    }
+                }
+                TITLE.with(|t| *t.borrow_mut() = title);
+            }) as Job
+        })
+        .collect();
+    wide(jobs);
+    settle.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod merge_wide_tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+
+    const MEM_WRITE_WATCH: u32 = 0x20_0000;
+    const PAGES: usize = 24;
+    const LEN: usize = PAGES * PAGE;
+
+    /// What a merge left: the copy's bytes, its reference's (the snapshot;
+    /// for a copy in the card's memory its CPU side, the copy's bytes), the
+    /// offsets noted to go up to the card (joined, in order), the pages
+    /// noted taken, and whether it said to settle.
+    #[derive(Debug, PartialEq)]
+    struct Left {
+        data: Vec<u8>,
+        reference: Vec<u8>,
+        up: Vec<(usize, usize)>,
+        taken: Vec<bool>,
+        settle: bool,
+    }
+
+    /// One merge of the same scene: a copy (in the card's memory, or with a
+    /// snapshot) of 24 pages of write-watched title memory, which the title
+    /// changed on two pages in three in runs of a few bytes, under the
+    /// writes flights may make to pages 2 to 19 and to part of page 22;
+    /// merged page after page or side by side (`wide`), `runs` changed
+    /// runs at most. `None` without the software adapter.
+    fn merged(card: bool, wide: bool, runs: usize) -> Option<Left> {
+        let buffer = super::card_merge_tests::warp_buffer()?;
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert!(title != 0 && title.is_multiple_of(PAGE));
+        let old: Vec<u8> = (0..LEN).map(|i| (i * 31 + 7) as u8).collect();
+        let mut now = old.clone();
+        for page in (0..PAGES).filter(|p| p % 3 != 0) {
+            for k in 0..page % 5 + 1 {
+                let at = page * PAGE + k * 4099 + page * 13;
+                for b in &mut now[at..at + 1 + k * 3] {
+                    *b ^= 0xa5;
+                }
+            }
+        }
+        // SAFETY: our allocation, `LEN` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(now.as_ptr(), title as *mut u8, LEN) };
+        let mut data = old.clone();
+        let mut shadow = Shadow::new(buffer.clone(), data.as_mut_ptr(), 0, title as u64, LEN as u64);
+        if card {
+            shadow.card = Some(Card {
+                staging: buffer,
+                before: Mutex::new(None),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+                // 0: no card bytes counted (`Drop` takes them off again).
+                size: 0,
+                sides: Default::default(),
+                merged: Default::default(),
+            });
+        } else {
+            *shadow.before.get_mut().unwrap() = Some(old.clone());
+        }
+        shadow.pending.get_mut().unwrap().extend([
+            (title + 2 * PAGE, title + 20 * PAGE),
+            (title + 22 * PAGE + 100, title + 22 * PAGE + 5000),
+        ]);
+        let shadow = Arc::new(shadow);
+        let settle = if wide {
+            merge_all_under_writes(&[(shadow.clone(), title, title + LEN)], runs)
+        } else {
+            let mut left = runs;
+            shadow.merge_under_writes(title, LEN, &mut left)
+        };
+        let mut up: Vec<(usize, usize)> = shadow.card.as_ref().map(|c| c.dirty.lock().unwrap().clone()).unwrap_or_default();
+        up.sort_unstable();
+        let up = up.into_iter().fold(Vec::<(usize, usize)>::new(), |mut joined, (a, b)| {
+            match joined.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => joined.push((a, b)),
+            }
+            joined
+        });
+        let taken = shadow.copied.lock().unwrap().iter().map(|&c| c != 0).collect();
+        let snapshot = shadow.before.lock().unwrap().clone();
+        drop(shadow);
+        // SAFETY: our allocation, no copy of it left.
+        unsafe { VirtualFree(title as *mut _, 0, MEM_RELEASE) };
+        let reference = snapshot.unwrap_or_else(|| data.clone());
+        Some(Left { data, reference, up, taken, settle })
+    }
+
+    /// Merged side by side, the copy, its reference, what goes up and the
+    /// pages noted taken are what the merge page after page leaves.
+    #[test]
+    fn pages_merged_side_by_side_are_merged_as_one_after_the_other() {
+        for card in [true, false] {
+            let Some(one) = merged(card, false, 4096) else {
+                return;
+            };
+            let wide = merged(card, true, 4096).expect("made once");
+            assert!(!one.settle, "nothing to settle (card {card})");
+            assert!(one.data != (0..LEN).map(|i| (i * 31 + 7) as u8).collect::<Vec<u8>>(), "something merged (card {card})");
+            assert!(one.taken[2..20].iter().all(|&t| t) && !one.taken[22], "whole pages taken, the part page not (card {card})");
+            assert!(one == wide, "side by side differs from one after the other (card {card})");
+        }
+    }
+
+    /// Too few changed runs left for the copy in the card's memory: both
+    /// ways say to settle the flights.
+    #[test]
+    fn too_few_runs_settle_side_by_side_too() {
+        let Some(one) = merged(true, false, 5) else {
+            return;
+        };
+        let wide = merged(true, true, 5).expect("made once");
+        assert!(one.settle && wide.settle);
+    }
 }
 
 /// Whether a refresh of a copy in the card's memory stores and sends on
@@ -3730,91 +3956,151 @@ impl Shadow {
     /// [`Shadow::merge_under_writes`] for the ranges `busy` (cut to the
     /// copy), with `title` a page to read title memory into.
     fn merge_pages(&self, busy: Vec<(usize, usize)>, base: usize, title: &mut [u8], runs_left: &mut usize) -> bool {
-        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let mut take = |runs: usize| {
+            let enough = runs <= *runs_left;
+            if enough {
+                *runs_left -= runs;
+            }
+            enough
+        };
         for (a, e) in busy {
-            // As the refresh itself asks (`update_free`): the journal if
-            // the submission's asking covered the range, else the kernel,
-            // else the guards. The journal alone said nothing for copies
-            // of view memory, which is guarded and not write-watched, and
-            // those were all of run 99's cases: the flights were settled
-            // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            let Some((now, stale)) = self.stale_under(a, e, base) else {
                 return true;
             };
-            let stale: Vec<usize> = {
-                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
-            };
             for page in stale {
-                let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
-                if lo >= hi {
-                    continue;
-                }
-                let n = hi - lo;
-                let title = &mut title[..n];
-                // The lock of the copy's reference (the snapshot, or the
-                // CPU's side of a copy in the card's memory), from before
-                // title memory is read until the title's bytes are in: with
-                // the copy-back on its own thread ([`relay`]) that thread
-                // puts what the card wrote into title memory and into the
-                // reference under the same lock, and a page read before
-                // such a merge and compared after it would take the card's
-                // bytes for the title's. (A copy in the card's memory: the
-                // lock of the page's block, `Card::sides`.)
-                let side = self.card.as_ref().map(|card| card.side(lo, hi));
-                let mut before = side.is_none().then(|| self.before.lock().unwrap_or_else(|e| e.into_inner()));
-                // A page that is not there is left as it is, and looked at
-                // again next time.
-                if !crate::host::read_into(lo as *const u8, title) {
-                    continue;
-                }
-                MERGED[0].fetch_add(1, Ordering::Relaxed);
-                let at = lo - start;
-                if self.card.is_some() {
-                    // SAFETY: inside the mapping of the copy's CPU side,
-                    // which only the submitting thread writes.
-                    let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = joined_over(changed_runs(title, held), merge_gap());
-                    if runs.len() > *runs_left {
-                        return true;
-                    }
-                    *runs_left -= runs.len();
-                    for (r, m) in runs {
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
-                    }
-                } else {
-                    let Some(snapshot) = before.as_mut().and_then(|b| b.as_mut()) else {
-                        return true;
-                    };
-                    // SAFETY: the snapshot's allocation holds the copy's
-                    // bytes at the copy's offsets (`writing`), and these
-                    // are in a declared range.
-                    let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-                    for (r, m) in changed_runs(title, held) {
-                        // SAFETY: inside the copy's mapping. The card may be
-                        // writing the copy beside these bytes; they are
-                        // written here and nothing around them.
-                        unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
-                        held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
-                    }
-                }
-                drop(before);
-                drop(side);
-                // Taken, if the range holds all of the page that is in the
-                // copy; else the rest of it is the refresh's, which notes
-                // only whole pages, and the page is looked at again.
-                if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
-                    let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(at) = copied.get_mut(page - base) {
-                        *at = now;
-                    }
+                if !self.merge_page(page, (a, e), now, title, &mut take) {
+                    return true;
                 }
             }
+        }
+        false
+    }
+
+    /// Of `[a, e)`, a range shaders may be writing (cut to the copy, whose
+    /// first page is `base`): the asking that answers for it and the pages
+    /// the title wrote since the copy took them; `None` if nothing can say.
+    fn stale_under(&self, a: usize, e: usize, base: usize) -> Option<(u64, Vec<usize>)> {
+        // As the refresh itself asks (`update_free`): the journal if
+        // the submission's asking covered the range, else the kernel,
+        // else the guards. The journal alone said nothing for copies
+        // of view memory, which is guarded and not write-watched, and
+        // those were all of run 99's cases: the flights were settled
+        // 4-5 times a frame for "0 pages looked at".
+        let (now, written) = crate::watch::writes(a, e, true)?;
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        Some((now, stale_pages_in(base, &copied, a, e, &written)))
+    }
+
+    /// One page of [`Shadow::merge_pages`]: `page` of the range `[a, e)`,
+    /// stale as the asking `now` says, with `title` a page of scratch
+    /// memory; `take` takes the changed runs a copy in the card's memory
+    /// would send up from those left (false: too few left). False if the
+    /// caller must settle the flights (then nothing of the page was done).
+    fn merge_page(&self, page: usize, (a, e): (usize, usize), now: u64, title: &mut [u8], take: &mut dyn FnMut(usize) -> bool) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (lo, hi) = ((page * PAGE).max(a), ((page + 1) * PAGE).min(e));
+        if lo >= hi {
+            return true;
+        }
+        let n = hi - lo;
+        let title = &mut title[..n];
+        // The lock of the copy's reference (the snapshot, or the
+        // CPU's side of a copy in the card's memory), from before
+        // title memory is read until the title's bytes are in: with
+        // the copy-back on its own thread ([`relay`]) that thread
+        // puts what the card wrote into title memory and into the
+        // reference under the same lock, and a page read before
+        // such a merge and compared after it would take the card's
+        // bytes for the title's. (A copy in the card's memory: the
+        // lock of the page's block, `Card::sides`.)
+        let side = self.card.as_ref().map(|card| card.side(lo, hi));
+        let mut before = side.is_none().then(|| self.before.lock().unwrap_or_else(|e| e.into_inner()));
+        // A page that is not there is left as it is, and looked at
+        // again next time.
+        if !crate::host::read_into(lo as *const u8, title) {
+            return true;
+        }
+        MERGED[0].fetch_add(1, Ordering::Relaxed);
+        let at = lo - start;
+        if self.card.is_some() {
+            // SAFETY: inside the mapping of the copy's CPU side, which
+            // only the submission being prepared writes, here a page
+            // (one block of title memory) under that block's lock.
+            let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+            let runs = joined_over(changed_runs(title, held), merge_gap());
+            if !take(runs.len()) {
+                return false;
+            }
+            for (r, m) in runs {
+                held[r..r + m].copy_from_slice(&title[r..r + m]);
+                self.card_changed(at + r, at + r + m);
+                MERGED[1].fetch_add(1, Ordering::Relaxed);
+                MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+            }
+        } else {
+            let Some(snapshot) = before.as_mut().and_then(|b| b.as_mut()) else {
+                return false;
+            };
+            // SAFETY: the snapshot's allocation holds the copy's
+            // bytes at the copy's offsets (`writing`), and these
+            // are in a declared range.
+            let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
+            for (r, m) in changed_runs(title, held) {
+                // SAFETY: inside the copy's mapping. The card may be
+                // writing the copy beside these bytes; they are
+                // written here and nothing around them.
+                unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
+                held[r..r + m].copy_from_slice(&title[r..r + m]);
+                MERGED[1].fetch_add(1, Ordering::Relaxed);
+                MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+            }
+        }
+        drop(before);
+        drop(side);
+        // Taken, if the range holds all of the page that is in the
+        // copy; else the rest of it is the refresh's, which notes
+        // only whole pages, and the page is looked at again.
+        if (page * PAGE).max(start) >= a && ((page + 1) * PAGE).min(end) <= e {
+            let base = start / PAGE;
+            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(at) = copied.get_mut(page - base) {
+                *at = now;
+            }
+        }
+        true
+    }
+
+    /// The pages [`Shadow::merge_under_writes`] would merge, found as it
+    /// finds them (the ranges shaders may be writing, their askings, the
+    /// pages stale under them) and added to `pages`, its merging left to
+    /// [`merge_all_under_writes`]. True if the caller must settle the
+    /// flights as it says (nothing to merge then).
+    fn merge_plan(self: &Arc<Self>, address: usize, len: usize, pages: &mut Vec<MergePage>) -> bool {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return false;
+        }
+        let busy: Vec<(usize, usize)> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|&&(a, e)| a < to && e > from)
+            .map(|&(a, e)| (a.max(from), e.min(to)))
+            .collect();
+        if busy.is_empty() {
+            return false;
+        }
+        if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            return true;
+        }
+        let base = start / PAGE;
+        for (a, e) in busy {
+            let Some((now, stale)) = self.stale_under(a, e, base) else {
+                return true;
+            };
+            pages.extend(stale.into_iter().map(|page| MergePage { shadow: self.clone(), page, range: (a, e), now }));
         }
         false
     }

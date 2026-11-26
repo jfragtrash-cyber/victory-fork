@@ -605,3 +605,10 @@ already reach.
   BE and BF ended by themselves after 330-350 s with nothing in the log:
   the window was likely closed or held from outside; `victory_hle=info`
   in `VICTORY_LOG` says so next time.
+- 2026-11-26, morning. Run BG (`VICTORY_HASH_WIDE=alt`, captured; the
+  character walked by hand, 4,300-6,000 draws, 115-130 ms a frame): per
+  1,000 draws the frame is the same with and without (24.61 against
+  24.57 ms), the submitting thread slower with (16.45 against 15.23): the
+  pieces take the kept threads, whose spread copies the submitting thread
+  waits for. `VICTORY_HASH_WIDE` is off by default from here (`1` on).
+  BG ran to its timeout: BE and BF were ended from outside.

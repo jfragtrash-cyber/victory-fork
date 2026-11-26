@@ -1952,16 +1952,18 @@ pub(crate) fn copy_spread(copies: &[(usize, usize, usize)], per: usize) {
 const HASH_PIECE: usize = 256 << 10;
 
 /// Whether [`hash_wide`] hashes by pieces on the kept threads
-/// (`VICTORY_HASH_WIDE`; on by default, `0` hashes on the caller alone;
-/// `alt`: twenty seconds with, twenty without, in turn, each change said in
-/// the log). Either way a texture's hash is of one function while it lasts:
-/// with `alt` a texture hashed by the other is read again once.
+/// (`VICTORY_HASH_WIDE=1`; off by default: run BG measured no gain, the
+/// submitting thread a little slower with it, its pieces standing in line
+/// with the spread copies it waits for; `alt`: twenty seconds with, twenty
+/// without, in turn, each change said in the log). Either way a texture's
+/// hash is of one function while it lasts: with `alt` a texture hashed by
+/// the other is read again once.
 fn hash_wide_on() -> bool {
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     match *MODE.get_or_init(|| match std::env::var("VICTORY_HASH_WIDE").as_deref() {
-        Ok("0") => 0,
+        Ok("1") => 1,
         Ok("alt") => 2,
-        _ => 1,
+        _ => 0,
     }) {
         0 => false,
         1 => true,
@@ -2048,6 +2050,11 @@ pub(crate) fn hash_wide(bytes: &[u8]) -> blake3::Hash {
     if bytes.len() < 2 * HASH_PIECE || !hash_wide_on() {
         return blake3::hash(bytes);
     }
+    hash_by_pieces(bytes)
+}
+
+/// [`hash_wide`]'s hash past two pieces.
+fn hash_by_pieces(bytes: &[u8]) -> blake3::Hash {
     let (at, len) = (bytes.as_ptr() as usize, bytes.len());
     let hashes = spread_own(len.div_ceil(HASH_PIECE), &|i| {
         let from = i * HASH_PIECE;
@@ -2324,25 +2331,25 @@ mod wide_tests {
         }
     }
 
-    /// The wide hash is the same for the same bytes and differs when one
-    /// byte differs, in any piece, or the length does; under two pieces it
-    /// is blake3's.
+    /// The hash by pieces is the same for the same bytes and differs when
+    /// one byte differs, in any piece, or the length does; under two pieces
+    /// the wide hash is blake3's.
     #[test]
     fn wide_hashes_follow_every_byte() {
-        use super::{HASH_PIECE, hash_wide};
+        use super::{HASH_PIECE, hash_by_pieces, hash_wide};
         let small: Vec<u8> = (0..HASH_PIECE + 7).map(|i| (i * 7) as u8).collect();
         assert_eq!(hash_wide(&small), blake3::hash(&small));
         let len = 5 * HASH_PIECE + 999;
         let mut bytes: Vec<u8> = (0..len).map(|i| (i * 31 + i / 977) as u8).collect();
-        let first = hash_wide(&bytes);
-        assert_eq!(hash_wide(&bytes.clone()), first);
+        let first = hash_by_pieces(&bytes);
+        assert_eq!(hash_by_pieces(&bytes.clone()), first);
         for at in [0, HASH_PIECE - 1, HASH_PIECE, 3 * HASH_PIECE + 5, len - 1] {
             bytes[at] ^= 1;
-            assert_ne!(hash_wide(&bytes), first, "byte {at}");
+            assert_ne!(hash_by_pieces(&bytes), first, "byte {at}");
             bytes[at] ^= 1;
         }
-        assert_eq!(hash_wide(&bytes), first);
-        assert_ne!(hash_wide(&bytes[..len - 1]), first);
+        assert_eq!(hash_by_pieces(&bytes), first);
+        assert_ne!(hash_by_pieces(&bytes[..len - 1]), first);
     }
 
     /// Copies cut into jobs copy every byte once: long ones, short ones

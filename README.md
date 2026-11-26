@@ -45,6 +45,40 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Frame rate in the world | 8 to 10 fps in the first rooms: 97 to 104 ms a frame at about 3,850 draws, 122 ms in a heavier view (6,774 draws). 5 to 8.5 fps through the opening cutscene, by stretch (runs 271 to 273, with `VICTORY_CARD_WINDOWS_MB`). All measured with the switch set of run 253, which is off by default: `VICTORY_LEVELS_ON_DEMAND=1 VICTORY_ASYNC_SUBMIT=1 VICTORY_QUEUE2=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_TEXTURE_NO_WAIT=1 VICTORY_MERGE_GAP=64 VICTORY_MERGE_RUNS=4096 VICTORY_STAGING_POOL=0 VICTORY_COPY_PLAIN=1 VICTORY_JOIN_PARTS=1 VICTORY_BACK_OWN_VIEW=1 VICTORY_INDIRECT_GATHER=1 VICTORY_CARD_REHASH_RUNS=1`. The plain defaults were last measured at 420 to 450 ms a frame and not since. It started at 3 to 6 seconds a frame |
 | Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
 
+### Newest (2026-11-26, morning)
+
+**Play at 86-95 ms a frame (about 11 fps) in the cell view with the best
+switch set (run BA), from 100-110 ms at the start of the night (runs AJ,
+AL); cutscene frames of a second or more halved (15-19 a run against 30-31,
+the worst 1.5 s against 3-4 s).** Pictures right. RTX 3090 / Ryzen 9 5950X.
+What the night found and changed (MOONSHOT.md has every run, AK to BB):
+- **What bounds the frame is how fast the submitting thread prepares**
+  (copies of title memory, the guards and write-watch askings, the merges
+  under shader writes): not the card, not the landing of shaders' writes.
+  Cutting 11 ms of card time a frame (run AR) or setting the title's fences
+  before the card and the landing (run AX) left the frame where it was.
+  A new diagnostic times a fence's way (`pace` line): ~84 ms from the
+  title's Signal = ~45 to the line + ~28 the card + ~12 landing (run BA).
+- The guards' block sets are bit sets, the journal answers only pages
+  written after a copy's oldest page, a check lets the guards' lock go
+  around `VirtualProtect` (`VICTORY_GUARD_UNLOCKED`, on), and the merge's
+  pages allocate nothing: the submitting thread's own work ~53 -> ~48 ms
+  a frame (profile, in play), its ~6 ms of waits in the heap gone.
+- The title's page-mapping copies run behind their queue's line
+  (`VICTORY_ASYNC_PAGE_MAPPINGS`, now on with `VICTORY_ASYNC_SUBMIT=1`).
+- Card copies hashed a group a piece (`VICTORY_CARD_HASH_WIDE=1`, best
+  set): our own card lists 18 -> 5 ms a frame.
+- Translator (static review of the 50 heaviest programs: lean code, no
+  local memory): min/max against a constant without the zero test (on);
+  behind switches, off: legacy multiply forms, one-wave compute groups run
+  k to a host group (`VICTORY_GROUP_MERGE`, not cleared yet), wave64
+  exchanges batched. Each switch set needs its own cache warm.
+- Tried and left off: in-place copy-back writes (no change: most go through
+  the own view), mimalloc (worse), presents three ahead (worse), barrier
+  groups filtered by their accesses (`VICTORY_BARRIER_PRECISE`, within the
+  noise), early fences (`VICTORY_EARLY_FENCES`, measuring only: the title
+  crashes on results not landed).
+
 ### Newest (2026-11-26, night)
 
 **Play at 100-114 ms a frame (about 9-10 fps) in the cell view with run

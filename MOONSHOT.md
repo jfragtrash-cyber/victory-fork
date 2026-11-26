@@ -557,3 +557,19 @@ already reach.
   52 ms against 60. The merge's pages no longer allocate (a vector of runs
   reused per thread, one block's lock without a vector): run AY had ~11 ms
   a frame of the submitting thread in the heap for them.
+- 2026-11-26, morning. Run BA (all of the night's changes, best set, no
+  capture, profiled): play at 86-95 ms a frame at the end of the run (about
+  11 fps), usual frames 93 ms at 4,262 draws (AL 96 at 4,236, AU 100 at
+  4,106); the fence's way 84 ms = 45 to the line + 28 the card + 12 landing
+  (AU 109 = 55 + 44 + 10); the submitting thread's own work 47.8 ms a frame
+  (AY 52.7), its heap waits gone, 16 ms a frame idle waiting for the title.
+  World frames of a second or more: 19. `VICTORY_GUARD_UNLOCKED` is on by
+  default from here. Run BB (the same, captured, final build): pictures
+  right; usual frames 76.9 ms (AW 83.8), the fence's way 71 ms = 33 + 28 +
+  12. What is left on the submitting thread (BA, ms a frame): the copies'
+  flush 14 (write-watch and guard askings 9.3, of which `VirtualProtect`
+  3.8 and `GetWriteWatch` 4.4), fills of upload memory 6.3, the wide
+  copies 5-6, askings ahead 4.1, merges under shader writes 3.9. The card
+  is ~75 % busy (title lists 47-66 ms a frame): it becomes the limit again
+  once the preparing is ~20 ms shorter, and then the translator's switches
+  (`VICTORY_GROUP_MERGE`, once a same-scene run clears it) are next.

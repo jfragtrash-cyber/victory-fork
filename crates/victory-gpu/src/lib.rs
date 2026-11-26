@@ -12,13 +12,16 @@
 //! descriptor heaps, [`root`] root signatures, [`query`] query heaps,
 //! [`signature`] command signatures, [`pipeline`] pipeline states,
 //! [`frame`] frame pacing, [`object`] what all console graphics objects
-//! share, [`console`] which console model the title sees. Planned:
+//! share, [`console`] which console model the title sees, `external` host
+//! libraries recording into title lists. Planned:
 //! `present` (swap chain).
 
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
 mod cardmeter;
+#[cfg(windows)]
+mod compose;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod renderdoc;
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -37,6 +40,8 @@ mod spread;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+pub mod external;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]

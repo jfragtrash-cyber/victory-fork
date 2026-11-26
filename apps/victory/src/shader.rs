@@ -44,9 +44,17 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
     }
     let raw = memchr::memmem::find_iter(data, b"DXBC")
         .filter(|&offset| Container::parse(&data[offset..]).is_ok())
-        .map(|offset| Source::Raw {
-            offset,
-            data: &data[offset..],
+        .map(|offset| {
+            // The container's own bytes (its header gives their count), as
+            // a run hashes and caches them: with the rest of the file their
+            // hash was no run's (the upscaler DLL's 20 programs, which the
+            // run's log names, were not found by it) and `--warm` missed them.
+            let size = &data[offset + 0x18..offset + 0x1C];
+            let size = u32::from_le_bytes(size.try_into().expect("4 bytes")) as usize;
+            Source::Raw {
+                offset,
+                data: &data[offset..offset + size],
+            }
         });
     out.extend(raw);
     out
@@ -106,7 +114,8 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                 let program = dxil.and_then(|p| DxilProgram::parse(p.data).ok());
                 let mut listing = Vec::new();
                 // Independent of the bitcode: titles may strip it.
-                let native = match dxil.map(|p| native_programs(p.data)) {
+                let code = dxil.or(container.part(FourCC::ACCC));
+                let native = match code.map(|p| native_programs(p.data)) {
                     Some(Ok(programs)) if !programs.is_empty() => {
                         t.with_native += 1;
                         let mut list = Vec::new();

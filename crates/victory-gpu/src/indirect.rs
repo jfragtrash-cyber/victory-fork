@@ -689,6 +689,94 @@ pub(crate) fn record_gathers(l: &ID3D12GraphicsCommandList, sets: &[GatherSet], 
     all
 }
 
+/// The pass that gathers a submission's constants on the card
+/// (`crate::host`'s `gather_fills`): one group of 64 threads per entry of
+/// the table, an entry being the constants' offset in the host copy, their
+/// slot's offset in the list's slots, their bytes, and a word unused. Each
+/// thread moves sixteen bytes at a time; the last word is moved whole (a
+/// slot is a multiple of 256 bytes, and the caller keeps the word inside
+/// the copy's buffer).
+const CONSTANTS_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), SRV(t0), SRV(t1), UAV(u0)"
+cbuffer Gather : register(b0) {
+    uint entries;
+};
+ByteAddressBuffer source : register(t0);
+ByteAddressBuffer table : register(t1);
+RWByteAddressBuffer slots : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 group : SV_GroupID, uint3 thread : SV_GroupThreadID) {
+    if (group.x >= entries) {
+        return;
+    }
+    uint3 entry = table.Load3(16 * group.x);
+    uint words = (entry.z + 3) / 4;
+    for (uint w = 4 * thread.x; w < words; w += 256) {
+        if (w + 4 <= words) {
+            slots.Store4(entry.y + 4 * w, source.Load4(entry.x + 4 * w));
+        } else {
+            for (uint k = w; k < words; k++) {
+                slots.Store(entry.y + 4 * k, source.Load(entry.x + 4 * k));
+            }
+        }
+    }
+}
+"#;
+
+/// The most entries of one table of [`record_constants`]: a group each.
+pub(crate) const CONSTANTS_MOST: u32 = 1024;
+
+fn constants_pass() -> Option<&'static Clamp> {
+    static PASS: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    PASS.get_or_init(|| {
+        let device = &host()?.device;
+        match make_from(device, CONSTANTS_SOURCE) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(error = %e, "no pass to gather constants on the card: the CPU fills them (VICTORY_GATHER_FILLS)");
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// Whether the gather of constants can be recorded (its pass compiled).
+pub(crate) fn constants_ready() -> bool {
+    constants_pass().is_some()
+}
+
+/// Records into `l` the gather of the first `entries` entries of the table
+/// at `table_gpu` from the host copy whose buffer begins at `source_gpu`
+/// into the slots at `slots_gpu` ([`CONSTANTS_SOURCE`]); the caller has the
+/// slots writable and the barriers around. False, with nothing recorded,
+/// without the pass or with arguments it cannot take.
+pub(crate) fn record_constants(l: &ID3D12GraphicsCommandList, source_gpu: u64, table_gpu: u64, slots_gpu: u64, entries: u32) -> bool {
+    let Some(c) = constants_pass() else {
+        return false;
+    };
+    record_constants_with(c, l, (source_gpu, table_gpu, slots_gpu), entries)
+}
+
+fn record_constants_with(c: &Clamp, l: &ID3D12GraphicsCommandList, (source, table, slots): (u64, u64, u64), entries: u32) -> bool {
+    if entries == 0 || entries > CONSTANTS_MOST || !source.is_multiple_of(4) || !table.is_multiple_of(16) || !slots.is_multiple_of(256) {
+        return false;
+    }
+    // SAFETY: an open list; our root signature and pipeline; the caller's
+    // live buffers at those addresses.
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 1, [entries].as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, source);
+        l.SetComputeRootShaderResourceView(2, table);
+        l.SetComputeRootUnorderedAccessView(3, slots);
+        l.Dispatch(entries, 1, 1);
+    }
+    true
+}
+
 /// Whether every draw served from a window is checked against a fresh
 /// clamp of its record (`VICTORY_INDIRECT_WINDOW_CHECK=1`, with
 /// `VICTORY_INDIRECT_WINDOW=1`; off by default). A window clamps its
@@ -1662,6 +1750,72 @@ void main() {
         // The source is read only.
         // SAFETY: a mapped buffer.
         assert_eq!(unsafe { std::slice::from_raw_parts(src_ptr.cast_const(), total) }, &src[..]);
+    }
+
+    /// Constants gathered on the card land in their slots as the CPU would
+    /// have copied them: sixteen-byte rows, a tail of words, one word, the
+    /// same constants twice, a buffer of 64 KiB, the copy's last bytes. A
+    /// slot's bytes past the constants' last word are left as they were.
+    #[test]
+    fn warp_gathered_constants_land_in_their_slots() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let pass = make_from(&warp.device, CONSTANTS_SOURCE).expect("the constants pass must compile on WARP");
+        let total = 0x3_0000usize;
+        let src: Vec<u8> = (0..total).map(|i| (i * 7 + i / 251) as u8).collect();
+        // (offset in the copy, slot, bytes)
+        let entries: [(u32, u32, u32); 6] = [
+            (0x0010, 0x0000, 0x220),
+            (0x1234, 0x0300, 20),
+            (0x2000, 0x0400, 4),
+            (0x0010, 0x0500, 36),
+            (0x1_0000, 0x0600, 0x1_0000),
+            (0x2_fff0, 0x1_0700, 16),
+        ];
+        let slots = 0x2_0000u64;
+        let (_src_buf, src_ptr, src_gpu) = warp.shared_buffer(total as u64);
+        let (_table_buf, table_ptr, table_gpu) = warp.shared_buffer(16 * entries.len() as u64);
+        let (sentinel_buf, sentinel_ptr, _) = warp.shared_buffer(slots);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(slots);
+        let dst_buf = warp.default_uav(slots);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), src_ptr, total);
+            for (i, (at, slot, bytes)) in entries.into_iter().enumerate() {
+                for (k, word) in [at, slot, bytes, 0].into_iter().enumerate() {
+                    (table_ptr as *mut u32).add(4 * i + k).write_volatile(word);
+                }
+            }
+            std::ptr::write_bytes(sentinel_ptr, 0xEE, slots as usize);
+            std::ptr::write_bytes(readback_ptr, 0, slots as usize);
+        }
+        // SAFETY: an open list; live buffers.
+        let dst_gpu = unsafe {
+            warp.list.CopyBufferRegion(&dst_buf, 0, &sentinel_buf, 0, slots);
+            warp.list.ResourceBarrier(&[transition(&dst_buf, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            dst_buf.GetGPUVirtualAddress()
+        };
+        assert!(record_constants_with(&pass, &warp.list, (src_gpu, table_gpu, dst_gpu), entries.len() as u32));
+        // Arguments the pass cannot take: nothing recorded.
+        assert!(!record_constants_with(&pass, &warp.list, (src_gpu, table_gpu, dst_gpu + 16), 1));
+        assert!(!record_constants_with(&pass, &warp.list, (src_gpu, table_gpu, dst_gpu), 0));
+        assert!(!record_constants_with(&pass, &warp.list, (src_gpu, table_gpu, dst_gpu), CONSTANTS_MOST + 1));
+        // SAFETY: an open list; the slots copied for the check.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(&dst_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            warp.list.CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, slots);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; a mapped buffer.
+        let out = unsafe { std::slice::from_raw_parts(readback_ptr.cast_const(), slots as usize) };
+        for (at, slot, bytes) in entries {
+            let (at, slot, bytes) = (at as usize, slot as usize, bytes as usize);
+            assert_eq!(&out[slot..slot + bytes], &src[at..at + bytes], "the constants at {at:#x} in the slot at {slot:#x}");
+            let end = slot + bytes.next_multiple_of(4);
+            let next = (slot + bytes).next_multiple_of(256);
+            assert!(out[end..next].iter().all(|&b| b == 0xEE), "the rest of the slot at {slot:#x} as it was");
+        }
     }
 
     #[test]

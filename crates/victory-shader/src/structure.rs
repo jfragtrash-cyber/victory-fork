@@ -453,6 +453,13 @@ impl Structured {
         }
         .copied()
     }
+
+    /// What holds in every lane that runs the instruction at `site`: its
+    /// block's reach and, for a vector instruction, its guard.
+    pub(crate) fn running(&self, (b, i): (usize, usize)) -> impl Iterator<Item = (Bool, bool)> {
+        let guard = self.guards.get(b).and_then(|g| g.get(i)).copied().flatten();
+        std::iter::once((self.reach[b], true)).chain(guard.map(|g| (g, true)))
+    }
 }
 
 /// Builds the per-lane form of `program`.
@@ -1191,7 +1198,8 @@ impl<'a> Lanes<'a> {
                         && let Some(k) = self.key(|r| inst.read(r), code)
                     {
                         let phi = self.phis.contains_key(&k.0) || self.phis.contains_key(&k.1);
-                        takes_mask |= self.masks.contains_key(&k) || phi && self.mask(k).1;
+                        takes_mask |= self.masks.contains_key(&k)
+                            || phi && !self.joins_loaded(k) && self.mask(k).1;
                     }
                 }
                 let touches_exec =
@@ -1299,6 +1307,21 @@ impl<'a> Lanes<'a> {
             }
             _ => {}
         }
+    }
+
+    /// Whether a join takes a value loaded from memory on some edge: data
+    /// that the other paths leave a stale lane mask in place of (a register
+    /// reused after a branch), so operations on it are no mask operations.
+    fn joins_loaded(&self, k: Key) -> bool {
+        [k.0, k.1].iter().any(|v| {
+            self.phis.get(v).is_some_and(|&(b, i)| {
+                self.p.blocks[b].phis[i].args.iter().any(|a| {
+                    self.defs.get(a).is_some_and(|&(db, di)| {
+                        matches!(self.p.blocks[db].insts[di].fields, Fields::Smem { .. })
+                    })
+                })
+            })
+        })
     }
 
     /// The per-lane condition under which a block's closing branch is taken.
@@ -1559,6 +1582,41 @@ mod tests {
             Some((Atom::Lane(cmp), Bool::TRUE, Bool::FALSE))
         );
         assert_eq!(guarded(&s), 0, "{:?}", s.guards);
+    }
+
+    #[test]
+    fn data_loaded_where_a_mask_was_is_no_mask() {
+        // s1 holds a mask on one path and a loaded value on the other; the
+        // bit test after the join is data (wave32: `_b32` operations would
+        // otherwise read as mask operations).
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0xBE81_036A, // s_mov_b32 s1, vcc_lo
+                0xBF06_8004, // s_cmp_eq_u32 s4, 0
+                0xBF85_0002, // s_cbranch_scc1 -> join
+                0xF400_0041,
+                0xFA00_0000, // s_load_dword s1, s[2:3], 0
+                0x8702_FF01,
+                0x0010_0000, // join: s_and_b32 s2, s1, 0x100000
+                0xBF06_8002, // s_cmp_eq_u32 s2, 0
+                0xBF85_0001, // s_cbranch_scc1 -> end
+                0x7E06_0280, // v_mov_b32 v3, 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let join = p
+            .blocks
+            .iter()
+            .position(|b| b.insts.iter().any(|i| i.name() == "s_and_b32"))
+            .unwrap();
+        let LaneExit::Branch { when, .. } = s.exits[join] else {
+            panic!("{:?}", s.exits)
+        };
+        let scc = p.blocks[join].insts[1].write(Reg::Scc).unwrap();
+        assert_eq!(s.bools.support(when), vec![Atom::Uniform(scc)]);
     }
 
     #[test]

@@ -24,7 +24,9 @@
 //!   [`HostShader::static_samplers`] (the same decoded into a D3D12 static
 //!   sampler description). Comparison sampling (added 2026-11-23): an
 //!   immediate sampler it uses has a comparison filter there (bit 0x80);
-//!   a heap sampler it uses must be a comparison sampler on the host.
+//!   a heap sampler it uses must be a comparison sampler on the host. One
+//!   of two immediate samplers chosen by uniform control flow takes two
+//!   entries; the sampling runs with both and the result is chosen.
 //! * **Root CBVs and root SRVs** (raw buffers) as root descriptors
 //!   `b<i>` / `t<i>` in [`ROOT_CBV_SPACE`], `i` the title's root parameter
 //!   index ([`HostShader::root_cbvs`], [`HostShader::root_srvs`]); the
@@ -100,6 +102,10 @@ mod threading;
 pub mod validator;
 #[cfg(all(test, windows))]
 mod loop_report_tests;
+#[cfg(all(test, windows))]
+mod stride_tests;
+#[cfg(all(test, windows))]
+mod synthetic_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;
 #[cfg(all(test, windows))]
@@ -368,6 +374,7 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
+        .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
     let native = crate::native_programs(dxil.data)?
         .into_iter()

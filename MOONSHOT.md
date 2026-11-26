@@ -674,3 +674,30 @@ already reach.
   with, 19.44 without: no gain, the switch is off by default (it keeps a
   title write that falls between the merge's read and its store). The
   pictures right.
+- 2026-11-26, afternoon. Series S (`--console series-s`): the render
+  surfaces are smaller, the relay's copy-back 34 MB a frame against 61
+  (run BL: 19.7 ms per 1,000 draws against BJ's 21.9). The title presents
+  two planes there, the interface over the scene: the present draws one
+  over the other (`crate::compose`, after codec-d/cool_fox). The scene
+  plane stayed black (run BM): the title upscales with AMD FidelityFX,
+  whose shaders come in ACCC parts the translator did not read. Upstream
+  0b35b7f merged (FidelityFX on host and console paths): 16 of the 20
+  upscaler shaders translate; the whole pack 26,148 -> 26,177 programs,
+  vertex and pixel DXIL validated 14,100 -> 14,147; the warmed cache 211
+  shaders left untranslated against 285. Run BP (the console upscaler,
+  translated): the picture white (4 of its passes still dropped). Run
+  BP2 (`VICTORY_FIDELITYFX_DIR`: the PC SDK 2.4.0's upscaler, FSR 3.1.6,
+  rendering 1280x720 to 1920x1080): the picture shows, with trails and
+  flicker on moving people; play 102.5 ms a frame at more draws, 19.7 ms
+  per 1,000 draws, the card idle 42 ms a frame.
+- 2026-11-26, afternoon. The tracer knows an access's EXEC guard at a
+  join (VIctory-CGBJ): 4 more shaders translate. Run BN
+  (`VICTORY_FILL_ONCE=alt`: a list's fills of the same constant-buffer
+  bytes made once; 16,000 of 21,000 fills a frame are repeats): the
+  submitting thread -3.9 ms a frame (+-4.6), the frame +2.6 (+-3.8), by a
+  fit on draws and phase; off by default. Run BO
+  (`VICTORY_COPY_STREAM=alt`: refreshes and snapshots stored past the
+  caches): submitting thread +1.4 (+-3.0), frame -0.9 (+-2.6), the copies
+  0.3 ms shorter in all; off by default. Agents' builds during a run
+  starve the texture threads (BN's loading lacked textures): runs now
+  wait for no cargo or rustc.

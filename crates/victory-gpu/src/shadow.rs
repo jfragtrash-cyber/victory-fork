@@ -2058,10 +2058,11 @@ impl Drop for Spreading {
 }
 
 /// Copies a piece of title memory into host copies: (destination, source,
-/// bytes).
+/// bytes). Nothing here reads them before the card does
+/// (`crate::host::copy_mapped_cold`).
 fn copy_piece(piece: &[(usize, usize, usize)]) {
     for &(dst, src, len) in piece {
-        crate::host::copy_mapped(dst as *mut u8, src as *const u8, len, false);
+        crate::host::copy_mapped_cold(dst as *mut u8, src as *const u8, len);
     }
 }
 
@@ -2256,8 +2257,9 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
             jobs.push(Box::new(move || {
                 for (src, dst, len) in group {
                     // SAFETY: the caller's ranges: a host copy's mapping and
-                    // its snapshot, which do not overlap.
-                    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+                    // its snapshot, which do not overlap. The snapshot is read
+                    // when its flight is done, frames later.
+                    unsafe { crate::plaincopy::copy_own_streamed(dst as *mut u8, src as *const u8, len) };
                 }
             }));
         }
@@ -2956,7 +2958,91 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 /// per thread ([`merge_page`](Shadow::merge_page)). A new vector a page,
 /// grown run by run, was ~6 ms a frame of the submitting thread waiting in
 /// the system heap's `realloc` (run AY).
+///
+/// With AVX2, 64 bytes at a time ([`changed_runs_avx2`], the same runs);
+/// else eight ([`changed_runs_words`]).
 fn changed_runs_into(now: &[u8], was: &[u8], runs: &mut Vec<(usize, usize)>) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the processor has AVX2.
+        unsafe { changed_runs_avx2(now, was, runs) };
+        return;
+    }
+    changed_runs_words(now, was, runs);
+}
+
+/// [`changed_runs_into`] with AVX2: of 64 bytes at a time, one bit a byte
+/// that differs (two compares of 32 bytes), and the runs where the bits
+/// turn; the last bytes under 64 one by one.
+///
+/// Eight bytes at a time, with a compare call for every 64 equal bytes, it
+/// was 1.9 ms a frame of the submitting thread and 9.7 of the kept threads
+/// (as sampled) in run BA's gameplay, in the merge of the title's bytes
+/// under ranges shaders write. A 64 KiB page (`changed_runs_speeds`, old
+/// bytes in the caches): as it was 2.9 -> 1.2 us, a few runs 3.3 -> 1.4,
+/// changed throughout 18.7 -> 1.7, a quarter of its bytes here and there
+/// (12,300 runs) 133 -> 43. (Run BL merged ~200 pages a frame with 3-5
+/// runs each: some 0.4 ms a frame less, all threads.)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn changed_runs_avx2(now: &[u8], was: &[u8], runs: &mut Vec<(usize, usize)>) {
+    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+    let n = now.len().min(was.len());
+    runs.clear();
+    // Where the run being walked began.
+    let mut open: Option<usize> = None;
+    let mut i = 0;
+    while i + 64 <= n {
+        // SAFETY: `[i, i + 64)` lies in both slices; the loads take any
+        // alignment.
+        let differ = unsafe {
+            let (a, b) = (now.as_ptr().add(i).cast::<__m256i>(), was.as_ptr().add(i).cast::<__m256i>());
+            let low = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(a), _mm256_loadu_si256(b))) as u32;
+            let high =
+                _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(a.add(1)), _mm256_loadu_si256(b.add(1)))) as u32;
+            !((u64::from(high) << 32) | u64::from(low))
+        };
+        if differ == 0 {
+            if let Some(first) = open.take() {
+                runs.push((first, i - first));
+            }
+        } else if differ == u64::MAX {
+            open.get_or_insert(i);
+        } else {
+            // From bit to bit where the bytes turn: each step lands on a
+            // byte of the other kind, further on, so at most 64 steps.
+            let mut at = 0;
+            loop {
+                let turn = match open {
+                    Some(_) => !differ & (u64::MAX << at),
+                    None => differ & (u64::MAX << at),
+                };
+                if turn == 0 {
+                    break;
+                }
+                at = turn.trailing_zeros();
+                match open.take() {
+                    Some(first) => runs.push((first, i + at as usize - first)),
+                    None => open = Some(i + at as usize),
+                }
+            }
+        }
+        i += 64;
+    }
+    for i in i..n {
+        if now[i] != was[i] {
+            open.get_or_insert(i);
+        } else if let Some(first) = open.take() {
+            runs.push((first, i - first));
+        }
+    }
+    if let Some(first) = open {
+        runs.push((first, n - first));
+    }
+}
+
+/// [`changed_runs_into`] eight bytes at a time.
+fn changed_runs_words(now: &[u8], was: &[u8], runs: &mut Vec<(usize, usize)>) {
     const LOW: u64 = 0x7f7f_7f7f_7f7f_7f7f;
     const HIGH: u64 = !LOW;
     let n = now.len().min(was.len());
@@ -3007,7 +3093,7 @@ fn changed_runs_into(now: &[u8], was: &[u8], runs: &mut Vec<(usize, usize)>) {
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{PIECE, back_piece, changed_chunks, changed_runs, changed_runs_into, join_in_place};
+    use super::{PIECE, back_piece, changed_chunks, changed_runs, changed_runs_into, changed_runs_words, join_in_place};
 
     /// Runs a small gap apart are joined in place, gap included; a reused
     /// vector starts empty.
@@ -3182,10 +3268,130 @@ mod merge_tests {
                 }
             }
             // (A byte may also keep a zero difference inside a stretch.)
-            assert_eq!(changed_runs(&now, &was), by_bytes(&now, &was), "case {case}, {n} bytes");
+            let want = by_bytes(&now, &was);
+            assert_eq!(changed_runs(&now, &was), want, "case {case}, {n} bytes");
+            // Eight bytes at a time too (without AVX2).
+            let mut words = vec![(1, 1)];
+            changed_runs_words(&now, &was, &mut words);
+            assert_eq!(words, want, "case {case}, {n} bytes, by words");
         }
         // Slices of unlike lengths: the shorter one's bytes.
         assert_eq!(changed_runs(&[1, 2, 3, 4, 5, 6, 7, 8, 9], &[1, 2, 0]), vec![(2, 1)]);
+    }
+
+    /// Runs that begin, end or turn on every byte of a 64-byte block and
+    /// beside it, over several blocks and a short end: the same with AVX2
+    /// as eight bytes at a time.
+    #[test]
+    fn runs_found_64_bytes_at_a_time_are_those_found_by_words() {
+        let was: Vec<u8> = (0..1000u32).map(|i| (i * 7 + 1) as u8).collect();
+        for n in [0usize, 63, 64, 65, 127, 128, 129, 200, 1000] {
+            for from in (0..n.min(200)).step_by(3) {
+                for len in [1usize, 2, 31, 32, 33, 63, 64, 65, 130] {
+                    for gap in [0usize, 1, 5, 64] {
+                        let mut now = was[..n].to_vec();
+                        let mut at = from;
+                        // A run, a gap that stays, a run, and the very end.
+                        for _ in 0..2 {
+                            for b in now.iter_mut().skip(at).take(len) {
+                                *b = !*b;
+                            }
+                            at += len + gap.max(1);
+                        }
+                        if n > 0 {
+                            now[n - 1] ^= 0x40;
+                        }
+                        let (mut fast, mut words) = (Vec::new(), Vec::new());
+                        changed_runs_into(&now, &was[..n], &mut fast);
+                        changed_runs_words(&now, &was[..n], &mut words);
+                        assert_eq!(fast, words, "{n} bytes, from {from}, {len} long, gap {gap}");
+                        assert!(n == 0 || fast.last().is_some_and(|&(at, m)| at + m == n), "the last byte's run");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Times the merge's compare of a 64 KiB page, eight bytes at a time
+    /// against 64 with AVX2: a page the title left as it was, one with a
+    /// few runs, one rewritten with a quarter of its bytes changed here and
+    /// there, and one changed throughout; with the old bytes in the caches
+    /// and far outside them.
+    /// `cargo test --profile diag -p victory-gpu --lib changed_runs_speeds -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn changed_runs_speeds() {
+        const PAGE: usize = 64 << 10;
+        const FAR: usize = 4096;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        // 16 pages of old bytes, again and again over 256 MB (outside the
+        // caches), and 16 pages of new bytes for each kind.
+        let was: Vec<u8> =
+            (0..FAR * PAGE).map(|i| ((i % (16 * PAGE)) as u32).wrapping_mul(2_654_435_761).rotate_left(7) as u8).collect();
+        let kinds: [(&str, Box<dyn Fn(&mut [u8], &mut dyn FnMut() -> u64)>); 4] = [
+            ("as it was", Box::new(|_, _| {})),
+            (
+                "a few runs",
+                Box::new(|p, r| {
+                    for _ in 0..8 {
+                        let at = (r() as usize) % (PAGE - 200);
+                        for b in &mut p[at..at + 1 + (r() % 150) as usize] {
+                            *b = !*b;
+                        }
+                    }
+                }),
+            ),
+            (
+                "a quarter here and there",
+                Box::new(|p, r| {
+                    for b in p.iter_mut() {
+                        if r() % 4 == 0 {
+                            *b = !*b;
+                        }
+                    }
+                }),
+            ),
+            ("changed throughout", Box::new(|p, _| p.iter_mut().for_each(|b| *b = !*b))),
+        ];
+        for (name, change) in &kinds {
+            let mut nows = Vec::new();
+            for k in 0..16 {
+                let mut now = was[k * PAGE..(k + 1) * PAGE].to_vec();
+                change(&mut now, &mut next);
+                nows.push(now);
+            }
+            for (way, f) in [
+                ("eight bytes", changed_runs_words as fn(&[u8], &[u8], &mut Vec<(usize, usize)>)),
+                ("64 bytes, AVX2", changed_runs_into),
+            ] {
+                let mut runs = Vec::new();
+                for far in [false, true] {
+                    let rounds = 4096;
+                    let started = std::time::Instant::now();
+                    let mut found = 0;
+                    for r in 0..rounds {
+                        let k = r % 16;
+                        // The page's old bytes, in the caches or far away.
+                        let at = if far { ((r * 37) % (FAR / 16) * 16 + k) * PAGE } else { k * PAGE };
+                        f(&nows[k], &was[at..at + PAGE], &mut runs);
+                        found += runs.len();
+                    }
+                    let us = started.elapsed().as_secs_f64() * 1e6 / rounds as f64;
+                    println!(
+                        "{name:>24}, old bytes {}: {way:>15} {us:7.2} us a page ({:.1} GB/s), {} runs a page",
+                        if far { "far away    " } else { "in the caches" },
+                        PAGE as f64 / us / 1e3,
+                        found / rounds
+                    );
+                }
+            }
+        }
     }
 
     /// The runs hold exactly the bytes that differ: putting them into the
@@ -4703,7 +4909,13 @@ impl Shadow {
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        // A copy that may be spread is read by nothing here before the card
+        // (`crate::host::copy_mapped_cold`); one that may not is read at once.
+        if spread {
+            crate::host::copy_mapped_cold(at, from as *const u8, to - from);
+        } else {
+            crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        }
         self.copied_in(from, to);
         to - from
     }
@@ -4774,6 +4986,11 @@ impl Shadow {
 
     pub(crate) fn carded(&self) -> bool {
         self.card.is_some()
+    }
+
+    /// Whether this is a window of title memory outside buffers.
+    pub(crate) fn is_window(&self) -> bool {
+        self.window
     }
 
     /// The CPU side's bytes at offsets `[from, to)` changed: they go to the
@@ -5269,6 +5486,43 @@ mod found_tests {
         assert!(Arc::ptr_eq(&here, &there));
         unregister(a, start);
     }
+
+    /// `holding` makes nothing: a buffer without a copy is passed over for
+    /// one around it that has one, or none; what it found last is asked
+    /// again only while the buffers stay as they were and the copy lives.
+    #[test]
+    fn holding_finds_only_copies_made_already() {
+        if host().is_none() {
+            return; // no host GPU
+        }
+        // Addresses no title and no other test uses; nothing is read there.
+        let start = 0x7fe5_6780_0000u64;
+        let (a, b) = (0x52_5100usize, 0x52_5200usize);
+        register(a, start, 0x20000);
+        assert!(holding(start + 0x100, 0x40).is_none(), "no copy made yet, and none made by asking");
+        let Some(outer) = find(start + 0x100, 0x40) else {
+            unregister(a, start);
+            return;
+        };
+        let found = holding(start + 0x100, 0x40).expect("the copy find made");
+        assert!(Arc::ptr_eq(&found, &outer));
+        // Past the buffer's end: not held.
+        assert!(holding(start + 0x1_fff0, 0x20).is_none());
+        // A buffer inside without a copy: the one around it still holds.
+        register(b, start + 0x80, 0x1000);
+        assert!(Arc::ptr_eq(&holding(start + 0x100, 0x40).unwrap(), &outer));
+        // Its copy made, and the outer buffer gone: the inner copy.
+        let inner = find(start + 0x100, 0x40).unwrap();
+        assert_eq!(inner.start, start + 0x80);
+        unregister(a, start);
+        assert!(Arc::ptr_eq(&holding(start + 0x100, 0x40).unwrap(), &inner));
+        // On another thread, which remembers nothing of this one's.
+        let there = std::thread::scope(|s| s.spawn(|| holding(start + 0x100, 0x40)).join().unwrap()).unwrap();
+        assert!(Arc::ptr_eq(&there, &inner));
+        unregister(b, start + 0x80);
+        assert!(holding(start + 0x100, 0x40).is_none());
+        drop((outer, found, inner, there));
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -5357,6 +5611,51 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// (a root view: the caller reads on to the copy's end).
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
+}
+
+/// The copy of a title buffer holding `[address, address + len)` that is
+/// made already, the innermost such: nothing is made, windows outside
+/// buffers are not looked at, and title memory in place is not a copy. For
+/// the constants the card gathers from a copy (`crate::host`'s
+/// `gather_fills`); those no copy holds are filled by the CPU, as before.
+///
+/// Each thread remembers the copy it found last while the buffers stay as
+/// they were ([`BUFFERS_CHANGES`]): the title's per-draw constants lie in
+/// one buffer, at new addresses every frame, and ~16,000 asks a frame under
+/// the buffers' lock would stand in line with the recording threads' own
+/// (run P: 16 ms a frame of them in that search).
+pub(crate) fn holding(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    let end = address.checked_add(len.max(1))?;
+    thread_local! {
+        /// The last copy found: its title memory, the count of changes it
+        /// was found at, the copy.
+        static LAST: std::cell::RefCell<Option<(u64, u64, u64, std::sync::Weak<Shadow>)>> = const { std::cell::RefCell::new(None) };
+    }
+    let changes = BUFFERS_CHANGES.load(Ordering::Acquire);
+    let remembered = LAST
+        .try_with(|last| {
+            let last = last.borrow();
+            let (start, stop, at, copy) = last.as_ref()?;
+            (*at == changes && *start <= address && end <= *stop).then(|| copy.upgrade()).flatten()
+        })
+        .ok()
+        .flatten();
+    if remembered.is_some() {
+        return remembered;
+    }
+    let map = buffers();
+    let changes = BUFFERS_CHANGES.load(Ordering::Relaxed);
+    let shadow = map
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .filter(|(_, e)| e.end >= end)
+        .find_map(|(_, e)| e.shadow.clone().filter(|s| s.place.is_none() && !s.window))?;
+    drop(map);
+    let _ = LAST.try_with(|last| {
+        *last.borrow_mut() = Some((shadow.start, shadow.start + shadow.len, changes, Arc::downgrade(&shadow)));
+    });
+    Some(shadow)
 }
 
 /// As [`find`], for an ask that is done with the copy when its list has

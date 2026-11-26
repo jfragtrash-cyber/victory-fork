@@ -64,11 +64,12 @@ pub enum T {
     RemapUs,
     RemapWaitUs,
     /// The title's page-mapping copies (`crate::pagemap`): its calls and
-    /// its time in them, on every thread, and its time waiting for batches
-    /// applied elsewhere (at a present that forced the lines, at a fault,
-    /// before a mapping of its own); the batches a thread of ours applied,
-    /// their pages, its time applying them, and their time from the call
-    /// to the end; batches applied before their line got to them.
+    /// its time in them, on every thread, and its time on batches outside
+    /// them (applying or waiting for them at a present that forced the
+    /// lines, at a fault on a target, before a mapping of its own); the
+    /// batches a thread of ours applied, their pages, its time applying
+    /// them, and their time from the call to the end; pages the title's
+    /// faults and mappings applied before their line got to them.
     PageMapCalls,
     PageMapCallUs,
     PageMapWaitUs,
@@ -426,8 +427,8 @@ fn text(f: &Frame) -> String {
          send-and-hash lists {:.1} ms in {:.0}, our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0} | \
          recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
          still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
-         readers) | page mappings: {:.0} calls, the title {:.1} ms in them and {:.1} ms waiting for batches; {:.0} batches \
-         {:.0} pages applied by our thread in {:.1} ms, {:.1} ms after their call on average, {:.0} ahead of their place \
+         readers) | page mappings: {:.0} calls, the title {:.1} ms in them and {:.1} ms on batches outside them; {:.0} batches \
+         {:.0} pages applied by our thread in {:.1} ms, {:.1} ms after their call on average, {:.0} pages ahead of their place \
          | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
          faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
          draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",

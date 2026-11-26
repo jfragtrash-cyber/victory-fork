@@ -1552,8 +1552,22 @@ impl Drop for Reading {
             let_go(&mut h.reading, range);
         }
         drop(h);
+        READINGS_HERE.set(READINGS_HERE.get() - 1);
         LET_GO.notify_all();
     }
+}
+
+std::thread_local! {
+    /// Readings this thread holds ([`Reading`]): a change of that memory
+    /// waits for this thread, which then must not wait for a change itself
+    /// (`crate::pagemap`'s fault handler asks).
+    static READINGS_HERE: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether this thread holds a reading of title memory in place
+/// ([`title_memory_reading`]).
+pub(crate) fn reading_here() -> bool {
+    READINGS_HERE.get() != 0
 }
 
 /// For reading title memory `[at, at + len)` in place: until what it
@@ -1574,6 +1588,7 @@ pub fn title_memory_reading_all(ranges: &[(usize, usize)]) -> Reading {
         h = LET_GO.wait(h).unwrap_or_else(|e| e.into_inner());
     }
     h.reading.extend_from_slice(&ranges);
+    READINGS_HERE.set(READINGS_HERE.get() + 1);
     Reading(ranges)
 }
 
@@ -1587,6 +1602,7 @@ pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
         return None;
     }
     h.reading.push(range);
+    READINGS_HERE.set(READINGS_HERE.get() + 1);
     Some(Reading(vec![range]))
 }
 

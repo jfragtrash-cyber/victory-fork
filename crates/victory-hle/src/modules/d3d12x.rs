@@ -19,6 +19,19 @@ extern "system" fn create_device(
 ) -> HRESULT {
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
+    // Where the title's code is: an access of its own to a page-mapping
+    // target not mapped yet is helped (`VICTORY_ASYNC_PAGE_MAPPINGS`), one
+    // from our code never.
+    #[cfg(windows)]
+    if let Some(base) = crate::runtime::main_image() {
+        // SAFETY: the mapped image's headers: the PE header's offset, then
+        // its SizeOfImage.
+        let size = unsafe {
+            let nt = base + ((base + 0x3c) as *const u32).read_unaligned() as usize;
+            ((nt + 0x50) as *const u32).read_unaligned() as usize
+        };
+        victory_gpu::title_code(base, size);
+    }
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)

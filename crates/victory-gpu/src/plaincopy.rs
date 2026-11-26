@@ -212,6 +212,13 @@ fn guarded(_: *mut u8, _: *const u8, _: usize) -> bool {
     false
 }
 
+/// [`guarded`], whatever [`on`] says: for tests elsewhere of what faults
+/// in it.
+#[cfg(test)]
+pub(crate) fn guarded_copy(to: *mut u8, from: *const u8, len: usize) -> bool {
+    guarded(to, from, len)
+}
+
 /// With [`on`]: copies title memory at `from` into host memory at `to`;
 /// false if it is off or a source page was not there (the caller then
 /// copies through the kernel, as before). Under [`LEAST`] bytes it is left

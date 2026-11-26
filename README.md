@@ -675,6 +675,12 @@ and point `VICTORY_FIDELITYFX_DIR` (or `[paths].fidelityfx_dir`) at its
 `Kits/FidelityFX/signedbin` folder, which holds
 `amd_fidelityfx_upscaler_dx12.dll`. Without it, or if that DLL offers no
 upscaler for your GPU (the log says so), the title's own DLLs run.
+`VICTORY_FFX_TRACE=1` logs the title's upscaling once a second (jitter,
+motion-vector scale, sizes, frame time, reset, camera, its textures); in
+diagnostics builds it also saves the upscaler's inputs and output as PNGs
+for the frames `VICTORY_CAPTURE_FRAMES` names. `VICTORY_FFX_PREPARE=0`
+hands the upscaler the textures without making them ready as a title
+shader's read would (as before).
 
 The window caption shows the framerate. Saves, settings and `crashes.log`
 are kept under the data folder (default `%LOCALAPPDATA%\victory\data`), derived

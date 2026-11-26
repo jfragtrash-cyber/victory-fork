@@ -84,21 +84,47 @@ struct Resource {
 }
 
 /// One upscaling: the command list, then colour, depth, motion vectors,
-/// exposure, reactive mask, transparency mask and output; then jitter,
-/// motion-vector scale, sizes, sharpening, frame time, pre-exposure, reset,
-/// camera and flags, which pass through.
+/// exposure, reactive mask, transparency mask and output ([`RESOURCES`]);
+/// then what passes through: jitter (pixels), motion-vector scale, render
+/// and output sizes, sharpening, frame time (milliseconds), pre-exposure,
+/// reset, camera (near, far, vertical field of view in radians, view units
+/// per metre) and flags. A C `bool` takes four bytes here with its
+/// padding: only the low byte counts.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct DispatchUpscale {
     header: Header,
     list: *mut c_void,
     resources: [Resource; 7],
-    rest: [u32; 18],
+    jitter: [f32; 2],
+    mv_scale: [f32; 2],
+    render: [u32; 2],
+    upscale: [u32; 2],
+    sharpen: u32,
+    sharpness: f32,
+    frame_time: f32,
+    pre_exposure: f32,
+    reset: u32,
+    camera: [f32; 4],
+    flags: u32,
 }
+
+/// The resources of a [`DispatchUpscale`], in order.
+const RESOURCES: [&str; 7] = [
+    "colour",
+    "depth",
+    "motion",
+    "exposure",
+    "reactive",
+    "transparency",
+    "output",
+];
 
 const _: () = assert!(size_of::<CreateUpscale>() == 0x30);
 const _: () = assert!(size_of::<Resource>() == 0x30);
 const _: () = assert!(size_of::<DispatchUpscale>() == 0x1b0);
+const _: () = assert!(std::mem::offset_of!(DispatchUpscale, jitter) == 0x168);
+const _: () = assert!(std::mem::offset_of!(DispatchUpscale, flags) == 0x1ac);
 
 /// The versions a backend offers: count in and out, ids, names.
 #[repr(C)]
@@ -401,20 +427,26 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     }
     // SAFETY: an upscaling, by its type.
     let mut dispatch = unsafe { desc.cast::<DispatchUpscale>().read() };
+    // As the title gave it: its own resources.
+    let title = dispatch;
     let list = dispatch.list.cast::<Object>().cast_const();
     // Alive for the call (the list holds them too).
     let mut textures = Vec::new();
-    for r in dispatch
+    // The title's resources and the host states their copies are in.
+    #[cfg(feature = "diagnostics")]
+    let mut states = [0u32; 7];
+    for (i, r) in dispatch
         .resources
         .iter_mut()
-        .filter(|r| !r.resource.is_null())
+        .enumerate()
+        .filter(|(_, r)| !r.resource.is_null())
     {
         let wanted = host_state(r.state);
         let texture = wanted.and_then(|w| {
             victory_gpu::external::host_texture(list, r.resource.cast::<Object>(), w)
                 .filter(|&(_, state)| state == w)
         });
-        let Some((texture, _)) = texture else {
+        let Some((texture, state)) = texture else {
             once!(
                 warn,
                 state = r.state,
@@ -422,6 +454,12 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
             );
             return PARAMETER;
         };
+        #[cfg(feature = "diagnostics")]
+        {
+            states[i] = state;
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = (i, state);
         r.resource = texture.as_raw();
         textures.push(texture);
     }
@@ -429,12 +467,163 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
         // SAFETY: a live texture.
         unsafe { t.GetDesc() }.Format.0
     }).collect::<Vec<_>>(), "FidelityFX: first upscaling, host formats of its textures");
-    victory_gpu::external::record(list, |host_list| {
+    #[cfg(feature = "diagnostics")]
+    let dumped = diagnose_before(list, &title, &states);
+    let code = victory_gpu::external::record(list, |host_list| {
         dispatch.list = host_list.as_raw();
         // SAFETY: the PC dispatch on host objects; the context is the host's.
         unsafe { (host.dispatch)(context, &raw mut dispatch.header) }
     })
-    .unwrap_or(PARAMETER)
+    .unwrap_or(PARAMETER);
+    // What the upscaler wrote, as the title's next pass finds it.
+    #[cfg(feature = "diagnostics")]
+    if let Some(frame) = dumped
+        && !title.resources[6].resource.is_null()
+    {
+        victory_gpu::external::snapshot(list, title.resources[6].resource.cast::<Object>(), states[6], frame, "ffx-output");
+    }
+    if code != OK {
+        once!(
+            warn,
+            code,
+            "FidelityFX: the host upscaler refused an upscaling (counted in VICTORY_FFX_TRACE lines)"
+        );
+    }
+    if trace_on() {
+        trace(&title, code);
+    }
+    code
+}
+
+/// `VICTORY_FFX_TRACE=1`: once a second, a line with the fields of the
+/// title's last upscaling (jitter, motion-vector scale, sizes, frame time,
+/// pre-exposure, reset, camera, flags, its resources as the host has them)
+/// and counts over the second (upscalings, those the host refused, resets,
+/// the lowest and highest frame time). In diagnostics builds, also every
+/// upscaling a line in the ops file of a frame the capture lists
+/// (`VICTORY_CAPTURE_FRAMES`, a `now` file), and that frame's first one
+/// saves its inputs and output as PNGs (see [`diagnose_before`]).
+fn trace_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FFX_TRACE").is_some_and(|v| v != "0"))
+}
+
+/// Counts of the second [`trace`] reports on.
+struct Window {
+    start: std::time::Instant,
+    dispatches: u32,
+    refused: u32,
+    resets: u32,
+    frame_time: [f32; 2],
+}
+
+static WINDOW: std::sync::Mutex<Option<Window>> = std::sync::Mutex::new(None);
+
+/// Counts upscaling `d` (the title's), which returned `code`, and logs the
+/// line of [`trace_on`] once a second.
+fn trace(d: &DispatchUpscale, code: u32) {
+    let mut window = WINDOW.lock().unwrap_or_else(|e| e.into_inner());
+    let w = window.get_or_insert_with(|| Window {
+        start: std::time::Instant::now(),
+        dispatches: 0,
+        refused: 0,
+        resets: 0,
+        frame_time: [f32::MAX, f32::MIN],
+    });
+    w.dispatches += 1;
+    w.refused += u32::from(code != OK);
+    w.resets += u32::from(d.reset & 0xff != 0);
+    w.frame_time = [w.frame_time[0].min(d.frame_time), w.frame_time[1].max(d.frame_time)];
+    if w.start.elapsed() < std::time::Duration::from_secs(1) {
+        return;
+    }
+    let Some(Window { dispatches, refused, resets, frame_time, .. }) = window.take() else {
+        return;
+    };
+    drop(window);
+    tracing::info!(
+        dispatches,
+        refused,
+        last_code = code,
+        resets,
+        frame_time_ms = ?frame_time,
+        jitter = ?d.jitter,
+        mv_scale = ?d.mv_scale,
+        render = ?d.render,
+        upscale = ?d.upscale,
+        sharpen = d.sharpen & 0xff != 0,
+        sharpness = d.sharpness,
+        pre_exposure = d.pre_exposure,
+        reset = d.reset & 0xff != 0,
+        near = d.camera[0],
+        far = d.camera[1],
+        fov = d.camera[2],
+        meters = d.camera[3],
+        flags = format_args!("{:#x}", d.flags),
+        stale_depth_planes = victory_gpu::external::stale_planes(),
+        resources = %describe(d),
+        "FidelityFX: upscalings over the last second, the last one's fields (VICTORY_FFX_TRACE)"
+    );
+}
+
+/// The present resources of upscaling `d` (the title's): each one's name,
+/// state, the description the title gives (type, format, width, height,
+/// depth, levels, flags, usage) and what its host copy is
+/// (`victory_gpu::external::describe`).
+fn describe(d: &DispatchUpscale) -> String {
+    RESOURCES
+        .iter()
+        .zip(&d.resources)
+        .filter(|(_, r)| !r.resource.is_null())
+        .map(|(name, r)| {
+            format!(
+                "{name}: state {:#x} desc {:?} host {}",
+                r.state,
+                r.description,
+                victory_gpu::external::describe(r.resource.cast::<Object>())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Diagnostics, before upscaling `d` (the title's) is recorded into `list`,
+/// with its resources' host copies in host states `states`: with
+/// [`trace_on`], a line in the ops file of a listed frame (where it stands
+/// among the passes that write its inputs), and for the first upscaling of
+/// a listed frame copies of its inputs, saved two presents later in the
+/// capture folder as `frame-<n>-ffx-<input>-<resource>-...png` (depth as
+/// grey and its stencil plane, motion vectors as colour around mid grey;
+/// see `victory_gpu::external::snapshot`). The frame, if it saves.
+#[cfg(feature = "diagnostics")]
+fn diagnose_before(list: *const Object, d: &DispatchUpscale, states: &[u32; 7]) -> Option<u64> {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    if !trace_on() {
+        return None;
+    }
+    victory_gpu::external::note_op(list, || {
+        format!(
+            "FIDELITYFX upscaling jitter {:?} mv scale {:?} render {:?} upscale {:?} reset {} frame time {} | {}",
+            d.jitter,
+            d.mv_scale,
+            d.render,
+            d.upscale,
+            d.reset & 0xff != 0,
+            d.frame_time,
+            describe(d)
+        )
+    });
+    let frame = victory_gpu::external::frame();
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    if !victory_gpu::external::listed(frame) || LAST.swap(frame, Relaxed) == frame {
+        return None;
+    }
+    for ((name, r), &state) in RESOURCES.iter().zip(&d.resources).zip(states).take(6) {
+        if !r.resource.is_null() {
+            victory_gpu::external::snapshot(list, r.resource.cast::<Object>(), state, frame, &format!("ffx-{name}"));
+        }
+    }
+    Some(frame)
 }
 
 pub(crate) fn module() -> HleModule {

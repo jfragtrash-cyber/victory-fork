@@ -884,6 +884,218 @@ pub(crate) fn recent_levels() -> Vec<u8> {
     levels.iter().copied().collect()
 }
 
+/// A texture a host library was handed, copied into readback memory where
+/// the library's work stands in its list ([`snap`]), saved at a later
+/// present ([`save_snaps`]): the frame, a name, the texture's format, and
+/// per plane (depth, then stencil) the buffer and its layout.
+struct Snap {
+    frame: u64,
+    name: String,
+    format: u32,
+    planes: Vec<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)>,
+}
+
+// SAFETY: readback buffers, mapped only once the card has written them.
+unsafe impl Send for Snap {}
+
+static SNAPS: std::sync::Mutex<Vec<Snap>> = std::sync::Mutex::new(Vec::new());
+
+/// Records into `list` the copy of the first level and slice of `texture`
+/// (in host state `state`, where it is left) into readback memory, both
+/// planes of a depth-stencil texture, saved as `frame-<frame>-<name>-...`
+/// two presents later at full size ([`save_snaps`]).
+pub(crate) fn snap(list: &crate::host::HostList, texture: &ID3D12Resource, state: u32, frame: u64, name: String) {
+    let Some(host) = crate::host::host() else { return };
+    // SAFETY: a live texture.
+    let d = unsafe { texture.GetDesc() };
+    if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        tracing::info!(name = %name, "upscaler texture not saved: not a plain 2D texture");
+        return;
+    }
+    let stencil = matches!(d.Format.0, 19..=22 | 44..=47);
+    let state = D3D12_RESOURCE_STATES(state as i32);
+    let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    let mut planes = Vec::new();
+    // SAFETY: an open list and a live texture, moved to the copy state and
+    // back to the state the list has it in here.
+    unsafe {
+        if state != copy {
+            list.list.ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
+        }
+        planes.extend(read_back(&host.device, &list.list, texture));
+        // The stencil plane's first subresource follows all of the depth
+        // plane's.
+        if stencil {
+            let sub = u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize);
+            planes.extend(read_back_of(&host.device, &list.list, texture, sub));
+        }
+        if state != copy {
+            list.list.ResourceBarrier(&[crate::host::transition(texture, copy, state)]);
+        }
+    }
+    SNAPS.lock().unwrap_or_else(|e| e.into_inner()).push(Snap {
+        frame,
+        name,
+        format: d.Format.0 as u32,
+        planes,
+    });
+}
+
+/// At the present of `frame`: saves the copies [`snap`] made in frames two
+/// or more before (their lists have been submitted since), once the card
+/// has run everything sent before.
+pub(crate) fn save_snaps(frame: u64) {
+    let due: Vec<Snap> = {
+        let mut snaps = SNAPS.lock().unwrap_or_else(|e| e.into_inner());
+        if snaps.is_empty() {
+            return;
+        }
+        let (due, wait): (Vec<Snap>, Vec<Snap>) = std::mem::take(&mut *snaps).into_iter().partition(|s| s.frame + 2 <= frame);
+        *snaps = wait;
+        due
+    };
+    if due.is_empty() {
+        return;
+    }
+    let Some(host) = crate::host::host() else { return };
+    // An empty list run and waited for, behind what was sent before it.
+    if let Ok(list) = host.new_list() {
+        list.close();
+        host.execute(&[&list]);
+    }
+    for s in &due {
+        for (plane, (buffer, footprint)) in s.planes.iter().enumerate() {
+            save_snap_plane(s, plane, buffer, footprint);
+        }
+    }
+}
+
+fn save_snap_plane(s: &Snap, plane: usize, buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT) {
+    let f = footprint.Footprint;
+    let (w, h, pitch) = (f.Width as usize, f.Height as usize, f.RowPitch as usize);
+    if w == 0 || h == 0 {
+        return;
+    }
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the copy has run (see `save_snaps`); the mapping spans the
+    // footprint's rows.
+    unsafe {
+        if buffer.Map(0, None, Some(&mut data)).is_err() {
+            return;
+        }
+        // The last row has no padding after it.
+        let len = (buffer.GetDesc().Width as usize).min(pitch * h);
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
+        let (what, rgba) = match (plane, s.format) {
+            (1, _) => {
+                stencil_values(buffer, footprint, s.frame, std::ptr::null());
+                ("stencil", to_rgba(60, w, h, pitch, rows))
+            }
+            // A 32-bit float depth plane.
+            (_, 19..=22 | 39..=41) => ("depth", Some(depth_rgba(&s.name, w, h, pitch, rows))),
+            (_, 33 | 34) => ("motion", Some(motion_rgba(&s.name, w, h, pitch, rows))),
+            // A 24-bit depth plane comes as 32-bit words.
+            (_, 44..=47) => ("depth", to_rgba(44, w, h, pitch, rows)),
+            _ => ("", to_rgba(f.Format.0 as u32, w, h, pitch, rows)),
+        };
+        buffer.Unmap(0, None);
+        let Some(rgba) = rgba else {
+            tracing::info!(name = %s.name, format = f.Format.0, "upscaler texture not saved: format");
+            return;
+        };
+        let raw: Vec<u8> = rgba
+            .chunks(w * 4)
+            .flat_map(|row| std::iter::once(0).chain(row.chunks(4).flat_map(|p| [p[0], p[1], p[2]])))
+            .collect();
+        let Some(folder) = folder() else { return };
+        let name = format!("frame-{}-{}{}{}-{w}x{h}-f{}", s.frame, s.name, if what.is_empty() { "" } else { "-" }, what, s.format);
+        let path = folder.join(format!("{name}.png"));
+        match std::fs::write(&path, png_rgb(w as u32, h as u32, &raw)) {
+            Ok(()) => tracing::info!(path = %path.display(), "upscaler texture saved"),
+            Err(e) => tracing::warn!(error = %e, path = %path.display(), "upscaler texture not saved"),
+        }
+    }
+}
+
+/// Rows of a 32-bit float depth plane as grey (lowest black, highest
+/// white), with what it holds logged: with inverted depth (the title's) 0
+/// is the far plane and larger is nearer.
+fn depth_rgba(name: &str, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Vec<u8> {
+    let values: Vec<f32> = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .map(|(x, y)| f32::from_le_bytes(rows[y * pitch + x * 4..][..4].try_into().unwrap_or([0; 4])))
+        .collect();
+    let finite = values.iter().copied().filter(|v| v.is_finite());
+    let (low, high) = finite.fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v), h.max(v)));
+    let n = values.len().max(1) as f32;
+    let zero_percent = values.iter().filter(|&&v| v == 0.0).count() as f32 * 100.0 / n;
+    let one_percent = values.iter().filter(|&&v| v == 1.0).count() as f32 * 100.0 / n;
+    tracing::info!(name, width = w, height = h, low, high, zero_percent, one_percent, "depth handed to the upscaler");
+    let range = (high - low).max(1e-20);
+    values
+        .iter()
+        .flat_map(|&v| {
+            let c = if v.is_finite() { (((v - low) / range).clamp(0.0, 1.0) * 255.0) as u8 } else { 255 };
+            [c, c, c, 255]
+        })
+        .collect()
+}
+
+/// Rows of an R16G16_FLOAT motion-vector texture as colour: no motion is
+/// mid grey, x is red and y green around it, scaled so that the 99th
+/// percentile of the larger component of the moving texels reaches the
+/// edge (a few small moving characters on a still screen still show;
+/// non-finite texels magenta); logs what the vectors hold, in the
+/// texture's own units (the dispatch's motion-vector scale turns them into
+/// pixels): the share of texels without motion, then percentiles of the
+/// moving ones.
+fn motion_rgba(name: &str, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Vec<u8> {
+    let vectors: Vec<[f32; 2]> = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .map(|(x, y)| {
+            let p = &rows[y * pitch + x * 4..][..4];
+            [half(u16::from_le_bytes([p[0], p[1]])), half(u16::from_le_bytes([p[2], p[3]]))]
+        })
+        .collect();
+    let n = vectors.len().max(1);
+    let finite: Vec<[f32; 2]> = vectors.iter().copied().filter(|v| v[0].is_finite() && v[1].is_finite()).collect();
+    let mut larger: Vec<f32> =
+        finite.iter().map(|v| v[0].abs().max(v[1].abs())).filter(|&m| m > 0.0).collect();
+    larger.sort_by(f32::total_cmp);
+    let at = |q: f32| larger.get(((larger.len().max(1) - 1) as f32 * q) as usize).copied().unwrap_or(0.0);
+    let (p50, p99, max) = (at(0.5), at(0.99), larger.last().copied().unwrap_or(0.0));
+    let zero_percent = vectors.iter().filter(|v| v[0] == 0.0 && v[1] == 0.0).count() as f32 * 100.0 / n as f32;
+    let not_finite = n - finite.len();
+    let count = finite.len().max(1) as f32;
+    let mean_x = finite.iter().map(|v| v[0]).sum::<f32>() / count;
+    let mean_y = finite.iter().map(|v| v[1]).sum::<f32>() / count;
+    tracing::info!(
+        name,
+        width = w,
+        height = h,
+        zero_percent,
+        not_finite,
+        p50,
+        p99,
+        max,
+        mean_x,
+        mean_y,
+        "motion vectors handed to the upscaler (larger component of each)"
+    );
+    let k = if p99 > 0.0 { 0.5 / p99 } else { 0.0 };
+    let c = |v: f32| ((0.5 + v * k).clamp(0.0, 1.0) * 255.0) as u8;
+    vectors
+        .iter()
+        .flat_map(|v| {
+            if v[0].is_finite() && v[1].is_finite() {
+                [c(v[0]), c(v[1]), 128, 255]
+            } else {
+                [255, 0, 255, 255]
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -903,5 +1115,23 @@ mod tests {
         assert_eq!(super::to_rgba(89, 1, 1, 4, &xr), Some(vec![255, 127, 0, 255]));
         // B8G8R8A8 still swaps to RGBA.
         assert_eq!(super::to_rgba(87, 1, 1, 4, &[1, 2, 3, 4]), Some(vec![3, 2, 1, 255]));
+    }
+
+    /// Motion vectors: none is mid grey; the moving texels set the scale,
+    /// x in red and y in green.
+    #[test]
+    fn motion_vectors_show_around_mid_grey() {
+        // (0, 0), (1, -1), (0.5, 0) as half floats, one row.
+        let rows = [0, 0, 0, 0, 0x00, 0x3c, 0x00, 0xbc, 0x00, 0x38, 0, 0];
+        assert_eq!(
+            super::motion_rgba("test", 3, 1, 12, &rows),
+            vec![127, 127, 128, 255, 255, 0, 128, 255, 255, 127, 128, 255]
+        );
+    }
+
+    #[test]
+    fn depth_planes_show_lowest_black_highest_white() {
+        let rows: Vec<u8> = [0.0f32, 1.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(super::depth_rgba("test", 2, 1, 8, &rows), vec![0, 0, 0, 255, 255, 255, 255, 255]);
     }
 }
